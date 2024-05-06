@@ -1,3 +1,4 @@
+mod allocator;
 mod page;
 
 pub fn add(left: usize, right: usize) -> usize {
