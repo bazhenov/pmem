@@ -26,6 +26,10 @@ impl Page {
         &self.data[idx]
     }
 
+    pub fn as_mut_bytes(&mut self, idx: Range<usize>) -> &mut [u8] {
+        &mut self.data[idx]
+    }
+
     pub fn read_bytes<const N: usize>(&self, offset: usize) -> [u8; N] {
         let mut ret = [0; N];
         ret.copy_from_slice(&self.data[offset..(offset + N)]);
