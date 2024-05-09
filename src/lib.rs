@@ -1,4 +1,9 @@
-use std::{fmt::Debug, rc::Rc};
+use std::{
+    borrow::BorrowMut,
+    cell::{RefCell, RefMut},
+    fmt::Debug,
+    rc::Rc,
+};
 
 // mod allocator;
 mod page;
@@ -13,16 +18,18 @@ mod tests {
 
     #[test]
     fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
+        foo();
     }
 }
 
 fn foo() {
-    let handle: Handle<Foo> = create_entity(Foo { a: 8 });
+    let mut handle: Handle<Foo> = create_entity(Foo { a: 8 });
     let mut entity: Box<dyn JoinHandle> = handle.join_handle();
+
+    handle.as_mut().a = 42;
     drop(handle);
     let entity: Box<dyn ServiceEntity> = entity.join().unwrap();
+    entity.is_changed();
 }
 
 #[derive(Debug)]
@@ -32,7 +39,7 @@ struct Foo {
 
 impl ServiceEntity for Foo {
     fn is_changed(&self) {
-        todo!()
+        dbg!(self.a);
     }
 
     fn write(&self, buffer: &[u8]) {
@@ -42,12 +49,18 @@ impl ServiceEntity for Foo {
 
 fn create_entity<T>(entity: T) -> Handle<T> {
     Handle {
-        value: Rc::new(entity),
+        value: Rc::new(RefCell::new(entity)),
     }
 }
 
 struct Handle<T> {
-    value: Rc<T>,
+    value: Rc<RefCell<T>>,
+}
+
+impl<T> Handle<T> {
+    fn as_mut(&mut self) -> RefMut<T> {
+        RefCell::borrow_mut(&self.value)
+    }
 }
 
 impl<T: Debug + ServiceEntity + 'static> Handle<T> {
@@ -56,12 +69,12 @@ impl<T: Debug + ServiceEntity + 'static> Handle<T> {
     }
 }
 
-struct HandleImpl<T>(Option<Rc<T>>);
+struct HandleImpl<T>(Option<Rc<RefCell<T>>>);
 
 impl<T: Debug + ServiceEntity + 'static> JoinHandle for HandleImpl<T> {
     fn join(&mut self) -> Option<Box<dyn ServiceEntity>> {
         let v = self.0.take().unwrap();
-        let entity = Rc::try_unwrap(v).unwrap();
+        let entity = Rc::try_unwrap(v).unwrap().into_inner();
         Some(Box::new(entity))
     }
 }
