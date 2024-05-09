@@ -3,8 +3,15 @@ use binrw::BinWrite;
 use thiserror::Error;
 
 use crate::page::Page;
+use std::any::Any;
+use std::any::TypeId;
 use std::cell::OnceCell;
+use std::cell::Ref;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::marker::PhantomData;
+use std::ops::Deref;
 use std::{io::Cursor, mem, rc::Rc};
 
 struct Allocator {
@@ -71,18 +78,17 @@ mod tests {
         let page = Page::new();
         let scope = Scope::open(&mut allocator, &page);
 
-        let mut a = scope.new(ListNode {
+        let a = scope.new(ListNode {
             value: 35,
             next: Ptr::null(),
         });
-        let mut b = scope.new(ListNode {
+        let b = scope.new(ListNode {
             value: 35,
             next: Ptr::null(),
         });
 
-        scope.change(a, |a| a.next2 = b.get_ref());
-        scope.change(b, |b| b.next2 = a.get_ref());
-        // c.value.get_mut().unwrap().value.next = a;
+        scope.change(a.ptr(), |a| a.next = b.ptr());
+        scope.change(b.ptr(), |b| b.next = a.ptr());
     }
 
     #[test]
@@ -91,7 +97,7 @@ mod tests {
         let page = Page::new();
         let scope = Scope::open(&mut allocator, &page);
 
-        let mut list = LinkedList::new(scope.clone());
+        let mut list = LinkedList::new(scope);
         list.push(12);
 
         // let list = LinkedList::new(scope);
@@ -102,25 +108,21 @@ mod tests {
 #[derive(BinRead, BinWrite)]
 struct Ptr<T> {
     addr: u32,
-    #[brw(ignore)]
-    value: OnceCell<Rc<Handle<T>>>,
+    _phantom: PhantomData<T>,
 }
 
 impl<T> Ptr<T> {
     fn from_addr(addr: u32) -> Ptr<T> {
         Ptr {
             addr,
-            value: OnceCell::new(),
+            _phantom: PhantomData::<T>,
         }
     }
 
     fn new(value: T) -> Ptr<T> {
         Ptr {
             addr: 0,
-            value: OnceCell::from(Rc::new(Handle {
-                value,
-                ref_count: 0,
-            })),
+            _phantom: PhantomData::<T>,
         }
     }
 
@@ -129,24 +131,39 @@ impl<T> Ptr<T> {
     }
 
     fn is_null(&self) -> bool {
-        self.addr == 0 && self.value.get().is_none()
+        self.addr == 0 && todo!() //
     }
 }
 
 struct Handle<T> {
     ref_count: u32,
-    value: T,
+    value: RefCell<T>,
 }
 
 impl<T> Handle<T> {
-    fn get_ref(&self) -> Ptr2<T> {
+    fn ptr(&self) -> Ptr<T> {
         todo!()
+    }
+
+    fn get_mut(&self) -> &mut T {
+        todo!()
+    }
+
+    fn change(&self, f: impl Fn(&mut T)) {}
+}
+
+fn borrow_downcast<T: Any>(cell: &RefCell<dyn Any>) -> Option<Ref<T>> {
+    let r = cell.borrow();
+    if (*r).type_id() == TypeId::of::<T>() {
+        Some(Ref::map(r, |x| x.downcast_ref::<T>().unwrap()))
+    } else {
+        None
     }
 }
 
 impl<T> AsRef<T> for Handle<T> {
     fn as_ref(&self) -> &T {
-        &self.value
+        &self.value.borrow()
     }
 }
 
@@ -161,7 +178,6 @@ struct LinkedList<'a> {
 struct ListNode {
     value: i32,
     next: Ptr<ListNode>,
-    next2: Ptr2<ListNode>,
 }
 
 impl<'a> LinkedList<'a> {
@@ -187,7 +203,7 @@ impl<'a> LinkedList<'a> {
         let mut len = 0;
         while !node.is_null() {
             len += 1;
-            node = &self.scope.lookup(&mut node).next;
+            node = &self.scope.lookup(&node).unwrap().next;
         }
         len
     }
@@ -197,43 +213,52 @@ struct Utf8<'a> {
     data: &'a str,
 }
 
-#[derive(Clone)]
+type Addr = u32;
+
 struct Scope<'a> {
     allocator: &'a Allocator,
     page: &'a Page,
+    active_set: RefCell<HashMap<Addr, Rc<RefCell<dyn Any>>>>,
 }
 
 impl<'a> Scope<'a> {
     fn open(allocator: &'a mut Allocator, page: &'a Page) -> Self {
-        Self { allocator, page }
+        Self {
+            allocator,
+            page,
+            active_set: RefCell::new(HashMap::new()),
+        }
     }
 
-    fn lookup<T: BinRead>(&'a self, ptr: &'a Ptr<T>) -> &'a T
+    fn lookup<T: BinRead + 'static>(&'a self, ptr: &'a Ptr<T>) -> Rc<RefCell<T>>
     where
         T::Args<'a>: Default,
     {
         use binrw::BinReaderExt;
 
-        let get_or_init = ptr.value.get_or_init(|| {
-            let addr = ptr.addr as usize;
-            let size = u32::from_be_bytes(self.page.read_bytes::<4>(addr)) as usize;
-            let ref_count = u32::from_be_bytes(self.page.read_bytes::<4>(addr + 4));
-            let bytes = self.page.as_bytes((addr + 8)..(addr + 8 + size));
-            let mut cursor = Cursor::new(bytes);
-            let value = cursor.read_ne().unwrap();
-            Rc::new(Handle { value, ref_count })
-        });
-        get_or_init.as_ref().as_ref()
+        let addr = ptr.addr as usize;
+        let size = u32::from_be_bytes(self.page.read_bytes::<4>(addr)) as usize;
+        let ref_count = u32::from_be_bytes(self.page.read_bytes::<4>(addr + 4));
+        let bytes = self.page.as_bytes((addr + 8)..(addr + 8 + size));
+        let mut cursor = Cursor::new(bytes);
+        let value: T = cursor.read_ne().unwrap();
+        let value = Rc::new(RefCell::new(value));
+
+        let mut active_set = self.active_set.borrow_mut();
+        active_set.insert(ptr.addr, value);
+
+        let active_set = self.active_set.borrow();
+        let ref_cell = active_set.get(&ptr.addr).unwrap().clone();
+        let borrow = ref_cell.borrow();
+        let v = borrow.downcast_ref::<T>();
     }
 
     fn new<T>(&self, value: T) -> Handle<T> {
         // let addr = self.allocator.alloc::<T>();
-        Ptr2 {
-            _phantom: PhantomData,
-        }
+        todo!()
     }
 
-    fn change<T>(&self, ptr: Handle<T>, f: impl Fn(&mut T)) {}
+    fn change<T>(&self, ptr: Ptr<T>, f: impl Fn(&mut T)) {}
 }
 
 #[derive(BinRead, BinWrite, Clone, Copy)]
