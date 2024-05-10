@@ -37,19 +37,19 @@ impl Page {
     }
 }
 
-struct PatchedPage {
+pub struct PatchedPage {
     base: Rc<Page>,
     patches: Vec<(usize, Vec<u8>)>,
 }
 
 impl PatchedPage {
-    fn new(base: Rc<Page>) -> Self {
+    pub fn new(base: Rc<Page>) -> Self {
         Self {
             base,
             patches: vec![],
         }
     }
-    fn as_bytes_mut(&mut self, idx: Range<usize>) -> &mut [u8] {
+    pub fn as_bytes_mut(&mut self, idx: Range<usize>) -> &mut [u8] {
         assert!(
             idx.len() <= PAGE_SIZE && idx.end < PAGE_SIZE,
             "Out of bounds write"
@@ -59,7 +59,16 @@ impl PatchedPage {
         patch.as_mut_slice()
     }
 
-    fn as_bytes(&self, range: Range<usize>) -> Cow<[u8]> {
+    pub fn read_bytes<const N: usize>(&self, offset: usize) -> [u8; N] {
+        let mut ret = [0; N];
+        let bytes = self.as_bytes(offset..offset + N);
+        for (to, from) in ret.iter_mut().zip(bytes.into_iter()) {
+            *to = *from;
+        }
+        ret
+    }
+
+    pub fn as_bytes(&self, range: Range<usize>) -> Cow<[u8]> {
         assert!(
             range.len() <= PAGE_SIZE && range.end < PAGE_SIZE,
             "Out of bounds read"
@@ -71,7 +80,7 @@ impl PatchedPage {
             if range.contains(offset) {
                 // Patch start is in range
                 let from = offset - range.start;
-                let len = patch.len().min(range.end - from);
+                let len = patch.len().min(range.end - offset);
                 slice[from..(from + len)].copy_from_slice(&patch[..len])
             } else if range.contains(&(offset + patch.len())) {
                 // Patch end is in range
@@ -111,6 +120,7 @@ mod tests {
         assert_eq!(&*patched.as_bytes(0..12), b"Hello world!");
         assert_eq!(&*patched.as_bytes(0..8), b"Hello wo");
         assert_eq!(&*patched.as_bytes(3..12), b"lo world!");
+        assert_eq!(&*patched.as_bytes(6..11), b"world");
         assert_eq!(&*patched.as_bytes(8..12), b"rld!");
         assert_eq!(&*patched.as_bytes(7..10), b"orl");
     }

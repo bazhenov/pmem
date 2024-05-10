@@ -1,8 +1,10 @@
 use binrw::BinRead;
 use binrw::BinWrite;
+use binrw::BinWriterExt;
 use thiserror::Error;
 
 use crate::page::Page;
+use crate::page::PatchedPage;
 use std::any::Any;
 use std::any::TypeId;
 
@@ -23,6 +25,8 @@ struct Allocator {
     offset: usize,
 }
 
+const START_ADDR: usize = 4;
+
 #[derive(Error, Debug)]
 enum Error {
     #[error("Pointer already initialized")]
@@ -31,13 +35,16 @@ enum Error {
 
 impl Allocator {
     fn from(page: Page) -> Self {
-        Self { page, offset: 0 }
+        Self {
+            page,
+            offset: START_ADDR,
+        }
     }
 
     fn new() -> Self {
         Self {
             page: Page::new(),
-            offset: 0,
+            offset: START_ADDR,
         }
     }
 
@@ -51,10 +58,11 @@ impl Allocator {
         unsafe { &mut *ptr }
     }
 
-    fn alloc_untyped(&mut self, size: usize) -> &mut [u8] {
-        self.page
-            .as_mut_bytes(self.offset..(self.offset + size))
-            .as_mut()
+    fn alloc_untyped(&mut self, size: usize) -> Addr {
+        assert!(size > 0);
+        let addr = self.offset;
+        self.offset += size;
+        addr as u32
     }
 
     fn into(self) -> Page {
@@ -79,8 +87,8 @@ mod tests {
     #[test]
     fn allocate_simple_value() {
         let mut allocator = Allocator::new();
-        let page = Page::new();
-        let scope = Scope::open(&mut allocator, &page);
+        let page = Rc::new(Page::new());
+        let mut scope = Scope::open(&mut allocator, page);
 
         let mut a = scope.new(ListNode {
             value: 35,
@@ -98,8 +106,9 @@ mod tests {
     #[test]
     fn new_linked_list() {
         let mut allocator = Allocator::new();
-        let page = Page::new();
-        let scope = Scope::open(&mut allocator, &page);
+        let page = Rc::new(Page::new());
+
+        let scope = Scope::open(&mut allocator, page);
 
         let mut list = LinkedList::new(scope);
         list.push(12);
@@ -109,7 +118,7 @@ mod tests {
     }
 }
 
-#[derive(Clone, Copy, BinRead, BinWrite)]
+#[derive(Clone, BinRead, BinWrite)]
 struct Ptr<T> {
     addr: u32,
     _phantom: PhantomData<T>,
@@ -135,7 +144,7 @@ impl<T> Ptr<T> {
     }
 
     fn is_null(&self) -> bool {
-        self.addr == 0 && todo!() //
+        self.addr == 0
     }
 }
 
@@ -150,7 +159,6 @@ fn borrow_downcast<T: Any>(cell: &RefCell<dyn Any>) -> Option<Ref<T>> {
 
 struct LinkedList<'a> {
     scope: Scope<'a>,
-    len: usize,
     root: Ptr<ListNode>,
 }
 
@@ -161,22 +169,32 @@ struct ListNode {
     next: Ptr<ListNode>,
 }
 
+impl ServiceEntity for ListNode {
+    fn size(&self) -> usize {
+        8
+    }
+
+    fn write_to(&self, buffer: &mut [u8]) {
+        let mut cursor = Cursor::new(buffer);
+        self.write(&mut cursor).unwrap();
+    }
+}
+
 impl<'a> LinkedList<'a> {
     fn new(scope: Scope<'a>) -> Self {
         Self {
             scope,
-            len: 0,
             root: Ptr::from_addr(0),
         }
     }
 
     fn push(&mut self, value: i32) {
-        let node = ListNode {
+        let handle = self.scope.new(ListNode {
             value,
             next: Ptr::null(),
-        };
-        self.root = Ptr::new(node);
-        self.len += 1;
+        });
+        self.scope.write(&handle);
+        self.root = handle.ptr();
     }
 
     fn len(&self) -> usize {
@@ -197,16 +215,18 @@ struct Utf8<'a> {
 type Addr = u32;
 
 struct Scope<'a> {
-    allocator: &'a Allocator,
-    page: &'a Page,
+    allocator: &'a mut Allocator,
+    page: Rc<Page>,
+    patched: PatchedPage,
     active_set: RefCell<HashMap<Addr, Rc<RefCell<dyn Any>>>>,
 }
 
 impl<'a> Scope<'a> {
-    fn open(allocator: &'a mut Allocator, page: &'a Page) -> Self {
+    fn open(allocator: &'a mut Allocator, page: Rc<Page>) -> Self {
         Self {
             allocator,
-            page,
+            page: Rc::clone(&page),
+            patched: PatchedPage::new(page),
             active_set: RefCell::new(HashMap::new()),
         }
     }
@@ -218,14 +238,17 @@ impl<'a> Scope<'a> {
         use binrw::BinReaderExt;
 
         let addr = ptr.addr as usize;
-        let size = u32::from_be_bytes(self.page.read_bytes::<4>(addr)) as usize;
-        let ref_count = u32::from_be_bytes(self.page.read_bytes::<4>(addr + 4));
-        let bytes = self.page.as_bytes((addr + 8)..(addr + 8 + size));
+        let size = u32::from_ne_bytes(self.patched.read_bytes::<4>(addr)) as usize;
+        println!("Size: {}", size);
+        // let ref_count = u32::from_be_bytes(self.page.read_bytes::<4>(addr + 4));
+        let bytes = self.patched.as_bytes((addr + 4)..(addr + 4 + size));
         let mut cursor = Cursor::new(bytes);
         let value: T = cursor.read_ne().unwrap();
 
-        create_entity(value)
-
+        Handle {
+            addr: addr as u32,
+            value: Rc::new(RefCell::new(value)),
+        }
         // let mut active_set = self.active_set.borrow_mut();
         // active_set.insert(ptr.addr, value);
 
@@ -235,21 +258,37 @@ impl<'a> Scope<'a> {
         // borrow.downcast_ref::<T>()
     }
 
-    fn new<T>(&self, value: T) -> Handle<T> {
+    fn new<T: ServiceEntity>(&mut self, value: T) -> Handle<T> {
         // let addr = self.allocator.alloc::<T>();
-        todo!()
+        let size = value.size();
+        let addr = self.allocator.alloc_untyped(size);
+        Handle {
+            addr: addr as u32,
+            value: Rc::new(RefCell::new(value)),
+        }
     }
 
     fn change<T>(&self, ptr: Ptr<T>, f: impl Fn(&mut T)) {}
-}
 
-fn create_entity<T>(entity: T) -> Handle<T> {
-    Handle {
-        value: Rc::new(RefCell::new(entity)),
+    fn finish(&self) {
+        todo!()
+    }
+
+    fn write<T: ServiceEntity>(&mut self, handle: &Handle<T>) {
+        let entity = RefCell::borrow(&handle.value);
+        let size = entity.size() + 4;
+        let bytes = self
+            .patched
+            .as_bytes_mut(handle.addr as usize..handle.addr as usize + (size as usize));
+        let (header, body) = bytes.split_at_mut(4);
+        let mut cursor = Cursor::new(header);
+        cursor.write_ne(&(size as u32)).unwrap();
+        entity.write_to(body);
     }
 }
 
 struct Handle<T> {
+    addr: Addr,
     value: Rc<RefCell<T>>,
 }
 
@@ -263,7 +302,10 @@ impl<T> Handle<T> {
     }
 
     fn ptr(&self) -> Ptr<T> {
-        todo!();
+        Ptr {
+            addr: self.addr,
+            _phantom: PhantomData::<T>,
+        }
     }
 }
 
@@ -284,8 +326,8 @@ impl<T: Debug + ServiceEntity + 'static> JoinHandle for HandleImpl<T> {
 }
 
 trait ServiceEntity {
-    fn is_changed(&self);
-    fn write(&self, buffer: &[u8]);
+    fn size(&self) -> usize;
+    fn write_to(&self, buffer: &mut [u8]);
 }
 
 trait JoinHandle {
