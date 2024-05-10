@@ -5,13 +5,17 @@ use thiserror::Error;
 use crate::page::Page;
 use std::any::Any;
 use std::any::TypeId;
-use std::cell::OnceCell;
+
+use std::borrow::Borrow;
 use std::cell::Ref;
 use std::cell::RefCell;
+use std::cell::RefMut;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::ops::Deref;
+use std::ops::DerefMut;
 use std::{io::Cursor, mem, rc::Rc};
 
 struct Allocator {
@@ -78,17 +82,17 @@ mod tests {
         let page = Page::new();
         let scope = Scope::open(&mut allocator, &page);
 
-        let a = scope.new(ListNode {
+        let mut a = scope.new(ListNode {
             value: 35,
             next: Ptr::null(),
         });
-        let b = scope.new(ListNode {
+        let mut b = scope.new(ListNode {
             value: 35,
             next: Ptr::null(),
         });
 
-        scope.change(a.ptr(), |a| a.next = b.ptr());
-        scope.change(b.ptr(), |b| b.next = a.ptr());
+        a.as_mut().next = b.ptr();
+        b.as_mut().next = a.ptr();
     }
 
     #[test]
@@ -105,7 +109,7 @@ mod tests {
     }
 }
 
-#[derive(BinRead, BinWrite)]
+#[derive(Clone, Copy, BinRead, BinWrite)]
 struct Ptr<T> {
     addr: u32,
     _phantom: PhantomData<T>,
@@ -135,23 +139,6 @@ impl<T> Ptr<T> {
     }
 }
 
-struct Handle<T> {
-    ref_count: u32,
-    value: RefCell<T>,
-}
-
-impl<T> Handle<T> {
-    fn ptr(&self) -> Ptr<T> {
-        todo!()
-    }
-
-    fn get_mut(&self) -> &mut T {
-        todo!()
-    }
-
-    fn change(&self, f: impl Fn(&mut T)) {}
-}
-
 fn borrow_downcast<T: Any>(cell: &RefCell<dyn Any>) -> Option<Ref<T>> {
     let r = cell.borrow();
     if (*r).type_id() == TypeId::of::<T>() {
@@ -161,19 +148,13 @@ fn borrow_downcast<T: Any>(cell: &RefCell<dyn Any>) -> Option<Ref<T>> {
     }
 }
 
-impl<T> AsRef<T> for Handle<T> {
-    fn as_ref(&self) -> &T {
-        &self.value.borrow()
-    }
-}
-
 struct LinkedList<'a> {
     scope: Scope<'a>,
     len: usize,
     root: Ptr<ListNode>,
 }
 
-#[derive(BinRead, BinWrite)]
+#[derive(BinRead, BinWrite, Clone)]
 #[brw(little)]
 struct ListNode {
     value: i32,
@@ -199,11 +180,11 @@ impl<'a> LinkedList<'a> {
     }
 
     fn len(&self) -> usize {
-        let mut node = &self.root;
+        let mut node: Ptr<_> = self.root.clone();
         let mut len = 0;
         while !node.is_null() {
             len += 1;
-            node = &self.scope.lookup(&node).unwrap().next;
+            node = self.scope.lookup(&node).as_ref().next.clone();
         }
         len
     }
@@ -230,7 +211,7 @@ impl<'a> Scope<'a> {
         }
     }
 
-    fn lookup<T: BinRead + 'static>(&'a self, ptr: &'a Ptr<T>) -> Rc<RefCell<T>>
+    fn lookup<T: BinRead + 'static>(&'a self, ptr: &'a Ptr<T>) -> Handle<T>
     where
         T::Args<'a>: Default,
     {
@@ -242,15 +223,16 @@ impl<'a> Scope<'a> {
         let bytes = self.page.as_bytes((addr + 8)..(addr + 8 + size));
         let mut cursor = Cursor::new(bytes);
         let value: T = cursor.read_ne().unwrap();
-        let value = Rc::new(RefCell::new(value));
 
-        let mut active_set = self.active_set.borrow_mut();
-        active_set.insert(ptr.addr, value);
+        create_entity(value)
 
-        let active_set = self.active_set.borrow();
-        let ref_cell = active_set.get(&ptr.addr).unwrap().clone();
-        let borrow = ref_cell.borrow();
-        let v = borrow.downcast_ref::<T>();
+        // let mut active_set = self.active_set.borrow_mut();
+        // active_set.insert(ptr.addr, value);
+
+        // let active_set = self.active_set.borrow();
+        // let ref_cell = active_set.get(&ptr.addr).unwrap().clone();
+        // let borrow = ref_cell.borrow();
+        // borrow.downcast_ref::<T>()
     }
 
     fn new<T>(&self, value: T) -> Handle<T> {
@@ -261,7 +243,51 @@ impl<'a> Scope<'a> {
     fn change<T>(&self, ptr: Ptr<T>, f: impl Fn(&mut T)) {}
 }
 
-#[derive(BinRead, BinWrite, Clone, Copy)]
-struct Ptr2<T> {
-    _phantom: PhantomData<T>,
+fn create_entity<T>(entity: T) -> Handle<T> {
+    Handle {
+        value: Rc::new(RefCell::new(entity)),
+    }
+}
+
+struct Handle<T> {
+    value: Rc<RefCell<T>>,
+}
+
+impl<T> Handle<T> {
+    fn as_mut(&mut self) -> RefMut<T> {
+        RefCell::borrow_mut(&self.value)
+    }
+
+    fn as_ref(&self) -> Ref<T> {
+        RefCell::borrow(&self.value)
+    }
+
+    fn ptr(&self) -> Ptr<T> {
+        todo!();
+    }
+}
+
+impl<T: Debug + ServiceEntity + 'static> Handle<T> {
+    fn join_handle(&self) -> Box<dyn JoinHandle> {
+        Box::new(HandleImpl(Some(Rc::clone(&self.value))))
+    }
+}
+
+struct HandleImpl<T>(Option<Rc<RefCell<T>>>);
+
+impl<T: Debug + ServiceEntity + 'static> JoinHandle for HandleImpl<T> {
+    fn join(&mut self) -> Option<Box<dyn ServiceEntity>> {
+        let v = self.0.take().unwrap();
+        let entity = Rc::try_unwrap(v).unwrap().into_inner();
+        Some(Box::new(entity))
+    }
+}
+
+trait ServiceEntity {
+    fn is_changed(&self);
+    fn write(&self, buffer: &[u8]);
+}
+
+trait JoinHandle {
+    fn join(&mut self) -> Option<Box<dyn ServiceEntity>>;
 }
