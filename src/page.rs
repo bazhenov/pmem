@@ -1,7 +1,6 @@
-use std::{borrow::Cow, ops::Range, rc::Rc};
+use std::{borrow::Cow, ops::Range};
 
 const PAGE_SIZE: usize = 1 << 16; // 64KB
-
 type Patch = (usize, Vec<u8>);
 
 pub struct Page {
@@ -151,10 +150,9 @@ mod tests {
     }
 
     mod proptests {
-        use std::ops::Deref;
-
         use super::super::*;
         use proptest::{collection::vec, prelude::*};
+        use std::ops::Deref;
 
         proptest! {
             #[test]

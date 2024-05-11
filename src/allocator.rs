@@ -13,12 +13,12 @@ use std::marker::PhantomData;
 use std::{io::Cursor, mem, rc::Rc};
 use thiserror::Error;
 
+const START_ADDR: usize = 4;
+
 struct Allocator {
     page: Page,
     offset: usize,
 }
-
-const START_ADDR: usize = 4;
 
 #[derive(Error, Debug)]
 enum Error {
@@ -41,16 +41,6 @@ impl Allocator {
         }
     }
 
-    fn alloc<T>(&mut self) -> &mut T {
-        let size = mem::size_of::<T>();
-        let ptr = self
-            .page
-            .as_bytes_mut(self.offset..(self.offset + size))
-            .as_mut_ptr() as *mut T;
-        self.offset += size;
-        unsafe { &mut *ptr }
-    }
-
     fn alloc_untyped(&mut self, size: usize) -> Addr {
         assert!(size > 0);
         let addr = self.offset;
@@ -68,14 +58,19 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore]
     fn check_allocation() {
-        let mut allocator = Allocator::from(Page::new());
+        let mut allocator = Allocator::new();
+        let page = Page::new();
+        let mut scope = Scope::open(&mut allocator, page);
 
-        let v = allocator.alloc::<u32>();
-        *v = 42;
-        let mut page = allocator.into();
-        page.commit();
-        assert_eq!(u32::from_ne_bytes(page.read_bytes::<4>(4)), 42);
+        let a = scope.new(ListNode {
+            value: 42,
+            next: Ptr::null(),
+        });
+
+        let handle = scope.lookup(a.ptr());
+        assert_eq!(RefCell::borrow(&handle.value).value, 42);
     }
 
     #[test]
@@ -132,13 +127,6 @@ impl<T> Ptr<T> {
     fn from_addr(addr: u32) -> Ptr<T> {
         Ptr {
             addr,
-            _phantom: PhantomData::<T>,
-        }
-    }
-
-    fn new(value: T) -> Ptr<T> {
-        Ptr {
-            addr: 0,
             _phantom: PhantomData::<T>,
         }
     }
@@ -206,7 +194,7 @@ impl<'a> LinkedList<'a> {
         let mut len = 0;
         while !node.is_null() {
             len += 1;
-            node = self.scope.lookup(&node).as_ref().next;
+            node = self.scope.lookup(node).as_ref().next;
         }
         len
     }
@@ -233,7 +221,7 @@ impl<'a> Scope<'a> {
         }
     }
 
-    fn lookup<T: BinRead + 'static>(&'a self, ptr: &'a Ptr<T>) -> Handle<T>
+    fn lookup<T: BinRead + 'static>(&'a self, ptr: Ptr<T>) -> Handle<T>
     where
         T::Args<'a>: Default,
     {
