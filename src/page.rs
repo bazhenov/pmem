@@ -2,10 +2,12 @@ use std::{borrow::Cow, ops::Range, rc::Rc};
 
 const PAGE_SIZE: usize = 1 << 16; // 64KB
 
+type Patch = (usize, Vec<u8>);
+
 pub struct Page {
     data: [u8; PAGE_SIZE],
-    uncommited: Vec<(usize, Vec<u8>)>,
-    patches: Vec<(usize, Vec<u8>)>,
+    uncommited: Vec<Patch>,
+    patches: Vec<Patch>,
 }
 
 impl Page {
@@ -48,7 +50,7 @@ impl Page {
     fn as_bytes_with_patches<'a>(
         &self,
         range: Range<usize>,
-        patches: impl Iterator<Item = &'a (usize, Vec<u8>)>,
+        patches: impl Iterator<Item = &'a Patch>,
     ) -> Cow<[u8]> {
         assert!(
             range.len() <= PAGE_SIZE && range.end < PAGE_SIZE,
@@ -57,22 +59,23 @@ impl Page {
         let mut slice = vec![0; range.len()];
         slice.copy_from_slice(&self.data[range.clone()]);
 
-        for (offset, patch) in patches {
-            if range.contains(offset) {
-                // Patch start is in range
-                let from = offset - range.start;
-                let len = patch.len().min(range.end - offset);
-                slice[from..(from + len)].copy_from_slice(&patch[..len])
-            } else if range.contains(&(offset + patch.len())) {
-                // Patch end is in range
-                let from = range.start - offset;
-                let len = range.len().min(patch.len() - from);
-                slice[..len].copy_from_slice(&patch[from..from + len])
-            } else if *offset < range.start && range.end < offset + patch.len() {
-                // Patch is fully covering slice
-                let from = range.start - offset;
-                slice.copy_from_slice(&patch[from..from + range.len()])
-            }
+        for (offset, bytes) in patches.filter(|p| intersects(p, &range)) {
+            // Calculating intersection of the path and input interval
+            let start = range.start.max(*offset);
+            let end = range.end.min(offset + bytes.len());
+            let len = end - start;
+
+            let patch_range = {
+                let from = start.saturating_sub(*offset);
+                from..from + len
+            };
+
+            let slice_range = {
+                let from = start.saturating_sub(range.start);
+                from..from + len
+            };
+
+            slice[slice_range].copy_from_slice(&bytes[patch_range])
         }
 
         Cow::Owned(slice)
@@ -81,6 +84,11 @@ impl Page {
     pub fn commit(&mut self) {
         self.patches.extend(self.uncommited.drain(..));
     }
+}
+
+/// Returns true of given patch intersects given range of bytes
+fn intersects((offset, patch): &Patch, range: &Range<usize>) -> bool {
+    *offset < range.end && offset + patch.len() > range.start
 }
 
 #[cfg(test)]
