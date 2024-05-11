@@ -21,9 +21,11 @@ impl Page {
 
     pub fn as_bytes_mut(&mut self, idx: Range<usize>) -> &mut [u8] {
         assert!(
-            idx.len() <= PAGE_SIZE && idx.end < PAGE_SIZE,
-            "Out of bounds write"
+            0 < idx.len() && idx.len() <= PAGE_SIZE,
+            "idx range should be at least 1 byte ({:?})",
+            idx
         );
+        assert!(idx.end < PAGE_SIZE, "idx.end out of page bounds");
         self.uncommited.push((idx.start, vec![0; idx.len()]));
         let (_, patch) = self.uncommited.last_mut().unwrap();
         patch.as_mut_slice()
@@ -53,7 +55,7 @@ impl Page {
         patches: impl Iterator<Item = &'a Patch>,
     ) -> Cow<[u8]> {
         assert!(
-            range.len() <= PAGE_SIZE && range.end < PAGE_SIZE,
+            range.len() <= PAGE_SIZE && range.end <= PAGE_SIZE,
             "Out of bounds read"
         );
         let mut slice = vec![0; range.len()];
@@ -145,6 +147,45 @@ mod tests {
                 patches: vec![],
                 uncommited: vec![],
             }
+        }
+    }
+
+    mod proptests {
+        use std::ops::Deref;
+
+        use super::super::*;
+        use proptest::{collection::vec, prelude::*};
+
+        proptest! {
+            #[test]
+            fn arbitrary_page_patches(snapshots in vec(any_snapshot(), 0..5)) {
+                // Mirror buffer where we track all the patches being applied
+                // in the end page content should be equal mirror buffer
+                let mut mirror = [0; PAGE_SIZE];
+                let mut page = Page::new();
+
+                for patches in snapshots {
+                    for (offset, bytes) in patches {
+                        let range = offset..offset + bytes.len();
+                        page.as_bytes_mut(range.clone()).copy_from_slice(bytes.as_slice());
+                        mirror[range].copy_from_slice(bytes.as_slice());
+                    }
+                    page.commit();
+                }
+
+                assert_eq!(page.as_bytes(0..PAGE_SIZE).deref(), mirror);
+            }
+        }
+
+        fn any_patch() -> impl Strategy<Value = Patch> {
+            (0usize..PAGE_SIZE, vec(any::<u8>(), 1..32))
+                .prop_filter("out of bounds patch", |(offset, bytes)| {
+                    offset + bytes.len() < PAGE_SIZE
+                })
+        }
+
+        fn any_snapshot() -> impl Strategy<Value = Vec<Patch>> {
+            vec(any_patch(), 1..10)
         }
     }
 }
