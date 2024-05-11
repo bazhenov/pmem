@@ -4,16 +4,16 @@ const PAGE_SIZE: usize = 1 << 16; // 64KB
 
 pub struct Page {
     data: [u8; PAGE_SIZE],
+    uncommited: Vec<(usize, Vec<u8>)>,
     patches: Vec<(usize, Vec<u8>)>,
-    commited_patches: Vec<(usize, Vec<u8>)>,
 }
 
 impl Page {
     pub fn new() -> Self {
         Self {
             data: [0; PAGE_SIZE],
+            uncommited: vec![],
             patches: vec![],
-            commited_patches: vec![],
         }
     }
 
@@ -22,8 +22,8 @@ impl Page {
             idx.len() <= PAGE_SIZE && idx.end < PAGE_SIZE,
             "Out of bounds write"
         );
-        self.patches.push((idx.start, vec![0; idx.len()]));
-        let (_, patch) = self.patches.last_mut().unwrap();
+        self.uncommited.push((idx.start, vec![0; idx.len()]));
+        let (_, patch) = self.uncommited.last_mut().unwrap();
         patch.as_mut_slice()
     }
 
@@ -37,35 +37,19 @@ impl Page {
     }
 
     pub fn as_bytes(&self, range: Range<usize>) -> Cow<[u8]> {
-        assert!(
-            range.len() <= PAGE_SIZE && range.end < PAGE_SIZE,
-            "Out of bounds read"
-        );
-        let mut slice = vec![0; range.len()];
-        slice.copy_from_slice(&self.data[range.clone()]);
-
-        for (offset, patch) in &self.commited_patches {
-            if range.contains(offset) {
-                // Patch start is in range
-                let from = offset - range.start;
-                let len = patch.len().min(range.end - offset);
-                slice[from..(from + len)].copy_from_slice(&patch[..len])
-            } else if range.contains(&(offset + patch.len())) {
-                // Patch end is in range
-                let from = range.start - offset;
-                let len = range.len().min(patch.len() - from);
-                slice[..len].copy_from_slice(&patch[from..from + len])
-            } else if *offset < range.start && range.end < offset + patch.len() {
-                // Patch is fully covering slice
-                let from = range.start - offset;
-                slice.copy_from_slice(&patch[from..from + range.len()])
-            }
-        }
-
-        Cow::Owned(slice)
+        self.as_bytes_with_patches(range, self.patches.iter())
     }
 
     pub fn as_bytes_uncommited(&self, range: Range<usize>) -> Cow<[u8]> {
+        let patches = self.patches.iter().chain(self.uncommited.iter());
+        self.as_bytes_with_patches(range, patches)
+    }
+
+    fn as_bytes_with_patches<'a>(
+        &self,
+        range: Range<usize>,
+        patches: impl Iterator<Item = &'a (usize, Vec<u8>)>,
+    ) -> Cow<[u8]> {
         assert!(
             range.len() <= PAGE_SIZE && range.end < PAGE_SIZE,
             "Out of bounds read"
@@ -73,7 +57,6 @@ impl Page {
         let mut slice = vec![0; range.len()];
         slice.copy_from_slice(&self.data[range.clone()]);
 
-        let patches = self.patches.iter().chain(self.commited_patches.iter());
         for (offset, patch) in patches {
             if range.contains(offset) {
                 // Patch start is in range
@@ -96,7 +79,7 @@ impl Page {
     }
 
     pub fn commit(&mut self) {
-        self.commited_patches.extend(self.patches.drain(..));
+        self.patches.extend(self.uncommited.drain(..));
     }
 }
 
@@ -152,7 +135,7 @@ mod tests {
             Self {
                 data,
                 patches: vec![],
-                commited_patches: vec![],
+                uncommited: vec![],
             }
         }
     }
