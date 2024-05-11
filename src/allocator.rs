@@ -1,24 +1,17 @@
+use crate::page::Page;
 use binrw::BinRead;
 use binrw::BinWrite;
 use binrw::BinWriterExt;
-use thiserror::Error;
-
-use crate::page::Page;
-use crate::page::PatchedPage;
 use std::any::Any;
 use std::any::TypeId;
-
-use std::borrow::Borrow;
 use std::cell::Ref;
 use std::cell::RefCell;
 use std::cell::RefMut;
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::fmt::Debug;
 use std::marker::PhantomData;
-use std::ops::Deref;
-use std::ops::DerefMut;
 use std::{io::Cursor, mem, rc::Rc};
+use thiserror::Error;
 
 struct Allocator {
     page: Page,
@@ -52,7 +45,7 @@ impl Allocator {
         let size = mem::size_of::<T>();
         let ptr = self
             .page
-            .as_mut_bytes(self.offset..(self.offset + size))
+            .as_bytes_mut(self.offset..(self.offset + size))
             .as_mut_ptr() as *mut T;
         self.offset += size;
         unsafe { &mut *ptr }
@@ -80,14 +73,15 @@ mod tests {
 
         let v = allocator.alloc::<u32>();
         *v = 42;
-        let page = allocator.into();
-        assert_eq!(u32::from_ne_bytes(page.read_bytes::<4>(0)), 42);
+        let mut page = allocator.into();
+        page.commit();
+        assert_eq!(u32::from_ne_bytes(page.read_bytes::<4>(4)), 42);
     }
 
     #[test]
     fn allocate_simple_value() {
         let mut allocator = Allocator::new();
-        let page = Rc::new(Page::new());
+        let page = Page::new();
         let mut scope = Scope::open(&mut allocator, page);
 
         let mut a = scope.new(ListNode {
@@ -106,7 +100,7 @@ mod tests {
     #[test]
     fn new_linked_list() {
         let mut allocator = Allocator::new();
-        let page = Rc::new(Page::new());
+        let page = Page::new();
 
         let scope = Scope::open(&mut allocator, page);
 
@@ -226,17 +220,15 @@ type Addr = u32;
 
 struct Scope<'a> {
     allocator: &'a mut Allocator,
-    page: Rc<Page>,
-    patched: PatchedPage,
+    page: Page,
     active_set: RefCell<HashMap<Addr, Rc<RefCell<dyn Any>>>>,
 }
 
 impl<'a> Scope<'a> {
-    fn open(allocator: &'a mut Allocator, page: Rc<Page>) -> Self {
+    fn open(allocator: &'a mut Allocator, page: Page) -> Self {
         Self {
             allocator,
-            page: Rc::clone(&page),
-            patched: PatchedPage::new(page),
+            page,
             active_set: RefCell::new(HashMap::new()),
         }
     }
@@ -248,8 +240,8 @@ impl<'a> Scope<'a> {
         use binrw::BinReaderExt;
 
         let addr = ptr.addr as usize;
-        let size = u32::from_ne_bytes(self.patched.read_bytes::<4>(addr)) as usize;
-        let bytes = self.patched.as_bytes((addr + 4)..(addr + 4 + size));
+        let size = u32::from_ne_bytes(self.page.read_bytes::<4>(addr)) as usize;
+        let bytes = self.page.as_bytes_uncommited((addr + 4)..(addr + 4 + size));
         let mut cursor = Cursor::new(bytes);
         let value: T = cursor.read_ne().unwrap();
 
@@ -279,7 +271,7 @@ impl<'a> Scope<'a> {
         let entity = RefCell::borrow(&handle.value);
         let size = entity.size() + 4;
         let bytes = self
-            .patched
+            .page
             .as_bytes_mut(handle.addr as usize..handle.addr as usize + (size as usize));
         let (header, body) = bytes.split_at_mut(4);
         let mut cursor = Cursor::new(header);
