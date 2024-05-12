@@ -26,6 +26,7 @@ pub struct Memory {
     page: Page,
     snapshot: Snapshot,
     next_addr: PageOffset,
+    seq: u32,
 }
 
 impl Memory {
@@ -34,6 +35,7 @@ impl Memory {
             page,
             snapshot: Snapshot::default(),
             next_addr: START_ADDR,
+            seq: 0,
         }
     }
 
@@ -42,14 +44,8 @@ impl Memory {
             page: Page::new(),
             snapshot: Snapshot::default(),
             next_addr: START_ADDR,
+            seq: 0,
         }
-    }
-
-    fn alloc(&mut self, size: usize) -> Addr {
-        assert!(size > 0);
-        let addr = self.next_addr;
-        self.next_addr += size as u32;
-        addr
     }
 
     pub fn write(&mut self, addr: Addr, bytes: &[u8]) {
@@ -60,11 +56,6 @@ impl Memory {
         self.page.read_uncommited(addr, len, &self.snapshot)
     }
 
-    pub fn commit(&mut self) {
-        let snapshot = mem::take(&mut self.snapshot);
-        self.page.commit(snapshot);
-    }
-
     pub fn read_static<const N: usize>(&self, offset: PageOffset) -> [u8; N] {
         let mut ret = [0; N];
         let bytes = self.read_uncommited(offset, N as PageOffset);
@@ -72,6 +63,99 @@ impl Memory {
             *to = *from;
         }
         ret
+    }
+
+    pub fn change<T>(&mut self, f: impl Fn(&mut Transaction) -> T) -> T {
+        let mut tx = self.start();
+        let response = f(&mut tx);
+        let Transaction {
+            snapshot,
+            next_addr,
+            seq,
+            ..
+        } = tx;
+
+        assert!(tx.next_addr >= self.next_addr);
+        assert!(tx.seq == self.seq);
+        self.seq += 1;
+        self.next_addr = next_addr;
+        self.page.commit(snapshot);
+        response
+    }
+
+    pub fn start(&self) -> Transaction {
+        Transaction {
+            memory: self,
+            snapshot: Snapshot::default(),
+            next_addr: self.next_addr,
+            seq: self.seq,
+        }
+    }
+}
+
+pub struct Transaction<'a> {
+    memory: &'a Memory,
+    snapshot: Snapshot,
+    next_addr: Addr,
+    seq: u32,
+}
+
+impl<'a> Transaction<'a> {
+    pub fn write_bytes(&mut self, addr: Addr, bytes: &[u8]) {
+        self.snapshot.write(addr, bytes)
+    }
+
+    pub fn read(&self, addr: PageOffset, len: PageOffset) -> Cow<[u8]> {
+        self.memory.page.read_uncommited(addr, len, &self.snapshot)
+    }
+
+    pub fn lookup<T>(&self, ptr: Ptr<T>) -> Handle<T>
+    where
+        T: BinRead<Args<'a> = ()> + 'static,
+    {
+        use binrw::BinReaderExt;
+
+        let addr = ptr.addr;
+        let bytes = self.memory.read_static::<4>(addr);
+        let len = u32::from_be_bytes(bytes);
+        let bytes = self.memory.read_uncommited(addr + 4, len);
+        let mut cursor = Cursor::new(bytes);
+        let value: T = cursor.read_ne().unwrap();
+
+        Handle {
+            addr,
+            value: Rc::new(RefCell::new(value)),
+        }
+    }
+
+    fn alloc(&mut self, size: usize) -> Addr {
+        assert!(size > 0);
+        let addr = self.next_addr;
+        self.next_addr += size as u32;
+        addr
+    }
+
+    pub fn write<T: ServiceEntity>(&mut self, value: T) -> Handle<T> {
+        let size = value.size() + 4; // 4 bytes in size
+        let addr = self.alloc(size);
+        let mut buffer = Cursor::new(Vec::new());
+        (size as PageOffset).write_be(&mut buffer);
+        value.write_to(&mut buffer);
+        self.write_bytes(addr, &buffer.into_inner());
+
+        Handle {
+            addr,
+            value: Rc::new(RefCell::new(value)),
+        }
+    }
+
+    pub fn update<T: ServiceEntity>(&mut self, handle: &Handle<T>) {
+        let value = RefCell::borrow(&handle.value);
+        let size = value.size() + 4; // 4 bytes in size
+        let mut buffer = Cursor::new(Vec::new());
+        (size as u32).write_be(&mut buffer);
+        value.write_to(&mut buffer);
+        self.write_bytes(handle.addr, &buffer.into_inner());
     }
 }
 
@@ -105,62 +189,6 @@ impl<T> Ptr<T> {
 
     pub fn is_null(&self) -> bool {
         self.addr == 0
-    }
-}
-
-pub struct Scope<'a> {
-    memory: &'a mut Memory,
-}
-
-impl<'a> Scope<'a> {
-    pub fn new(memory: &'a mut Memory) -> Self {
-        Self { memory }
-    }
-
-    pub fn lookup<T: BinRead + 'static>(&self, ptr: Ptr<T>) -> Handle<T>
-    where
-        T::Args<'a>: Default,
-    {
-        use binrw::BinReaderExt;
-
-        let addr = ptr.addr;
-        let bytes = self.memory.read_static::<4>(addr);
-        let len = u32::from_be_bytes(bytes);
-        let bytes = self.memory.read_uncommited(addr + 4, len);
-        let mut cursor = Cursor::new(bytes);
-        let value: T = cursor.read_ne().unwrap();
-
-        Handle {
-            addr,
-            value: Rc::new(RefCell::new(value)),
-        }
-    }
-
-    pub fn write<T: ServiceEntity>(&mut self, value: T) -> Handle<T> {
-        let size = value.size() + 4; // 4 bytes in size
-        let addr = self.memory.alloc(size);
-        let mut buffer = Cursor::new(Vec::new());
-        (size as PageOffset).write_be(&mut buffer);
-        value.write_to(&mut buffer);
-        self.memory.write(addr, &buffer.into_inner());
-
-        Handle {
-            addr,
-            value: Rc::new(RefCell::new(value)),
-        }
-    }
-
-    pub fn update<T: ServiceEntity>(&mut self, handle: &Handle<T>) {
-        let value = RefCell::borrow(&handle.value);
-        let size = value.size() + 4; // 4 bytes in size
-        let mut buffer = Cursor::new(Vec::new());
-        (size as u32).write_be(&mut buffer);
-        value.write_to(&mut buffer);
-        self.memory.write(handle.addr, &buffer.into_inner());
-    }
-
-    pub fn finish(self) {
-        self.memory.commit();
     }
 }
 

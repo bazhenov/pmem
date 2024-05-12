@@ -3,4 +3,4 @@
 mod memory;
 mod page;
 
-pub use memory::{Memory, Ptr, Scope, ServiceEntity};
+pub use memory::{Memory, Ptr, ServiceEntity, Transaction};

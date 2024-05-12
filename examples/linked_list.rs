@@ -1,11 +1,11 @@
 use binrw::{BinRead, BinWrite};
-use pmem::{Ptr, Scope, ServiceEntity};
+use pmem::{Ptr, ServiceEntity, Transaction};
 use std::{io::Cursor, mem};
 
 fn main() {}
 
-struct LinkedList<'a> {
-    scope: Scope<'a>,
+struct LinkedList<'m, 't> {
+    tx: &'t mut Transaction<'m>,
     root: Ptr<ListNode>,
 }
 
@@ -26,13 +26,13 @@ impl ServiceEntity for ListNode {
     }
 }
 
-impl<'a> LinkedList<'a> {
-    fn new(scope: Scope<'a>, root: Ptr<ListNode>) -> Self {
-        Self { scope, root }
+impl<'m, 't> LinkedList<'m, 't> {
+    fn new(tx: &'t mut Transaction<'m>, root: Ptr<ListNode>) -> Self {
+        Self { tx, root }
     }
 
     fn push_front(&mut self, value: i32) {
-        let handle = self.scope.write(ListNode {
+        let handle = self.tx.write(ListNode {
             value,
             next: self.root,
         });
@@ -44,7 +44,7 @@ impl<'a> LinkedList<'a> {
         let mut len = 0;
         while !node.is_null() {
             len += 1;
-            node = self.scope.lookup(node).as_ref().next;
+            node = self.tx.lookup(node).as_ref().next;
         }
         len
     }
@@ -69,18 +69,15 @@ mod tests {
     #[test]
     fn check_simple_allocation() {
         let mut memory = Memory::new();
-        let a_ptr = {
-            let mut scope = Scope::new(&mut memory);
-
-            let a = scope.write(ListNode {
+        let a_ptr = memory.change(|tx| {
+            let a = tx.write(ListNode {
                 value: 42,
                 next: Ptr::null(),
             });
             a.ptr()
-        };
+        });
 
-        let mut scope = Scope::new(&mut memory);
-        let handle = scope.lookup(a_ptr);
+        let handle = memory.start().lookup(a_ptr);
         assert_eq!(handle.as_ref().value, 42);
     }
 
@@ -88,23 +85,21 @@ mod tests {
     fn check_complex_allocation() {
         let mut memory = Memory::new();
 
-        let list_ptr = {
-            let mut scope = Scope::new(&mut memory);
-            let mut b = scope.write(ListNode {
+        let list_ptr = memory.change(|tx| {
+            let mut b = tx.write(ListNode {
                 value: 35,
                 next: Ptr::null(),
             });
-            let mut a = scope.write(ListNode {
+            let mut a = tx.write(ListNode {
                 value: 34,
                 next: b.ptr(),
             });
-            scope.finish();
 
             a.ptr()
-        };
+        });
 
-        let mut scope = Scope::new(&mut memory);
-        let list = LinkedList::new(scope, list_ptr);
+        let mut tx = memory.start();
+        let list = LinkedList::new(&mut tx, list_ptr);
         assert_eq!(list.len(), 2);
     }
 
@@ -112,19 +107,18 @@ mod tests {
     fn check_pushing_values_to_list() {
         let mut memory = Memory::new();
 
-        let root_ptr = {
-            let mut scope = Scope::new(&mut memory);
-            let mut list = LinkedList::new(scope, Ptr::null());
+        let root_ptr = memory.change(|tx| {
+            let mut list = LinkedList::new(tx, Ptr::null());
 
             list.push_front(3);
             list.push_front(2);
             list.push_front(1);
 
             list.ptr()
-        };
+        });
 
-        let scope = Scope::new(&mut memory);
-        let list = LinkedList::new(scope, root_ptr);
+        let mut tx = memory.start();
+        let list = LinkedList::new(&mut tx, root_ptr);
         // let values = list.iter().collect();
         assert_eq!(list.len(), 3);
     }
