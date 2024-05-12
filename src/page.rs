@@ -1,7 +1,11 @@
-use std::{borrow::Cow, ops::Range};
+use std::{
+    borrow::Cow,
+    ops::{Add, Range},
+};
 
 const PAGE_SIZE: usize = 1 << 16; // 64KB
 type Patch = (usize, Vec<u8>);
+pub type Addr = u32;
 
 pub struct Page {
     snapshots: Vec<Snapshot>,
@@ -76,7 +80,7 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    pub fn as_bytes_mut(&mut self, idx: Range<usize>) -> &mut [u8] {
+    pub fn zeroed(&mut self, idx: Range<usize>) -> &mut [u8] {
         assert!(
             0 < idx.len() && idx.len() <= PAGE_SIZE,
             "idx range should be at least 1 byte ({:?})",
@@ -86,6 +90,11 @@ impl Snapshot {
         self.patches.push((idx.start, vec![0; idx.len()]));
         let (_, patch) = self.patches.last_mut().unwrap();
         patch.as_mut_slice()
+    }
+
+    pub fn write(&mut self, addr: Addr, bytes: &[u8]) {
+        assert!(bytes.len() <= PAGE_SIZE, "Buffer too large");
+        self.patches.push((addr as usize, bytes.to_vec()))
     }
 }
 
@@ -119,7 +128,7 @@ mod tests {
         let mut page = Page::from("Jekyll");
 
         let mut snapshot = Snapshot::default();
-        snapshot.as_bytes_mut(0..4).copy_from_slice(b"Hide");
+        snapshot.write(0, b"Hide");
 
         page.commit(snapshot);
         assert_eq!(&*page.as_bytes(0..4), b"Hide");
@@ -129,7 +138,7 @@ mod tests {
     fn uncommited_changes_should_be_visible_via_as_bytes_uncommited() {
         let mut page = Page::from("Jekyll");
         let mut snapshot = Snapshot::default();
-        snapshot.as_bytes_mut(0..4).copy_from_slice(b"Hide");
+        snapshot.write(0, b"Hide");
 
         assert_eq!(&*page.as_bytes_uncommited(0..4, &snapshot), b"Hide");
     }
@@ -139,7 +148,7 @@ mod tests {
         let mut page = Page::from("Hello panic!");
 
         let mut snapshot = Snapshot::default();
-        snapshot.as_bytes_mut(6..11).copy_from_slice(b"world");
+        snapshot.write(6, b"world");
 
         page.commit(snapshot);
 
@@ -176,8 +185,9 @@ mod tests {
                 for patches in snapshots {
                     for (offset, bytes) in patches {
                         let mut snapshot = Snapshot::default();
+                        snapshot.write(offset as u32, &bytes);
+
                         let range = offset..offset + bytes.len();
-                        snapshot.as_bytes_mut(range.clone()).copy_from_slice(bytes.as_slice());
                         mirror[range].copy_from_slice(bytes.as_slice());
                         page.commit(snapshot);
                     }

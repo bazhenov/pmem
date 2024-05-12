@@ -1,3 +1,4 @@
+use crate::page::Addr;
 use crate::page::Page;
 use crate::page::Snapshot;
 use binrw::BinRead;
@@ -11,6 +12,7 @@ use std::cell::RefCell;
 use std::cell::RefMut;
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::io::Write;
 use std::marker::PhantomData;
 use std::ops::Range;
 use std::{io::Cursor, rc::Rc};
@@ -51,12 +53,16 @@ impl Memory {
         assert!(size > 0);
         let addr = self.next_addr;
         self.next_addr += size;
-        let bytes = self.snapshot.as_bytes_mut(addr..addr + size);
+        let bytes = self.snapshot.zeroed(addr..addr + size);
         (addr as u32, bytes)
     }
 
     pub fn read_mut(&mut self, idx: Range<usize>) -> &mut [u8] {
-        self.snapshot.as_bytes_mut(idx)
+        self.snapshot.zeroed(idx)
+    }
+
+    pub fn write(&mut self, addr: Addr, bytes: &[u8]) {
+        self.snapshot.write(addr, bytes)
     }
 
     pub fn read(&self, idx: Range<usize>) -> Cow<[u8]> {
@@ -123,7 +129,7 @@ mod tests {
         let scope = Scope::open(&mut memory);
 
         let mut list = LinkedList::new(scope);
-        list.push(12);
+        list.push(42);
 
         assert_eq!(list.len(), 1);
     }
@@ -188,9 +194,8 @@ impl ServiceEntity for ListNode {
         8
     }
 
-    fn write_to(&self, buffer: &mut [u8]) {
-        let mut cursor = Cursor::new(buffer);
-        self.write(&mut cursor).unwrap();
+    fn write_to(&self, buffer: &mut Cursor<Vec<u8>>) {
+        self.write(buffer).unwrap();
     }
 }
 
@@ -207,7 +212,6 @@ impl<'a> LinkedList<'a> {
             value,
             next: Ptr::null(),
         });
-        self.scope.write(&handle);
         self.root = handle.ptr();
     }
 
@@ -225,8 +229,6 @@ impl<'a> LinkedList<'a> {
 struct Utf8<'a> {
     data: &'a str,
 }
-
-type Addr = u32;
 
 struct Scope<'a> {
     memory: &'a mut Memory,
@@ -248,7 +250,8 @@ impl<'a> Scope<'a> {
         use binrw::BinReaderExt;
 
         let addr = ptr.addr as usize;
-        let size = u32::from_ne_bytes(self.memory.read_static::<4>(addr)) as usize;
+        let bytes = self.memory.read_static::<4>(addr);
+        let size = u32::from_be_bytes(bytes) as usize;
         let bytes = self.memory.read_uncommited((addr + 4)..(addr + 4 + size));
         let mut cursor = Cursor::new(bytes);
         let value: T = cursor.read_ne().unwrap();
@@ -262,8 +265,10 @@ impl<'a> Scope<'a> {
     fn new<T: ServiceEntity>(&mut self, value: T) -> Handle<T> {
         let size = value.size() + 4; // 4 bytes in size
         let (addr, bytes) = self.memory.alloc(size);
-        bytes[0..4].copy_from_slice(&(size as u32).to_ne_bytes());
-        value.write_to(&mut bytes[4..]);
+        let mut buffer = Cursor::new(Vec::new());
+        (size as u32).write_be(&mut buffer);
+        value.write_to(&mut buffer);
+        self.memory.write(addr, &buffer.into_inner());
 
         Handle {
             addr: addr as u32,
@@ -275,18 +280,6 @@ impl<'a> Scope<'a> {
 
     fn finish(&self) {
         todo!()
-    }
-
-    fn write<T: ServiceEntity>(&mut self, handle: &Handle<T>) {
-        let entity = RefCell::borrow(&handle.value);
-        let size = entity.size() + 4;
-        let bytes = self
-            .memory
-            .read_mut(handle.addr as usize..handle.addr as usize + (size as usize));
-        let (header, body) = bytes.split_at_mut(4);
-        let mut cursor = Cursor::new(header);
-        cursor.write_ne(&(size as u32)).unwrap();
-        entity.write_to(body);
     }
 }
 
@@ -330,7 +323,7 @@ impl<T: Debug + ServiceEntity + 'static> JoinHandle for HandleImpl<T> {
 
 trait ServiceEntity {
     fn size(&self) -> usize;
-    fn write_to(&self, buffer: &mut [u8]);
+    fn write_to(&self, buffer: &mut Cursor<Vec<u8>>);
 }
 
 trait JoinHandle {
