@@ -58,26 +58,29 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore]
     fn check_allocation() {
         let mut allocator = Allocator::new();
-        let page = Page::new();
-        let mut scope = Scope::open(&mut allocator, page);
+        let mut page = Page::new();
+        let a_ptr = {
+            let mut scope = Scope::open(&mut allocator, &mut page);
 
-        let a = scope.new(ListNode {
-            value: 42,
-            next: Ptr::null(),
-        });
+            let a = scope.new(ListNode {
+                value: 42,
+                next: Ptr::null(),
+            });
+            a.ptr()
+        };
 
-        let handle = scope.lookup(a.ptr());
+        let mut scope = Scope::open(&mut allocator, &mut page);
+        let handle = scope.lookup(a_ptr);
         assert_eq!(RefCell::borrow(&handle.value).value, 42);
     }
 
     #[test]
     fn allocate_simple_value() {
         let mut allocator = Allocator::new();
-        let page = Page::new();
-        let mut scope = Scope::open(&mut allocator, page);
+        let mut page = Page::new();
+        let mut scope = Scope::open(&mut allocator, &mut page);
 
         let mut a = scope.new(ListNode {
             value: 35,
@@ -95,9 +98,9 @@ mod tests {
     #[test]
     fn new_linked_list() {
         let mut allocator = Allocator::new();
-        let page = Page::new();
+        let mut page = Page::new();
 
-        let scope = Scope::open(&mut allocator, page);
+        let scope = Scope::open(&mut allocator, &mut page);
 
         let mut list = LinkedList::new(scope);
         list.push(12);
@@ -208,12 +211,12 @@ type Addr = u32;
 
 struct Scope<'a> {
     allocator: &'a mut Allocator,
-    page: Page,
+    page: &'a mut Page,
     active_set: RefCell<HashMap<Addr, Rc<RefCell<dyn Any>>>>,
 }
 
 impl<'a> Scope<'a> {
-    fn open(allocator: &'a mut Allocator, page: Page) -> Self {
+    fn open(allocator: &'a mut Allocator, page: &'a mut Page) -> Self {
         Self {
             allocator,
             page,
@@ -240,9 +243,14 @@ impl<'a> Scope<'a> {
     }
 
     fn new<T: ServiceEntity>(&mut self, value: T) -> Handle<T> {
-        // let addr = self.allocator.alloc::<T>();
-        let size = value.size();
+        let size = value.size() + 4; // 4 bytes in size
         let addr = self.allocator.alloc_untyped(size);
+        let addr_u = addr as usize;
+        let sz = self.page.as_bytes_mut(addr_u..addr_u + size);
+        sz[0..4].copy_from_slice(&(size as u32).to_ne_bytes());
+
+        value.write_to(&mut sz[4..]);
+
         Handle {
             addr: addr as u32,
             value: Rc::new(RefCell::new(value)),
