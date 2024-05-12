@@ -1,11 +1,15 @@
-use std::{
-    borrow::Cow,
-    ops::{Add, Range},
-};
+use std::{borrow::Cow, ops::Range};
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("Page offset is out of bounds")]
+    PageOffsetTooLarge,
+}
 
 const PAGE_SIZE: usize = 1 << 16; // 64KB
 type Patch = (usize, Vec<u8>);
 pub type Addr = u32;
+pub type PageOffset = u32;
 
 pub struct Page {
     snapshots: Vec<Snapshot>,
@@ -16,17 +20,23 @@ impl Page {
         Self { snapshots: vec![] }
     }
 
-    pub fn as_bytes(&self, range: Range<usize>) -> Cow<[u8]> {
-        as_bytes_with_patches(range, self.snapshots.iter().flat_map(|s| s.patches.iter()))
+    pub fn as_bytes(&self, addr: PageOffset, len: PageOffset) -> Cow<[u8]> {
+        let patches = self.snapshots.iter().flat_map(|s| s.patches.iter());
+        read_with_patches(addr, len, patches)
     }
 
-    pub fn as_bytes_uncommited(&self, range: Range<usize>, snapshot: &Snapshot) -> Cow<'_, [u8]> {
+    pub fn read_uncommited(
+        &self,
+        addr: PageOffset,
+        len: PageOffset,
+        snapshot: &Snapshot,
+    ) -> Cow<'_, [u8]> {
         let patches = self
             .snapshots
             .iter()
             .flat_map(|s| s.patches.iter())
             .chain(snapshot.patches.iter());
-        as_bytes_with_patches(range, patches)
+        read_with_patches(addr, len, patches)
     }
 
     pub fn commit(&mut self, snapshot: Snapshot) {
@@ -42,15 +52,14 @@ impl From<Snapshot> for Page {
     }
 }
 
-fn as_bytes_with_patches<'a, 'b>(
-    range: Range<usize>,
+fn read_with_patches<'a, 'b>(
+    addr: PageOffset,
+    len: PageOffset,
     patches: impl Iterator<Item = &'a Patch>,
 ) -> Cow<'b, [u8]> {
-    assert!(
-        range.len() <= PAGE_SIZE && range.end <= PAGE_SIZE,
-        "Out of bounds read"
-    );
-    let mut slice = vec![0; range.len()];
+    assert!(len <= PAGE_SIZE as u32, "Out of bounds read");
+    let mut slice = vec![0; len as usize];
+    let range = (addr as usize)..(addr + len) as usize;
 
     for (offset, bytes) in patches.filter(|p| intersects(p, &range)) {
         // Calculating intersection of the path and input interval
@@ -80,14 +89,17 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    pub fn zeroed(&mut self, idx: Range<usize>) -> &mut [u8] {
+    pub fn zeroed(&mut self, addr: PageOffset, len: PageOffset) -> &mut [u8] {
         assert!(
-            0 < idx.len() && idx.len() <= PAGE_SIZE,
-            "idx range should be at least 1 byte ({:?})",
-            idx
+            0 < len && len <= PAGE_SIZE as PageOffset,
+            "len should be at least 1 byte ({:?})",
+            len
         );
-        assert!(idx.end < PAGE_SIZE, "idx.end out of page bounds");
-        self.patches.push((idx.start, vec![0; idx.len()]));
+        assert!(
+            addr + len < PAGE_SIZE as PageOffset,
+            "end out of page bounds"
+        );
+        self.patches.push((addr as usize, vec![0; len as usize]));
         let (_, patch) = self.patches.last_mut().unwrap();
         patch.as_mut_slice()
     }
@@ -119,8 +131,8 @@ mod tests {
     #[test]
     fn create_new_page() {
         let page = Page::from("foo");
-        assert_eq!(&*page.as_bytes(0..3), b"foo");
-        assert_eq!(&*page.as_bytes(3..4), [0]);
+        assert_eq!(&*page.as_bytes(0, 3), b"foo");
+        assert_eq!(&*page.as_bytes(3, 1), [0]);
     }
 
     #[test]
@@ -131,7 +143,7 @@ mod tests {
         snapshot.write(0, b"Hide");
 
         page.commit(snapshot);
-        assert_eq!(&*page.as_bytes(0..4), b"Hide");
+        assert_eq!(&*page.as_bytes(0, 4), b"Hide");
     }
 
     #[test]
@@ -140,7 +152,7 @@ mod tests {
         let mut snapshot = Snapshot::default();
         snapshot.write(0, b"Hide");
 
-        assert_eq!(&*page.as_bytes_uncommited(0..4, &snapshot), b"Hide");
+        assert_eq!(&*page.read_uncommited(0, 4, &snapshot), b"Hide");
     }
 
     #[test]
@@ -152,12 +164,12 @@ mod tests {
 
         page.commit(snapshot);
 
-        assert_eq!(&*page.as_bytes(0..12), b"Hello world!");
-        assert_eq!(&*page.as_bytes(0..8), b"Hello wo");
-        assert_eq!(&*page.as_bytes(3..12), b"lo world!");
-        assert_eq!(&*page.as_bytes(6..11), b"world");
-        assert_eq!(&*page.as_bytes(8..12), b"rld!");
-        assert_eq!(&*page.as_bytes(7..10), b"orl");
+        assert_eq!(&*page.as_bytes(0, 12), b"Hello world!");
+        assert_eq!(&*page.as_bytes(0, 8), b"Hello wo");
+        assert_eq!(&*page.as_bytes(3, 9), b"lo world!");
+        assert_eq!(&*page.as_bytes(6, 5), b"world");
+        assert_eq!(&*page.as_bytes(8, 4), b"rld!");
+        assert_eq!(&*page.as_bytes(7, 3), b"orl");
     }
 
     impl<T: AsRef<str>> From<T> for Page {
@@ -193,7 +205,7 @@ mod tests {
                     }
                 }
 
-                assert_eq!(page.as_bytes(0..PAGE_SIZE).deref(), mirror);
+                assert_eq!(page.as_bytes(0, PAGE_SIZE as PageOffset).deref(), mirror);
             }
         }
 

@@ -1,26 +1,20 @@
-use crate::page::Addr;
-use crate::page::Page;
-use crate::page::Snapshot;
-use binrw::BinRead;
-use binrw::BinWrite;
-use binrw::BinWriterExt;
-use std::any::Any;
-use std::any::TypeId;
-use std::borrow::Borrow;
-use std::borrow::Cow;
-use std::cell::Ref;
-use std::cell::RefCell;
-use std::cell::RefMut;
-use std::collections::HashMap;
-use std::fmt::Debug;
-use std::io::Write;
-use std::marker::PhantomData;
-use std::mem;
-use std::ops::Range;
-use std::{io::Cursor, rc::Rc};
+use crate::page::{Addr, Page, PageOffset, Snapshot};
+use binrw::{BinRead, BinWrite};
+use std::{
+    any::{Any, TypeId},
+    borrow::Cow,
+    cell::{Ref, RefCell, RefMut},
+    collections::HashMap,
+    fmt::Debug,
+    io::Cursor,
+    marker::PhantomData,
+    mem,
+    ops::Range,
+    rc::Rc,
+};
 use thiserror::Error;
 
-const START_ADDR: usize = 4;
+const START_ADDR: PageOffset = 4;
 
 #[derive(Error, Debug)]
 enum Error {
@@ -31,7 +25,7 @@ enum Error {
 pub struct Memory {
     page: Page,
     snapshot: Snapshot,
-    next_addr: usize,
+    next_addr: PageOffset,
 }
 
 impl Memory {
@@ -51,28 +45,19 @@ impl Memory {
         }
     }
 
-    fn alloc(&mut self, size: usize) -> (Addr, &mut [u8]) {
+    fn alloc(&mut self, size: usize) -> Addr {
         assert!(size > 0);
         let addr = self.next_addr;
-        self.next_addr += size;
-        let bytes = self.snapshot.zeroed(addr..addr + size);
-        (addr as u32, bytes)
-    }
-
-    pub fn read_mut(&mut self, idx: Range<usize>) -> &mut [u8] {
-        self.snapshot.zeroed(idx)
+        self.next_addr += size as u32;
+        addr
     }
 
     pub fn write(&mut self, addr: Addr, bytes: &[u8]) {
         self.snapshot.write(addr, bytes)
     }
 
-    pub fn read(&self, idx: Range<usize>) -> Cow<[u8]> {
-        self.page.as_bytes(idx)
-    }
-
-    pub fn read_uncommited(&self, range: Range<usize>) -> Cow<[u8]> {
-        self.page.as_bytes_uncommited(range, &self.snapshot)
+    pub fn read_uncommited(&self, addr: PageOffset, len: PageOffset) -> Cow<[u8]> {
+        self.page.read_uncommited(addr, len, &self.snapshot)
     }
 
     pub fn commit(&mut self) {
@@ -80,10 +65,10 @@ impl Memory {
         self.page.commit(snapshot);
     }
 
-    pub fn read_static<const N: usize>(&self, offset: usize) -> [u8; N] {
+    pub fn read_static<const N: usize>(&self, offset: PageOffset) -> [u8; N] {
         let mut ret = [0; N];
-        let bytes = self.read_uncommited(offset..offset + N);
-        for (to, from) in ret.iter_mut().zip(bytes.into_iter()) {
+        let bytes = self.read_uncommited(offset, N as PageOffset);
+        for (to, from) in ret.iter_mut().zip(bytes.iter()) {
             *to = *from;
         }
         ret
@@ -249,29 +234,29 @@ impl<'a> Scope<'a> {
     {
         use binrw::BinReaderExt;
 
-        let addr = ptr.addr as usize;
+        let addr = ptr.addr;
         let bytes = self.memory.read_static::<4>(addr);
-        let size = u32::from_be_bytes(bytes) as usize;
-        let bytes = self.memory.read_uncommited((addr + 4)..(addr + 4 + size));
+        let len = u32::from_be_bytes(bytes);
+        let bytes = self.memory.read_uncommited(addr + 4, len);
         let mut cursor = Cursor::new(bytes);
         let value: T = cursor.read_ne().unwrap();
 
         Handle {
-            addr: addr as u32,
+            addr,
             value: Rc::new(RefCell::new(value)),
         }
     }
 
     fn create<T: ServiceEntity>(&mut self, value: T) -> Handle<T> {
         let size = value.size() + 4; // 4 bytes in size
-        let (addr, bytes) = self.memory.alloc(size);
+        let addr = self.memory.alloc(size);
         let mut buffer = Cursor::new(Vec::new());
-        (size as u32).write_be(&mut buffer);
+        (size as PageOffset).write_be(&mut buffer);
         value.write_to(&mut buffer);
         self.memory.write(addr, &buffer.into_inner());
 
         Handle {
-            addr: addr as u32,
+            addr,
             value: Rc::new(RefCell::new(value)),
         }
     }
@@ -284,8 +269,6 @@ impl<'a> Scope<'a> {
         value.write_to(&mut buffer);
         self.memory.write(handle.addr, &buffer.into_inner());
     }
-
-    fn change<T>(&self, ptr: Ptr<T>, f: impl Fn(&mut T)) {}
 
     fn finish(self) {
         self.memory.commit();
