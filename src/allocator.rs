@@ -75,55 +75,8 @@ impl Memory {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn check_simple_allocation() {
-        let mut memory = Memory::new();
-        let a_ptr = {
-            let mut scope = Scope::new(&mut memory);
-
-            let a = scope.create(ListNode {
-                value: 42,
-                next: Ptr::null(),
-            });
-            a.ptr()
-        };
-
-        let mut scope = Scope::new(&mut memory);
-        let handle = scope.lookup(a_ptr);
-        assert_eq!(RefCell::borrow(&handle.value).value, 42);
-    }
-
-    #[test]
-    fn check_complex_allocation() {
-        let mut memory = Memory::new();
-
-        let a_ptr = {
-            let mut scope = Scope::new(&mut memory);
-            let mut b = scope.create(ListNode {
-                value: 35,
-                next: Ptr::null(),
-            });
-            let mut a = scope.create(ListNode {
-                value: 34,
-                next: b.ptr(),
-            });
-            scope.finish();
-
-            a.ptr()
-        };
-
-        let mut scope = Scope::new(&mut memory);
-        let list = LinkedList::new(scope, a_ptr);
-        assert_eq!(list.len(), 2);
-    }
-}
-
 #[derive(BinRead, BinWrite)]
-struct Ptr<T> {
+pub struct Ptr<T> {
     addr: u32,
     _phantom: PhantomData<T>,
 }
@@ -146,11 +99,11 @@ impl<T> Ptr<T> {
         }
     }
 
-    fn null() -> Self {
+    pub fn null() -> Self {
         Self::from_addr(0)
     }
 
-    fn is_null(&self) -> bool {
+    pub fn is_null(&self) -> bool {
         self.addr == 0
     }
 }
@@ -164,71 +117,24 @@ fn borrow_downcast<T: Any>(cell: &RefCell<dyn Any>) -> Option<Ref<T>> {
     }
 }
 
-struct LinkedList<'a> {
-    scope: Scope<'a>,
-    root: Ptr<ListNode>,
-}
-
-#[derive(BinRead, BinWrite, Clone)]
-#[brw(little)]
-struct ListNode {
-    value: i32,
-    next: Ptr<ListNode>,
-}
-
-impl ServiceEntity for ListNode {
-    fn size(&self) -> usize {
-        8
-    }
-
-    fn write_to(&self, buffer: &mut Cursor<Vec<u8>>) {
-        self.write(buffer).unwrap();
-    }
-}
-
-impl<'a> LinkedList<'a> {
-    fn new(scope: Scope<'a>, root: Ptr<ListNode>) -> Self {
-        Self { scope, root }
-    }
-
-    fn push(&mut self, value: i32) {
-        let handle = self.scope.create(ListNode {
-            value,
-            next: Ptr::null(),
-        });
-        self.root = handle.ptr();
-    }
-
-    fn len(&self) -> usize {
-        let mut node: Ptr<_> = self.root;
-        let mut len = 0;
-        while !node.is_null() {
-            // dbg!(node.addr);
-            len += 1;
-            node = self.scope.lookup(node).as_ref().next;
-        }
-        len
-    }
-}
-
 struct Utf8<'a> {
     data: &'a str,
 }
 
-struct Scope<'a> {
+pub struct Scope<'a> {
     memory: &'a mut Memory,
     active_set: RefCell<HashMap<Addr, Rc<RefCell<dyn Any>>>>,
 }
 
 impl<'a> Scope<'a> {
-    fn new(memory: &'a mut Memory) -> Self {
+    pub fn new(memory: &'a mut Memory) -> Self {
         Self {
             memory,
             active_set: RefCell::new(HashMap::new()),
         }
     }
 
-    fn lookup<T: BinRead + 'static>(&'a self, ptr: Ptr<T>) -> Handle<T>
+    pub fn lookup<T: BinRead + 'static>(&'a self, ptr: Ptr<T>) -> Handle<T>
     where
         T::Args<'a>: Default,
     {
@@ -247,7 +153,7 @@ impl<'a> Scope<'a> {
         }
     }
 
-    fn create<T: ServiceEntity>(&mut self, value: T) -> Handle<T> {
+    pub fn write<T: ServiceEntity>(&mut self, value: T) -> Handle<T> {
         let size = value.size() + 4; // 4 bytes in size
         let addr = self.memory.alloc(size);
         let mut buffer = Cursor::new(Vec::new());
@@ -261,7 +167,7 @@ impl<'a> Scope<'a> {
         }
     }
 
-    fn update<T: ServiceEntity>(&mut self, handle: &Handle<T>) {
+    pub fn update<T: ServiceEntity>(&mut self, handle: &Handle<T>) {
         let value = RefCell::borrow(&handle.value);
         let size = value.size() + 4; // 4 bytes in size
         let mut buffer = Cursor::new(Vec::new());
@@ -270,12 +176,12 @@ impl<'a> Scope<'a> {
         self.memory.write(handle.addr, &buffer.into_inner());
     }
 
-    fn finish(self) {
+    pub fn finish(self) {
         self.memory.commit();
     }
 }
 
-struct Handle<T> {
+pub struct Handle<T> {
     addr: Addr,
     value: Rc<RefCell<T>>,
 }
@@ -285,11 +191,11 @@ impl<T> Handle<T> {
         RefCell::borrow_mut(&self.value)
     }
 
-    fn as_ref(&self) -> Ref<T> {
+    pub fn as_ref(&self) -> Ref<T> {
         RefCell::borrow(&self.value)
     }
 
-    fn ptr(&self) -> Ptr<T> {
+    pub fn ptr(&self) -> Ptr<T> {
         Ptr {
             addr: self.addr,
             _phantom: PhantomData::<T>,
@@ -313,7 +219,7 @@ impl<T: Debug + ServiceEntity + 'static> JoinHandle for HandleImpl<T> {
     }
 }
 
-trait ServiceEntity {
+pub trait ServiceEntity {
     fn size(&self) -> usize;
     fn write_to(&self, buffer: &mut Cursor<Vec<u8>>);
 }
