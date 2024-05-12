@@ -1,13 +1,15 @@
-use crate::memory::{Ptr, Scope, ServiceEntity};
 use binrw::{BinRead, BinWrite};
-use std::io::Cursor;
+use pmem::{Ptr, Scope, ServiceEntity};
+use std::{io::Cursor, mem};
+
+fn main() {}
 
 struct LinkedList<'a> {
     scope: Scope<'a>,
     root: Ptr<ListNode>,
 }
 
-#[derive(BinRead, BinWrite, Clone)]
+#[derive(BinRead, BinWrite)]
 #[brw(little)]
 struct ListNode {
     value: i32,
@@ -16,7 +18,7 @@ struct ListNode {
 
 impl ServiceEntity for ListNode {
     fn size(&self) -> usize {
-        8
+        mem::size_of::<Self>()
     }
 
     fn write_to(&self, buffer: &mut Cursor<Vec<u8>>) {
@@ -29,10 +31,10 @@ impl<'a> LinkedList<'a> {
         Self { scope, root }
     }
 
-    fn push(&mut self, value: i32) {
+    fn push_front(&mut self, value: i32) {
         let handle = self.scope.write(ListNode {
             value,
-            next: Ptr::null(),
+            next: self.root,
         });
         self.root = handle.ptr();
     }
@@ -41,18 +43,28 @@ impl<'a> LinkedList<'a> {
         let mut node: Ptr<_> = self.root;
         let mut len = 0;
         while !node.is_null() {
-            // dbg!(node.addr);
             len += 1;
             node = self.scope.lookup(node).as_ref().next;
         }
         len
+    }
+
+    // fn iter(&self) -> impl Iterator<Item = i32> {
+    //     ListIterator {
+    //         scope: self.scope,
+    //         ptr: self.root,
+    //     }
+    // }
+
+    fn ptr(&self) -> Ptr<ListNode> {
+        self.root
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::Memory;
+    use pmem::Memory;
 
     #[test]
     fn check_simple_allocation() {
@@ -76,7 +88,7 @@ mod tests {
     fn check_complex_allocation() {
         let mut memory = Memory::new();
 
-        let a_ptr = {
+        let list_ptr = {
             let mut scope = Scope::new(&mut memory);
             let mut b = scope.write(ListNode {
                 value: 35,
@@ -92,7 +104,28 @@ mod tests {
         };
 
         let mut scope = Scope::new(&mut memory);
-        let list = LinkedList::new(scope, a_ptr);
+        let list = LinkedList::new(scope, list_ptr);
         assert_eq!(list.len(), 2);
+    }
+
+    #[test]
+    fn check_pushing_values_to_list() {
+        let mut memory = Memory::new();
+
+        let root_ptr = {
+            let mut scope = Scope::new(&mut memory);
+            let mut list = LinkedList::new(scope, Ptr::null());
+
+            list.push_front(3);
+            list.push_front(2);
+            list.push_front(1);
+
+            list.ptr()
+        };
+
+        let scope = Scope::new(&mut memory);
+        let list = LinkedList::new(scope, root_ptr);
+        // let values = list.iter().collect();
+        assert_eq!(list.len(), 3);
     }
 }

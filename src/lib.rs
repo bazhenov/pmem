@@ -1,5 +1,6 @@
 #![allow(unused)]
 
-mod linked_list;
 mod memory;
 mod page;
+
+pub use memory::{Memory, Ptr, Scope, ServiceEntity};

@@ -110,18 +110,14 @@ impl<T> Ptr<T> {
 
 pub struct Scope<'a> {
     memory: &'a mut Memory,
-    active_set: RefCell<HashMap<Addr, Rc<RefCell<dyn Any>>>>,
 }
 
 impl<'a> Scope<'a> {
     pub fn new(memory: &'a mut Memory) -> Self {
-        Self {
-            memory,
-            active_set: RefCell::new(HashMap::new()),
-        }
+        Self { memory }
     }
 
-    pub fn lookup<T: BinRead + 'static>(&'a self, ptr: Ptr<T>) -> Handle<T>
+    pub fn lookup<T: BinRead + 'static>(&self, ptr: Ptr<T>) -> Handle<T>
     where
         T::Args<'a>: Default,
     {
