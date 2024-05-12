@@ -6,6 +6,7 @@ use binrw::BinWrite;
 use binrw::BinWriterExt;
 use std::any::Any;
 use std::any::TypeId;
+use std::borrow::Borrow;
 use std::borrow::Cow;
 use std::cell::Ref;
 use std::cell::RefCell;
@@ -14,6 +15,7 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::io::Write;
 use std::marker::PhantomData;
+use std::mem;
 use std::ops::Range;
 use std::{io::Cursor, rc::Rc};
 use thiserror::Error;
@@ -73,6 +75,11 @@ impl Memory {
         self.page.as_bytes_uncommited(range, &self.snapshot)
     }
 
+    pub fn commit(&mut self) {
+        let snapshot = mem::take(&mut self.snapshot);
+        self.page.commit(snapshot);
+    }
+
     pub fn read_static<const N: usize>(&self, offset: usize) -> [u8; N] {
         let mut ret = [0; N];
         let bytes = self.read_uncommited(offset..offset + N);
@@ -88,50 +95,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn check_allocation() {
+    fn check_simple_allocation() {
         let mut memory = Memory::new();
         let a_ptr = {
-            let mut scope = Scope::open(&mut memory);
+            let mut scope = Scope::new(&mut memory);
 
-            let a = scope.new(ListNode {
+            let a = scope.create(ListNode {
                 value: 42,
                 next: Ptr::null(),
             });
             a.ptr()
         };
 
-        let mut scope = Scope::open(&mut memory);
+        let mut scope = Scope::new(&mut memory);
         let handle = scope.lookup(a_ptr);
         assert_eq!(RefCell::borrow(&handle.value).value, 42);
     }
 
     #[test]
-    fn allocate_simple_value() {
+    fn check_complex_allocation() {
         let mut memory = Memory::new();
-        let mut scope = Scope::open(&mut memory);
 
-        let mut a = scope.new(ListNode {
-            value: 35,
-            next: Ptr::null(),
-        });
-        let mut b = scope.new(ListNode {
-            value: 35,
-            next: Ptr::null(),
-        });
+        let a_ptr = {
+            let mut scope = Scope::new(&mut memory);
+            let mut b = scope.create(ListNode {
+                value: 35,
+                next: Ptr::null(),
+            });
+            let mut a = scope.create(ListNode {
+                value: 34,
+                next: b.ptr(),
+            });
+            scope.finish();
 
-        a.as_mut().next = b.ptr();
-        b.as_mut().next = a.ptr();
-    }
+            a.ptr()
+        };
 
-    #[test]
-    fn new_linked_list() {
-        let mut memory = Memory::new();
-        let scope = Scope::open(&mut memory);
-
-        let mut list = LinkedList::new(scope);
-        list.push(42);
-
-        assert_eq!(list.len(), 1);
+        let mut scope = Scope::new(&mut memory);
+        let list = LinkedList::new(scope, a_ptr);
+        assert_eq!(list.len(), 2);
     }
 }
 
@@ -200,15 +202,12 @@ impl ServiceEntity for ListNode {
 }
 
 impl<'a> LinkedList<'a> {
-    fn new(scope: Scope<'a>) -> Self {
-        Self {
-            scope,
-            root: Ptr::from_addr(0),
-        }
+    fn new(scope: Scope<'a>, root: Ptr<ListNode>) -> Self {
+        Self { scope, root }
     }
 
     fn push(&mut self, value: i32) {
-        let handle = self.scope.new(ListNode {
+        let handle = self.scope.create(ListNode {
             value,
             next: Ptr::null(),
         });
@@ -219,6 +218,7 @@ impl<'a> LinkedList<'a> {
         let mut node: Ptr<_> = self.root;
         let mut len = 0;
         while !node.is_null() {
+            // dbg!(node.addr);
             len += 1;
             node = self.scope.lookup(node).as_ref().next;
         }
@@ -236,7 +236,7 @@ struct Scope<'a> {
 }
 
 impl<'a> Scope<'a> {
-    fn open(memory: &'a mut Memory) -> Self {
+    fn new(memory: &'a mut Memory) -> Self {
         Self {
             memory,
             active_set: RefCell::new(HashMap::new()),
@@ -262,7 +262,7 @@ impl<'a> Scope<'a> {
         }
     }
 
-    fn new<T: ServiceEntity>(&mut self, value: T) -> Handle<T> {
+    fn create<T: ServiceEntity>(&mut self, value: T) -> Handle<T> {
         let size = value.size() + 4; // 4 bytes in size
         let (addr, bytes) = self.memory.alloc(size);
         let mut buffer = Cursor::new(Vec::new());
@@ -276,10 +276,19 @@ impl<'a> Scope<'a> {
         }
     }
 
+    fn update<T: ServiceEntity>(&mut self, handle: &Handle<T>) {
+        let value = RefCell::borrow(&handle.value);
+        let size = value.size() + 4; // 4 bytes in size
+        let mut buffer = Cursor::new(Vec::new());
+        (size as u32).write_be(&mut buffer);
+        value.write_to(&mut buffer);
+        self.memory.write(handle.addr, &buffer.into_inner());
+    }
+
     fn change<T>(&self, ptr: Ptr<T>, f: impl Fn(&mut T)) {}
 
-    fn finish(&self) {
-        todo!()
+    fn finish(self) {
+        self.memory.commit();
     }
 }
 
