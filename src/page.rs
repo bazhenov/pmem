@@ -30,15 +30,6 @@ impl Page {
         patch.as_mut_slice()
     }
 
-    pub fn read_bytes<const N: usize>(&self, offset: usize) -> [u8; N] {
-        let mut ret = [0; N];
-        let bytes = self.as_bytes_uncommited(offset..offset + N);
-        for (to, from) in ret.iter_mut().zip(bytes.into_iter()) {
-            *to = *from;
-        }
-        ret
-    }
-
     pub fn as_bytes(&self, range: Range<usize>) -> Cow<[u8]> {
         self.as_bytes_with_patches(range, self.patches.iter())
     }
