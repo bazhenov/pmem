@@ -1,4 +1,5 @@
 use crate::page::Page;
+use crate::page::Snapshot;
 use binrw::BinRead;
 use binrw::BinWrite;
 use binrw::BinWriterExt;
@@ -17,21 +18,23 @@ use thiserror::Error;
 
 const START_ADDR: usize = 4;
 
-pub struct Memory {
-    page: Page,
-    next_addr: usize,
-}
-
 #[derive(Error, Debug)]
 enum Error {
     #[error("Pointer already initialized")]
     AlreadyInitialized,
 }
 
+pub struct Memory {
+    page: Page,
+    snapshot: Snapshot,
+    next_addr: usize,
+}
+
 impl Memory {
     fn from(page: Page) -> Self {
         Self {
             page,
+            snapshot: Snapshot::default(),
             next_addr: START_ADDR,
         }
     }
@@ -39,6 +42,7 @@ impl Memory {
     pub fn new() -> Self {
         Self {
             page: Page::new(),
+            snapshot: Snapshot::default(),
             next_addr: START_ADDR,
         }
     }
@@ -47,12 +51,12 @@ impl Memory {
         assert!(size > 0);
         let addr = self.next_addr;
         self.next_addr += size;
-        let bytes = self.page.as_bytes_mut(addr..addr + size);
+        let bytes = self.snapshot.as_bytes_mut(addr..addr + size);
         (addr as u32, bytes)
     }
 
     pub fn read_mut(&mut self, idx: Range<usize>) -> &mut [u8] {
-        self.page.as_bytes_mut(idx)
+        self.snapshot.as_bytes_mut(idx)
     }
 
     pub fn read(&self, idx: Range<usize>) -> Cow<[u8]> {
@@ -60,7 +64,7 @@ impl Memory {
     }
 
     pub fn read_uncommited(&self, range: Range<usize>) -> Cow<[u8]> {
-        self.page.as_bytes_uncommited(range)
+        self.page.as_bytes_uncommited(range, &self.snapshot)
     }
 
     pub fn read_static<const N: usize>(&self, offset: usize) -> [u8; N] {

@@ -4,20 +4,78 @@ const PAGE_SIZE: usize = 1 << 16; // 64KB
 type Patch = (usize, Vec<u8>);
 
 pub struct Page {
-    data: [u8; PAGE_SIZE],
-    uncommited: Vec<Patch>,
-    patches: Vec<Patch>,
+    snapshots: Vec<Snapshot>,
 }
 
 impl Page {
     pub fn new() -> Self {
-        Self {
-            data: [0; PAGE_SIZE],
-            uncommited: vec![],
-            patches: vec![],
-        }
+        Self { snapshots: vec![] }
     }
 
+    pub fn as_bytes(&self, range: Range<usize>) -> Cow<[u8]> {
+        as_bytes_with_patches(range, self.snapshots.iter().flat_map(|s| s.patches.iter()))
+    }
+
+    pub fn as_bytes_uncommited(&self, range: Range<usize>, snapshot: &Snapshot) -> Cow<'_, [u8]> {
+        let patches = self
+            .snapshots
+            .iter()
+            .flat_map(|s| s.patches.iter())
+            .chain(snapshot.patches.iter());
+        as_bytes_with_patches(range, patches)
+    }
+
+    pub fn commit(&mut self, snapshot: Snapshot) {
+        self.snapshots.push(snapshot);
+    }
+}
+
+impl From<Snapshot> for Page {
+    fn from(value: Snapshot) -> Self {
+        Self {
+            snapshots: vec![value],
+        }
+    }
+}
+
+fn as_bytes_with_patches<'a, 'b>(
+    range: Range<usize>,
+    patches: impl Iterator<Item = &'a Patch>,
+) -> Cow<'b, [u8]> {
+    assert!(
+        range.len() <= PAGE_SIZE && range.end <= PAGE_SIZE,
+        "Out of bounds read"
+    );
+    let mut slice = vec![0; range.len()];
+
+    for (offset, bytes) in patches.filter(|p| intersects(p, &range)) {
+        // Calculating intersection of the path and input interval
+        let start = range.start.max(*offset);
+        let end = range.end.min(offset + bytes.len());
+        let len = end - start;
+
+        let patch_range = {
+            let from = start.saturating_sub(*offset);
+            from..from + len
+        };
+
+        let slice_range = {
+            let from = start.saturating_sub(range.start);
+            from..from + len
+        };
+
+        slice[slice_range].copy_from_slice(&bytes[patch_range])
+    }
+
+    Cow::Owned(slice)
+}
+
+#[derive(Default)]
+pub struct Snapshot {
+    patches: Vec<Patch>,
+}
+
+impl Snapshot {
     pub fn as_bytes_mut(&mut self, idx: Range<usize>) -> &mut [u8] {
         assert!(
             0 < idx.len() && idx.len() <= PAGE_SIZE,
@@ -25,56 +83,17 @@ impl Page {
             idx
         );
         assert!(idx.end < PAGE_SIZE, "idx.end out of page bounds");
-        self.uncommited.push((idx.start, vec![0; idx.len()]));
-        let (_, patch) = self.uncommited.last_mut().unwrap();
+        self.patches.push((idx.start, vec![0; idx.len()]));
+        let (_, patch) = self.patches.last_mut().unwrap();
         patch.as_mut_slice()
     }
+}
 
-    pub fn as_bytes(&self, range: Range<usize>) -> Cow<[u8]> {
-        self.as_bytes_with_patches(range, self.patches.iter())
-    }
-
-    pub fn as_bytes_uncommited(&self, range: Range<usize>) -> Cow<[u8]> {
-        let patches = self.patches.iter().chain(self.uncommited.iter());
-        self.as_bytes_with_patches(range, patches)
-    }
-
-    fn as_bytes_with_patches<'a>(
-        &self,
-        range: Range<usize>,
-        patches: impl Iterator<Item = &'a Patch>,
-    ) -> Cow<[u8]> {
-        assert!(
-            range.len() <= PAGE_SIZE && range.end <= PAGE_SIZE,
-            "Out of bounds read"
-        );
-        let mut slice = vec![0; range.len()];
-        slice.copy_from_slice(&self.data[range.clone()]);
-
-        for (offset, bytes) in patches.filter(|p| intersects(p, &range)) {
-            // Calculating intersection of the path and input interval
-            let start = range.start.max(*offset);
-            let end = range.end.min(offset + bytes.len());
-            let len = end - start;
-
-            let patch_range = {
-                let from = start.saturating_sub(*offset);
-                from..from + len
-            };
-
-            let slice_range = {
-                let from = start.saturating_sub(range.start);
-                from..from + len
-            };
-
-            slice[slice_range].copy_from_slice(&bytes[patch_range])
+impl From<Patch> for Snapshot {
+    fn from(value: Patch) -> Self {
+        Self {
+            patches: vec![value],
         }
-
-        Cow::Owned(slice)
-    }
-
-    pub fn commit(&mut self) {
-        self.patches.extend(self.uncommited.drain(..));
     }
 }
 
@@ -96,26 +115,33 @@ mod tests {
     }
 
     #[test]
-    fn uncommited_changes_should_not_be_visible_via_as_bytes_mut() {
+    fn commited_changes_should_be_visible_via_commit() {
         let mut page = Page::from("Jekyll");
-        page.as_bytes_mut(0..4).copy_from_slice(b"Hide");
-        assert_eq!(&*page.as_bytes(0..6), b"Jekyll");
+
+        let mut snapshot = Snapshot::default();
+        snapshot.as_bytes_mut(0..4).copy_from_slice(b"Hide");
+
+        page.commit(snapshot);
+        assert_eq!(&*page.as_bytes(0..4), b"Hide");
     }
 
     #[test]
-    fn uncommited_changes_should_not_be_visible_via_as_bytes_mut_uncommited() {
+    fn uncommited_changes_should_be_visible_via_as_bytes_uncommited() {
         let mut page = Page::from("Jekyll");
-        page.as_bytes_mut(0..4).copy_from_slice(b"Hide");
-        assert_eq!(&*page.as_bytes_uncommited(0..4), b"Hide");
+        let mut snapshot = Snapshot::default();
+        snapshot.as_bytes_mut(0..4).copy_from_slice(b"Hide");
+
+        assert_eq!(&*page.as_bytes_uncommited(0..4, &snapshot), b"Hide");
     }
 
     #[test]
     fn patch_page() {
         let mut page = Page::from("Hello panic!");
 
-        page.as_bytes_mut(6..11).copy_from_slice(b"world");
+        let mut snapshot = Snapshot::default();
+        snapshot.as_bytes_mut(6..11).copy_from_slice(b"world");
 
-        page.commit();
+        page.commit(snapshot);
 
         assert_eq!(&*page.as_bytes(0..12), b"Hello world!");
         assert_eq!(&*page.as_bytes(0..8), b"Hello wo");
@@ -129,14 +155,8 @@ mod tests {
         fn from(value: T) -> Self {
             let bytes = value.as_ref().as_bytes();
             assert!(bytes.len() <= PAGE_SIZE, "String is too large");
-            let mut data = [0; PAGE_SIZE];
 
-            data[..bytes.len()].copy_from_slice(bytes);
-            Self {
-                data,
-                patches: vec![],
-                uncommited: vec![],
-            }
+            Page::from(Snapshot::from((0, bytes.to_vec())))
         }
     }
 
@@ -148,18 +168,19 @@ mod tests {
         proptest! {
             #[test]
             fn arbitrary_page_patches(snapshots in vec(any_snapshot(), 0..5)) {
-                // Mirror buffer where we track all the patches being applied
-                // in the end page content should be equal mirror buffer
+                // Mirror buffer where we track all the patches being applied.
+                // In the end page content should be equal mirror buffer
                 let mut mirror = [0; PAGE_SIZE];
                 let mut page = Page::new();
 
                 for patches in snapshots {
                     for (offset, bytes) in patches {
+                        let mut snapshot = Snapshot::default();
                         let range = offset..offset + bytes.len();
-                        page.as_bytes_mut(range.clone()).copy_from_slice(bytes.as_slice());
+                        snapshot.as_bytes_mut(range.clone()).copy_from_slice(bytes.as_slice());
                         mirror[range].copy_from_slice(bytes.as_slice());
+                        page.commit(snapshot);
                     }
-                    page.commit();
                 }
 
                 assert_eq!(page.as_bytes(0..PAGE_SIZE).deref(), mirror);
