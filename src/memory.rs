@@ -108,19 +108,6 @@ impl<T> Ptr<T> {
     }
 }
 
-fn borrow_downcast<T: Any>(cell: &RefCell<dyn Any>) -> Option<Ref<T>> {
-    let r = cell.borrow();
-    if (*r).type_id() == TypeId::of::<T>() {
-        Some(Ref::map(r, |x| x.downcast_ref::<T>().unwrap()))
-    } else {
-        None
-    }
-}
-
-struct Utf8<'a> {
-    data: &'a str,
-}
-
 pub struct Scope<'a> {
     memory: &'a mut Memory,
     active_set: RefCell<HashMap<Addr, Rc<RefCell<dyn Any>>>>,

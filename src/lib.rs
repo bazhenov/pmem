@@ -1,5 +1,5 @@
 #![allow(unused)]
 
-mod allocator;
 mod linked_list;
+mod memory;
 mod page;

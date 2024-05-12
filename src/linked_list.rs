@@ -1,7 +1,6 @@
-use std::io::Cursor;
-
-use crate::allocator::{Ptr, Scope, ServiceEntity};
+use crate::memory::{Ptr, Scope, ServiceEntity};
 use binrw::{BinRead, BinWrite};
+use std::io::Cursor;
 
 struct LinkedList<'a> {
     scope: Scope<'a>,
@@ -52,10 +51,8 @@ impl<'a> LinkedList<'a> {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
-
     use super::*;
-    use crate::allocator::Memory;
+    use crate::memory::Memory;
 
     #[test]
     fn check_simple_allocation() {
