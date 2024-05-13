@@ -1,11 +1,5 @@
 use std::{borrow::Cow, ops::Range};
 
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("Page offset is out of bounds")]
-    PageOffsetTooLarge,
-}
-
 const PAGE_SIZE: usize = 1 << 16; // 64KB
 type Patch = (usize, Vec<u8>);
 pub type Addr = u32;
@@ -18,11 +12,6 @@ pub struct Page {
 impl Page {
     pub fn new() -> Self {
         Self { snapshots: vec![] }
-    }
-
-    pub fn as_bytes(&self, addr: PageOffset, len: PageOffset) -> Cow<[u8]> {
-        let patches = self.snapshots.iter().flat_map(|s| s.patches.iter());
-        read_with_patches(addr, len, patches)
     }
 
     pub fn read_uncommited(
@@ -89,21 +78,6 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    pub fn zeroed(&mut self, addr: PageOffset, len: PageOffset) -> &mut [u8] {
-        assert!(
-            0 < len && len <= PAGE_SIZE as PageOffset,
-            "len should be at least 1 byte ({:?})",
-            len
-        );
-        assert!(
-            addr + len < PAGE_SIZE as PageOffset,
-            "end out of page bounds"
-        );
-        self.patches.push((addr as usize, vec![0; len as usize]));
-        let (_, patch) = self.patches.last_mut().unwrap();
-        patch.as_mut_slice()
-    }
-
     pub fn write(&mut self, addr: Addr, bytes: &[u8]) {
         assert!(bytes.len() <= PAGE_SIZE, "Buffer too large");
         self.patches.push((addr as usize, bytes.to_vec()))
@@ -125,14 +99,13 @@ fn intersects((offset, patch): &Patch, range: &Range<usize>) -> bool {
 
 #[cfg(test)]
 mod tests {
-
     use super::*;
 
     #[test]
     fn create_new_page() {
         let page = Page::from("foo");
-        assert_eq!(&*page.as_bytes(0, 3), b"foo");
-        assert_eq!(&*page.as_bytes(3, 1), [0]);
+        assert_eq!(&*as_bytes(&page, 0, 3), b"foo");
+        assert_eq!(&*as_bytes(&page, 3, 1), [0]);
     }
 
     #[test]
@@ -143,12 +116,12 @@ mod tests {
         snapshot.write(0, b"Hide");
 
         page.commit(snapshot);
-        assert_eq!(&*page.as_bytes(0, 4), b"Hide");
+        assert_eq!(&*as_bytes(&page, 0, 4), b"Hide");
     }
 
     #[test]
     fn uncommited_changes_should_be_visible_via_as_bytes_uncommited() {
-        let mut page = Page::from("Jekyll");
+        let page = Page::from("Jekyll");
         let mut snapshot = Snapshot::default();
         snapshot.write(0, b"Hide");
 
@@ -164,12 +137,17 @@ mod tests {
 
         page.commit(snapshot);
 
-        assert_eq!(&*page.as_bytes(0, 12), b"Hello world!");
-        assert_eq!(&*page.as_bytes(0, 8), b"Hello wo");
-        assert_eq!(&*page.as_bytes(3, 9), b"lo world!");
-        assert_eq!(&*page.as_bytes(6, 5), b"world");
-        assert_eq!(&*page.as_bytes(8, 4), b"rld!");
-        assert_eq!(&*page.as_bytes(7, 3), b"orl");
+        assert_eq!(&*as_bytes(&page, 0, 12), b"Hello world!");
+        assert_eq!(&*as_bytes(&page, 0, 8), b"Hello wo");
+        assert_eq!(&*as_bytes(&page, 3, 9), b"lo world!");
+        assert_eq!(&*as_bytes(&page, 6, 5), b"world");
+        assert_eq!(&*as_bytes(&page, 8, 4), b"rld!");
+        assert_eq!(&*as_bytes(&page, 7, 3), b"orl");
+    }
+
+    fn as_bytes(page: &Page, addr: PageOffset, len: PageOffset) -> Cow<[u8]> {
+        let patches = page.snapshots.iter().flat_map(|s| s.patches.iter());
+        read_with_patches(addr, len, patches)
     }
 
     impl<T: AsRef<str>> From<T> for Page {
@@ -183,8 +161,8 @@ mod tests {
 
     mod proptests {
         use super::super::*;
+        use super::*;
         use proptest::{collection::vec, prelude::*};
-        use std::ops::Deref;
 
         proptest! {
             #[test]
@@ -205,7 +183,7 @@ mod tests {
                     }
                 }
 
-                assert_eq!(page.as_bytes(0, PAGE_SIZE as PageOffset).deref(), mirror);
+                assert_eq!(&*as_bytes(&page, 0, PAGE_SIZE as PageOffset), mirror);
             }
         }
 

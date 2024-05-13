@@ -1,26 +1,13 @@
 use crate::page::{Addr, Page, PageOffset, Snapshot};
 use binrw::{BinRead, BinWrite};
 use std::{
-    any::{Any, TypeId},
     borrow::Cow,
-    cell::{Ref, RefCell, RefMut},
-    collections::HashMap,
-    fmt::Debug,
+    cell::{Ref, RefCell},
     io::Cursor,
     marker::PhantomData,
-    mem,
-    ops::Range,
     rc::Rc,
 };
-use thiserror::Error;
-
 const START_ADDR: PageOffset = 4;
-
-#[derive(Error, Debug)]
-enum Error {
-    #[error("Pointer already initialized")]
-    AlreadyInitialized,
-}
 
 pub struct Memory {
     page: Page,
@@ -30,15 +17,6 @@ pub struct Memory {
 }
 
 impl Memory {
-    fn from(page: Page) -> Self {
-        Self {
-            page,
-            snapshot: Snapshot::default(),
-            next_addr: START_ADDR,
-            seq: 0,
-        }
-    }
-
     pub fn new() -> Self {
         Self {
             page: Page::new(),
@@ -71,7 +49,6 @@ impl Memory {
         let Transaction {
             snapshot,
             next_addr,
-            seq,
             ..
         } = tx;
 
@@ -139,7 +116,7 @@ impl<'a> Transaction<'a> {
         let size = value.size() + 4; // 4 bytes in size
         let addr = self.alloc(size);
         let mut buffer = Cursor::new(Vec::new());
-        (size as PageOffset).write_be(&mut buffer);
+        (size as PageOffset).write_be(&mut buffer).unwrap();
         value.write_to(&mut buffer);
         self.write_bytes(addr, &buffer.into_inner());
 
@@ -153,7 +130,7 @@ impl<'a> Transaction<'a> {
         let value = RefCell::borrow(&handle.value);
         let size = value.size() + 4; // 4 bytes in size
         let mut buffer = Cursor::new(Vec::new());
-        (size as u32).write_be(&mut buffer);
+        (size as u32).write_be(&mut buffer).unwrap();
         value.write_to(&mut buffer);
         self.write_bytes(handle.addr, &buffer.into_inner());
     }
@@ -198,10 +175,6 @@ pub struct Handle<T> {
 }
 
 impl<T> Handle<T> {
-    fn as_mut(&mut self) -> RefMut<T> {
-        RefCell::borrow_mut(&self.value)
-    }
-
     pub fn as_ref(&self) -> Ref<T> {
         RefCell::borrow(&self.value)
     }
@@ -214,27 +187,7 @@ impl<T> Handle<T> {
     }
 }
 
-impl<T: Debug + ServiceEntity + 'static> Handle<T> {
-    fn join_handle(&self) -> Box<dyn JoinHandle> {
-        Box::new(HandleImpl(Some(Rc::clone(&self.value))))
-    }
-}
-
-struct HandleImpl<T>(Option<Rc<RefCell<T>>>);
-
-impl<T: Debug + ServiceEntity + 'static> JoinHandle for HandleImpl<T> {
-    fn join(&mut self) -> Option<Box<dyn ServiceEntity>> {
-        let v = self.0.take().unwrap();
-        let entity = Rc::try_unwrap(v).unwrap().into_inner();
-        Some(Box::new(entity))
-    }
-}
-
 pub trait ServiceEntity {
     fn size(&self) -> usize;
     fn write_to(&self, buffer: &mut Cursor<Vec<u8>>);
-}
-
-trait JoinHandle {
-    fn join(&mut self) -> Option<Box<dyn ServiceEntity>>;
 }
