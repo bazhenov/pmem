@@ -5,7 +5,7 @@ use std::io::Cursor;
 fn main() {
     let mut memory = Memory::new();
 
-    let root_ptr = memory.change(|tx| {
+    let root_ptr = memory.update(|tx| {
         let mut list = LinkedList::new(tx, Ptr::null());
 
         list.push_front(3);
@@ -102,7 +102,7 @@ mod tests {
     #[test]
     fn check_simple_allocation() {
         let mut memory = Memory::new();
-        let a_ptr = memory.change(|tx| {
+        let a_ptr = memory.update(|tx| {
             let a = tx.write(ListNode {
                 value: 42,
                 next: Ptr::null(),
@@ -118,7 +118,7 @@ mod tests {
     fn check_complex_allocation() {
         let mut memory = Memory::new();
 
-        let list_ptr = memory.change(|tx| {
+        let list_ptr = memory.update(|tx| {
             let b = tx.write(ListNode {
                 value: 35,
                 next: Ptr::null(),
@@ -140,7 +140,7 @@ mod tests {
     fn check_pushing_values_to_list() {
         let mut memory = Memory::new();
 
-        let root_ptr = memory.change(|tx| {
+        let root_ptr = memory.update(|tx| {
             let mut list = LinkedList::new(tx, Ptr::null());
 
             list.push_front(3);

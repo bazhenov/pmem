@@ -24,7 +24,7 @@ impl Memory {
         }
     }
 
-    pub fn change<T>(&mut self, f: impl Fn(&mut Transaction) -> T) -> T {
+    pub fn update<T>(&mut self, f: impl Fn(&mut Transaction) -> T) -> T {
         let mut tx = self.start();
         let response = f(&mut tx);
         let Transaction {
