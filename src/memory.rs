@@ -11,7 +11,6 @@ const START_ADDR: PageOffset = 4;
 
 pub struct Memory {
     page: Page,
-    snapshot: Snapshot,
     next_addr: PageOffset,
     seq: u32,
 }
@@ -20,27 +19,9 @@ impl Memory {
     pub fn new() -> Self {
         Self {
             page: Page::new(),
-            snapshot: Snapshot::default(),
             next_addr: START_ADDR,
             seq: 0,
         }
-    }
-
-    pub fn write(&mut self, addr: Addr, bytes: &[u8]) {
-        self.snapshot.write(addr, bytes)
-    }
-
-    pub fn read_uncommited(&self, addr: PageOffset, len: PageOffset) -> Cow<[u8]> {
-        self.page.read_uncommited(addr, len, &self.snapshot)
-    }
-
-    pub fn read_static<const N: usize>(&self, offset: PageOffset) -> [u8; N] {
-        let mut ret = [0; N];
-        let bytes = self.read_uncommited(offset, N as PageOffset);
-        for (to, from) in ret.iter_mut().zip(bytes.iter()) {
-            *to = *from;
-        }
-        ret
     }
 
     pub fn change<T>(&mut self, f: impl Fn(&mut Transaction) -> T) -> T {
@@ -93,9 +74,9 @@ impl<'a> Transaction<'a> {
         use binrw::BinReaderExt;
 
         let addr = ptr.addr;
-        let bytes = self.memory.read_static::<4>(addr);
+        let bytes = self.read_static::<4>(addr);
         let len = u32::from_be_bytes(bytes);
-        let bytes = self.memory.read_uncommited(addr + 4, len);
+        let bytes = self.read_uncommited(addr + 4, len);
         let mut cursor = Cursor::new(bytes);
         let value: T = cursor.read_ne().unwrap();
 
@@ -103,6 +84,19 @@ impl<'a> Transaction<'a> {
             addr,
             value: Rc::new(RefCell::new(value)),
         }
+    }
+
+    fn read_static<const N: usize>(&self, offset: PageOffset) -> [u8; N] {
+        let mut ret = [0; N];
+        let bytes = self.read_uncommited(offset, N as PageOffset);
+        for (to, from) in ret.iter_mut().zip(bytes.iter()) {
+            *to = *from;
+        }
+        ret
+    }
+
+    fn read_uncommited(&self, addr: PageOffset, len: PageOffset) -> Cow<[u8]> {
+        self.memory.page.read_uncommited(addr, len, &self.snapshot)
     }
 
     fn alloc(&mut self, size: usize) -> Addr {
