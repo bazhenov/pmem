@@ -1,6 +1,6 @@
 use binrw::{BinRead, BinWrite};
 use pmem::{Memory, Ptr, ServiceEntity, Transaction};
-use std::{io::Cursor, mem};
+use std::io::Cursor;
 
 fn main() {
     let mut memory = Memory::new();
@@ -35,10 +35,6 @@ struct ListNode {
 }
 
 impl ServiceEntity for ListNode {
-    fn size(&self) -> usize {
-        mem::size_of::<Self>()
-    }
-
     fn write_to(&self, buffer: &mut Cursor<Vec<u8>>) {
         self.write(buffer).unwrap();
     }

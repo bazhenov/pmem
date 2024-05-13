@@ -3,7 +3,7 @@ use binrw::{BinRead, BinWrite};
 use std::{
     borrow::Cow,
     cell::{Ref, RefCell},
-    io::Cursor,
+    io::{Cursor, Seek, SeekFrom, Write},
     marker::PhantomData,
     rc::Rc,
 };
@@ -113,12 +113,7 @@ impl<'a> Transaction<'a> {
     }
 
     pub fn write<T: ServiceEntity>(&mut self, value: T) -> Handle<T> {
-        let size = value.size() + 4; // 4 bytes in size
-        let addr = self.alloc(size);
-        let mut buffer = Cursor::new(Vec::new());
-        (size as PageOffset).write_be(&mut buffer).unwrap();
-        value.write_to(&mut buffer);
-        self.write_bytes(addr, &buffer.into_inner());
+        let addr = self.write_at(&value, None).addr;
 
         Handle {
             addr,
@@ -126,13 +121,29 @@ impl<'a> Transaction<'a> {
         }
     }
 
+    fn write_at<T: ServiceEntity>(&mut self, value: &T, ptr: Option<Ptr<T>>) -> Ptr<T> {
+        let mut buffer = Cursor::new(Vec::new());
+        buffer.write_all(&[0, 0, 0, 0]).unwrap();
+        // reserving 4 bytes at the begining of the block
+        value.write_to(&mut buffer);
+        let size = buffer.position() as usize;
+        let ptr = ptr.unwrap_or_else(|| Ptr {
+            addr: self.alloc(size),
+            _phantom: PhantomData::<T>,
+        });
+
+        buffer.seek(SeekFrom::Start(0)).unwrap();
+        (size as PageOffset).write_be(&mut buffer).unwrap();
+        // writing object size
+        let buffer = buffer.into_inner();
+
+        self.write_bytes(ptr.addr, &buffer);
+        ptr
+    }
+
     pub fn update<T: ServiceEntity>(&mut self, handle: &Handle<T>) {
         let value = RefCell::borrow(&handle.value);
-        let size = value.size() + 4; // 4 bytes in size
-        let mut buffer = Cursor::new(Vec::new());
-        (size as u32).write_be(&mut buffer).unwrap();
-        value.write_to(&mut buffer);
-        self.write_bytes(handle.addr, &buffer.into_inner());
+        self.write_at(&*value, Some(handle.ptr()));
     }
 }
 
@@ -188,6 +199,5 @@ impl<T> Handle<T> {
 }
 
 pub trait ServiceEntity {
-    fn size(&self) -> usize;
     fn write_to(&self, buffer: &mut Cursor<Vec<u8>>);
 }
