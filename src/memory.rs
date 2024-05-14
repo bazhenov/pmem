@@ -5,9 +5,13 @@ use std::{
     cell::{Ref, RefCell},
     io::{Cursor, Seek, SeekFrom, Write},
     marker::PhantomData,
+    mem,
     rc::Rc,
 };
 const START_ADDR: PageOffset = 4;
+
+/// The size of a header of each entitity written to storage
+const HEADER_SIZE: usize = mem::size_of::<u32>();
 
 pub struct Memory {
     page: Page,
@@ -88,7 +92,7 @@ impl Memory {
     }
 
     pub fn write<T: ServiceEntity>(&self, tx: &mut Transaction, value: T) -> Handle<T> {
-        let addr = self.write_at(tx, &value, None).addr;
+        let addr = self.write_to_memory(tx, &value, None).addr;
 
         Handle {
             addr,
@@ -96,15 +100,19 @@ impl Memory {
         }
     }
 
-    fn write_at<T: ServiceEntity>(
+    /// Writes object to a given address or allocates new memory for an object and writes to it
+    fn write_to_memory<T: ServiceEntity>(
         &self,
         tx: &mut Transaction,
         value: &T,
         ptr: Option<Ptr<T>>,
     ) -> Ptr<T> {
         let mut buffer = Cursor::new(Vec::new());
-        buffer.write_all(&[0, 0, 0, 0]).unwrap();
-        // reserving 4 bytes at the begining of the block
+
+        // reserving space at the begining for the header
+        buffer.write_all(&[0; HEADER_SIZE]).unwrap();
+
+        // writing body
         value.write_to(&mut buffer);
         let size = buffer.position() as usize;
         let ptr = ptr.unwrap_or_else(|| Ptr {
@@ -112,18 +120,21 @@ impl Memory {
             _phantom: PhantomData::<T>,
         });
 
+        // writing header with the entity size
         buffer.seek(SeekFrom::Start(0)).unwrap();
         (size as PageOffset).write_be(&mut buffer).unwrap();
-        // writing object size
-        let buffer = buffer.into_inner();
+        // Making sure we didn't overwrite data by the header
+        assert_eq!(buffer.position(), HEADER_SIZE as u64);
 
+        let buffer = buffer.into_inner();
         self.write_bytes(tx, ptr.addr, &buffer);
+
         ptr
     }
 
     pub fn update<T: ServiceEntity>(&self, tx: &mut Transaction, handle: &Handle<T>) {
         let value = RefCell::borrow(&handle.value);
-        self.write_at(tx, &*value, Some(handle.ptr()));
+        self.write_to_memory(tx, &*value, Some(handle.ptr()));
     }
 }
 
@@ -188,4 +199,19 @@ impl<T> Handle<T> {
 
 pub trait ServiceEntity {
     fn write_to(&self, buffer: &mut Cursor<Vec<u8>>);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem;
+
+    const PTR_SIZE: usize = 4;
+
+    /// This test ensures that the size of Ptr is fixed, regardless of its parameter type
+    #[test]
+    fn check_ptr_size() {
+        assert_eq!(mem::size_of::<Ptr<u128>>(), PTR_SIZE);
+        assert_eq!(mem::size_of::<Ptr<u8>>(), PTR_SIZE);
+    }
 }
