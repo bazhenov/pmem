@@ -1,4 +1,4 @@
-use std::{borrow::Cow, ops::Range};
+use std::{borrow::Cow, ops::Range, rc::Rc};
 
 const PAGE_SIZE: usize = 1 << 16; // 64KB
 type Patch = (usize, Vec<u8>);
@@ -6,75 +6,55 @@ pub type Addr = u32;
 pub type PageOffset = u32;
 
 pub struct Page {
-    snapshots: Vec<Snapshot>,
+    snapshot: Rc<Snapshot>,
 }
 
 impl Page {
     pub fn new() -> Self {
-        Self { snapshots: vec![] }
+        Self {
+            snapshot: Rc::default(),
+        }
     }
 
-    pub fn read_uncommited(
-        &self,
-        addr: PageOffset,
-        len: PageOffset,
-        snapshot: &Snapshot,
-    ) -> Cow<'_, [u8]> {
-        let patches = self
-            .snapshots
-            .iter()
-            .flat_map(|s| s.patches.iter())
-            .chain(snapshot.patches.iter());
-        read_with_patches(addr, len, patches)
+    pub fn read(&self, addr: PageOffset, len: PageOffset) -> Cow<'_, [u8]> {
+        self.snapshot.read(addr, len)
+    }
+
+    pub fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            patches: vec![],
+            parent: Some(Rc::clone(&self.snapshot)),
+        }
     }
 
     pub fn commit(&mut self, snapshot: Snapshot) {
-        self.snapshots.push(snapshot);
+        // Given snapshot should have current snapshot as a parent
+        // Otherwise changes are not linear
+        let parent = snapshot
+            .parent
+            .as_ref()
+            .map(Rc::clone)
+            .expect("Proposed snapshot is not linear");
+        assert!(
+            Rc::ptr_eq(&self.snapshot, &parent),
+            "Proposed snaphot is not linear"
+        );
+        self.snapshot = Rc::new(snapshot);
     }
 }
 
 impl From<Snapshot> for Page {
-    fn from(value: Snapshot) -> Self {
+    fn from(snapshot: Snapshot) -> Self {
         Self {
-            snapshots: vec![value],
+            snapshot: Rc::new(snapshot),
         }
     }
-}
-
-fn read_with_patches<'a, 'b>(
-    addr: PageOffset,
-    len: PageOffset,
-    patches: impl Iterator<Item = &'a Patch>,
-) -> Cow<'b, [u8]> {
-    assert!(len <= PAGE_SIZE as u32, "Out of bounds read");
-    let mut slice = vec![0; len as usize];
-    let range = (addr as usize)..(addr + len) as usize;
-
-    for (offset, bytes) in patches.filter(|p| intersects(p, &range)) {
-        // Calculating intersection of the path and input interval
-        let start = range.start.max(*offset);
-        let end = range.end.min(offset + bytes.len());
-        let len = end - start;
-
-        let patch_range = {
-            let from = start.saturating_sub(*offset);
-            from..from + len
-        };
-
-        let slice_range = {
-            let from = start.saturating_sub(range.start);
-            from..from + len
-        };
-
-        slice[slice_range].copy_from_slice(&bytes[patch_range])
-    }
-
-    Cow::Owned(slice)
 }
 
 #[derive(Default)]
 pub struct Snapshot {
     patches: Vec<Patch>,
+    parent: Option<Rc<Snapshot>>,
 }
 
 impl Snapshot {
@@ -82,12 +62,48 @@ impl Snapshot {
         assert!(bytes.len() <= PAGE_SIZE, "Buffer too large");
         self.patches.push((addr as usize, bytes.to_vec()))
     }
+
+    pub fn read<'a, 'b>(&self, addr: PageOffset, len: PageOffset) -> Cow<'b, [u8]> {
+        assert!(len <= PAGE_SIZE as u32, "Out of bounds read");
+        let mut buffer = vec![0; len as usize];
+        let range = (addr as usize)..(addr + len) as usize;
+
+        self.apply_patches(&mut buffer, &range);
+
+        Cow::Owned(buffer)
+    }
+
+    fn apply_patches(&self, buffer: &mut [u8], range: &Range<usize>) {
+        if let Some(parent) = self.parent.as_ref() {
+            parent.apply_patches(buffer, range);
+        }
+        let patches = &self.patches;
+        for (offset, bytes) in patches.iter().filter(|p| intersects(p, range)) {
+            // Calculating intersection of the path and input interval
+            let start = range.start.max(*offset);
+            let end = range.end.min(offset + bytes.len());
+            let len = end - start;
+
+            let patch_range = {
+                let from = start.saturating_sub(*offset);
+                from..from + len
+            };
+
+            let slice_range = {
+                let from = start.saturating_sub(range.start);
+                from..from + len
+            };
+
+            buffer[slice_range].copy_from_slice(&bytes[patch_range])
+        }
+    }
 }
 
 impl From<Patch> for Snapshot {
     fn from(value: Patch) -> Self {
         Self {
             patches: vec![value],
+            parent: None,
         }
     }
 }
@@ -104,50 +120,47 @@ mod tests {
     #[test]
     fn create_new_page() {
         let page = Page::from("foo");
-        assert_eq!(&*as_bytes(&page, 0, 3), b"foo");
-        assert_eq!(&*as_bytes(&page, 3, 1), [0]);
+        assert_str_eq(page.read(0, 3), "foo");
+        assert_str_eq(page.read(3, 1), [0]);
     }
 
     #[test]
-    fn commited_changes_should_be_visible_via_commit() {
+    fn commited_changes_should_be_visible_on_a_page() {
         let mut page = Page::from("Jekyll");
-
-        let mut snapshot = Snapshot::default();
+        let mut snapshot = page.snapshot();
         snapshot.write(0, b"Hide");
-
         page.commit(snapshot);
-        assert_eq!(&*as_bytes(&page, 0, 4), b"Hide");
+        assert_str_eq(page.read(0, 4), b"Hide");
     }
 
     #[test]
-    fn uncommited_changes_should_be_visible_via_as_bytes_uncommited() {
+    fn uncommited_changes_should_be_visible_only_on_the_snapshot() {
         let page = Page::from("Jekyll");
-        let mut snapshot = Snapshot::default();
-        snapshot.write(0, b"Hide");
+        let mut snapshot = page.snapshot();
 
-        assert_eq!(&*page.read_uncommited(0, 4, &snapshot), b"Hide");
+        snapshot.write(0, b"Hide");
+        assert_str_eq(snapshot.read(0, 4), "Hide");
+        assert_str_eq(page.read(0, 6), "Jekyll");
     }
 
     #[test]
     fn patch_page() {
         let mut page = Page::from("Hello panic!");
 
-        let mut snapshot = Snapshot::default();
+        let mut snapshot = page.snapshot();
         snapshot.write(6, b"world");
-
         page.commit(snapshot);
 
-        assert_eq!(&*as_bytes(&page, 0, 12), b"Hello world!");
-        assert_eq!(&*as_bytes(&page, 0, 8), b"Hello wo");
-        assert_eq!(&*as_bytes(&page, 3, 9), b"lo world!");
-        assert_eq!(&*as_bytes(&page, 6, 5), b"world");
-        assert_eq!(&*as_bytes(&page, 8, 4), b"rld!");
-        assert_eq!(&*as_bytes(&page, 7, 3), b"orl");
+        assert_str_eq(page.read(0, 12), "Hello world!");
+        assert_str_eq(page.read(0, 8), "Hello wo");
+        assert_str_eq(page.read(3, 9), "lo world!");
+        assert_str_eq(page.read(6, 5), "world");
+        assert_str_eq(page.read(8, 4), "rld!");
+        assert_str_eq(page.read(7, 3), "orl");
     }
 
     fn as_bytes(page: &Page, addr: PageOffset, len: PageOffset) -> Cow<[u8]> {
-        let patches = page.snapshots.iter().flat_map(|s| s.patches.iter());
-        read_with_patches(addr, len, patches)
+        page.read(addr, len)
     }
 
     impl<T: AsRef<str>> From<T> for Page {
@@ -174,7 +187,7 @@ mod tests {
 
                 for patches in snapshots {
                     for (offset, bytes) in patches {
-                        let mut snapshot = Snapshot::default();
+                        let mut snapshot = page.snapshot();
                         snapshot.write(offset as u32, &bytes);
 
                         let range = offset..offset + bytes.len();
@@ -197,5 +210,11 @@ mod tests {
         fn any_snapshot() -> impl Strategy<Value = Vec<Patch>> {
             vec(any_patch(), 1..10)
         }
+    }
+
+    fn assert_str_eq<A: AsRef<[u8]>, B: AsRef<[u8]>>(a: A, b: B) {
+        let a = String::from_utf8_lossy(a.as_ref());
+        let b = String::from_utf8_lossy(b.as_ref());
+        assert_eq!(a, b);
     }
 }

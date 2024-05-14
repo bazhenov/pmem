@@ -38,7 +38,7 @@ impl Memory {
 
     pub fn start(&self) -> Transaction {
         Transaction {
-            snapshot: Snapshot::default(),
+            snapshot: self.page.snapshot(),
             next_addr: self.next_addr,
             seq: self.seq,
         }
@@ -49,7 +49,7 @@ impl Memory {
     }
 
     pub fn read(&self, tx: &Transaction, addr: PageOffset, len: PageOffset) -> Cow<[u8]> {
-        self.page.read_uncommited(addr, len, &tx.snapshot)
+        self.page.read(addr, len)
     }
 
     pub fn lookup<'a, T>(&self, tx: &Transaction, ptr: Ptr<T>) -> Handle<T>
@@ -81,7 +81,7 @@ impl Memory {
     }
 
     fn read_uncommited(&self, tx: &Transaction, addr: PageOffset, len: PageOffset) -> Cow<[u8]> {
-        self.page.read_uncommited(addr, len, &tx.snapshot)
+        tx.snapshot.read(addr, len)
     }
 
     fn alloc(&self, tx: &mut Transaction, size: usize) -> Addr {
