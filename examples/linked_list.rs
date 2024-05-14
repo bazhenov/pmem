@@ -3,10 +3,10 @@ use pmem::{Memory, Ptr, ServiceEntity, Transaction};
 use std::io::Cursor;
 
 fn main() {
-    let memory = Memory::new();
+    let memory = Memory::default();
 
     let mut tx = memory.start();
-    let mut list = LinkedList::new(&memory, &mut tx, Ptr::null());
+    let mut list = LinkedList::new(&mut tx, Ptr::null());
 
     list.push_front(3);
     list.push_front(2);
@@ -14,7 +14,7 @@ fn main() {
 
     let root_ptr = list.ptr();
 
-    let list = LinkedList::new(&memory, &mut tx, root_ptr);
+    let list = LinkedList::new(&mut tx, root_ptr);
     let values = list.iter().collect::<Vec<_>>();
     assert_eq!(list.len(), 3);
     assert_eq!(values, vec![1, 2, 3]);
@@ -22,7 +22,6 @@ fn main() {
 
 struct LinkedList<'a> {
     tx: &'a mut Transaction,
-    memory: &'a Memory,
     root: Ptr<ListNode>,
 }
 
@@ -40,18 +39,15 @@ impl ServiceEntity for ListNode {
 }
 
 impl<'a> LinkedList<'a> {
-    fn new(memory: &'a Memory, tx: &'a mut Transaction, root: Ptr<ListNode>) -> Self {
-        Self { tx, memory, root }
+    fn new(tx: &'a mut Transaction, root: Ptr<ListNode>) -> Self {
+        Self { tx, root }
     }
 
     fn push_front(&mut self, value: i32) {
-        let handle = self.memory.write(
-            self.tx,
-            ListNode {
-                value,
-                next: self.root,
-            },
-        );
+        let handle = self.tx.write(ListNode {
+            value,
+            next: self.root,
+        });
         self.root = handle.ptr();
     }
 
@@ -60,7 +56,7 @@ impl<'a> LinkedList<'a> {
         let mut len = 0;
         while !node.is_null() {
             len += 1;
-            node = self.memory.lookup(self.tx, node).as_ref().next;
+            node = self.tx.lookup(node).as_ref().next;
         }
         len
     }
@@ -68,7 +64,6 @@ impl<'a> LinkedList<'a> {
     fn iter(&self) -> impl Iterator<Item = i32> + '_ {
         ListIterator {
             tx: self.tx,
-            memory: &self.memory,
             ptr: self.root,
         }
     }
@@ -79,7 +74,6 @@ impl<'a> LinkedList<'a> {
 }
 
 struct ListIterator<'a> {
-    memory: &'a Memory,
     tx: &'a Transaction,
     ptr: Ptr<ListNode>,
 }
@@ -91,7 +85,7 @@ impl<'a> Iterator for ListIterator<'a> {
         if self.ptr.is_null() {
             None
         } else {
-            let node = self.memory.lookup(self.tx, self.ptr);
+            let node = self.tx.lookup(self.ptr);
             let node = node.as_ref();
             self.ptr = node.next;
             Some(node.value)
@@ -105,50 +99,41 @@ mod tests {
 
     #[test]
     fn check_simple_allocation() {
-        let mut memory = Memory::new();
+        let memory = Memory::default();
         let mut tx = memory.start();
-        let a = memory.write(
-            &mut tx,
-            ListNode {
-                value: 42,
-                next: Ptr::null(),
-            },
-        );
+        let a = tx.write(ListNode {
+            value: 42,
+            next: Ptr::null(),
+        });
 
-        let handle = memory.lookup(&tx, a.ptr());
+        let handle = tx.lookup(a.ptr());
         assert_eq!(handle.as_ref().value, 42);
     }
 
     #[test]
     fn check_complex_allocation() {
-        let mut memory = Memory::new();
+        let memory = Memory::default();
 
         let mut tx = memory.start();
-        let b = memory.write(
-            &mut tx,
-            ListNode {
-                value: 35,
-                next: Ptr::null(),
-            },
-        );
-        let a = memory.write(
-            &mut tx,
-            ListNode {
-                value: 34,
-                next: b.ptr(),
-            },
-        );
+        let b = tx.write(ListNode {
+            value: 35,
+            next: Ptr::null(),
+        });
+        let a = tx.write(ListNode {
+            value: 34,
+            next: b.ptr(),
+        });
 
-        let list = LinkedList::new(&memory, &mut tx, a.ptr());
+        let list = LinkedList::new(&mut tx, a.ptr());
         assert_eq!(list.len(), 2);
     }
 
     #[test]
     fn check_pushing_values_to_list() {
-        let mut memory = Memory::new();
+        let mut memory = Memory::default();
 
         let mut tx = memory.start();
-        let mut list = LinkedList::new(&memory, &mut tx, Ptr::null());
+        let mut list = LinkedList::new(&mut tx, Ptr::null());
         list.push_front(3);
         list.push_front(2);
         list.push_front(1);
@@ -157,7 +142,7 @@ mod tests {
         memory.commit(tx);
 
         let mut tx = memory.start();
-        let list = LinkedList::new(&memory, &mut tx, root);
+        let list = LinkedList::new(&mut tx, root);
         let values = list.iter().collect::<Vec<_>>();
         assert_eq!(list.len(), 3);
         assert_eq!(values, vec![1, 2, 3]);

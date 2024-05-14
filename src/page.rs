@@ -16,10 +16,6 @@ impl Page {
         }
     }
 
-    pub fn read(&self, addr: PageOffset, len: PageOffset) -> Cow<'_, [u8]> {
-        self.snapshot.read(addr, len)
-    }
-
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
             patches: vec![],
@@ -30,16 +26,25 @@ impl Page {
     pub fn commit(&mut self, snapshot: Snapshot) {
         // Given snapshot should have current snapshot as a parent
         // Otherwise changes are not linear
+
+        // In case of future changes explicitly calling as_ref()/Rc::clone to be sure
+        // we cloning Rc, and not the inner object. Snapshots itself can be costly to clone.
+        #[allow(clippy::useless_asref)]
         let parent = snapshot
             .parent
             .as_ref()
             .map(Rc::clone)
-            .expect("Proposed snapshot is not linear");
+            .expect("Proposed snapshot has no parent");
         assert!(
             Rc::ptr_eq(&self.snapshot, &parent),
             "Proposed snaphot is not linear"
         );
         self.snapshot = Rc::new(snapshot);
+    }
+
+    #[cfg(test)]
+    fn read(&self, addr: PageOffset, len: PageOffset) -> Cow<'_, [u8]> {
+        self.snapshot.read(addr, len)
     }
 }
 
@@ -63,7 +68,7 @@ impl Snapshot {
         self.patches.push((addr as usize, bytes.to_vec()))
     }
 
-    pub fn read<'a, 'b>(&self, addr: PageOffset, len: PageOffset) -> Cow<'b, [u8]> {
+    pub fn read(&self, addr: PageOffset, len: PageOffset) -> Cow<'_, [u8]> {
         assert!(len <= PAGE_SIZE as u32, "Out of bounds read");
         let mut buffer = vec![0; len as usize];
         let range = (addr as usize)..(addr + len) as usize;
