@@ -24,59 +24,40 @@ impl Memory {
         }
     }
 
-    pub fn update<T>(&mut self, f: impl Fn(&mut Transaction) -> T) -> T {
-        let mut tx = self.start();
-        let response = f(&mut tx);
-        let Transaction {
-            snapshot,
-            next_addr,
-            ..
-        } = tx;
-
+    pub fn commit(&mut self, tx: Transaction) {
         assert!(tx.next_addr >= self.next_addr);
         assert!(tx.seq == self.seq);
         self.seq += 1;
-        self.next_addr = next_addr;
-        self.page.commit(snapshot);
-        response
+        self.next_addr = tx.next_addr;
+        self.page.commit(tx.snapshot);
     }
 
     pub fn start(&self) -> Transaction {
         Transaction {
-            memory: self,
             snapshot: Snapshot::default(),
             next_addr: self.next_addr,
             seq: self.seq,
         }
     }
-}
 
-pub struct Transaction<'a> {
-    memory: &'a Memory,
-    snapshot: Snapshot,
-    next_addr: Addr,
-    seq: u32,
-}
-
-impl<'a> Transaction<'a> {
-    pub fn write_bytes(&mut self, addr: Addr, bytes: &[u8]) {
-        self.snapshot.write(addr, bytes)
+    pub fn write_bytes(&self, tx: &mut Transaction, addr: Addr, bytes: &[u8]) {
+        tx.snapshot.write(addr, bytes)
     }
 
-    pub fn read(&self, addr: PageOffset, len: PageOffset) -> Cow<[u8]> {
-        self.memory.page.read_uncommited(addr, len, &self.snapshot)
+    pub fn read(&self, tx: &Transaction, addr: PageOffset, len: PageOffset) -> Cow<[u8]> {
+        self.page.read_uncommited(addr, len, &tx.snapshot)
     }
 
-    pub fn lookup<T>(&self, ptr: Ptr<T>) -> Handle<T>
+    pub fn lookup<'a, T>(&self, tx: &Transaction, ptr: Ptr<T>) -> Handle<T>
     where
         T: BinRead<Args<'a> = ()> + 'static,
     {
         use binrw::BinReaderExt;
 
         let addr = ptr.addr;
-        let bytes = self.read_static::<4>(addr);
+        let bytes = self.read_static::<4>(tx, addr);
         let len = u32::from_be_bytes(bytes);
-        let bytes = self.read_uncommited(addr + 4, len);
+        let bytes = self.read_uncommited(tx, addr + 4, len);
         let mut cursor = Cursor::new(bytes);
         let value: T = cursor.read_ne().unwrap();
 
@@ -86,28 +67,28 @@ impl<'a> Transaction<'a> {
         }
     }
 
-    fn read_static<const N: usize>(&self, offset: PageOffset) -> [u8; N] {
+    fn read_static<const N: usize>(&self, tx: &Transaction, offset: PageOffset) -> [u8; N] {
         let mut ret = [0; N];
-        let bytes = self.read_uncommited(offset, N as PageOffset);
+        let bytes = self.read_uncommited(tx, offset, N as PageOffset);
         for (to, from) in ret.iter_mut().zip(bytes.iter()) {
             *to = *from;
         }
         ret
     }
 
-    fn read_uncommited(&self, addr: PageOffset, len: PageOffset) -> Cow<[u8]> {
-        self.memory.page.read_uncommited(addr, len, &self.snapshot)
+    fn read_uncommited(&self, tx: &Transaction, addr: PageOffset, len: PageOffset) -> Cow<[u8]> {
+        self.page.read_uncommited(addr, len, &tx.snapshot)
     }
 
-    fn alloc(&mut self, size: usize) -> Addr {
+    fn alloc(&self, tx: &mut Transaction, size: usize) -> Addr {
         assert!(size > 0);
-        let addr = self.next_addr;
-        self.next_addr += size as u32;
+        let addr = tx.next_addr;
+        tx.next_addr += size as u32;
         addr
     }
 
-    pub fn write<T: ServiceEntity>(&mut self, value: T) -> Handle<T> {
-        let addr = self.write_at(&value, None).addr;
+    pub fn write<T: ServiceEntity>(&self, tx: &mut Transaction, value: T) -> Handle<T> {
+        let addr = self.write_at(tx, &value, None).addr;
 
         Handle {
             addr,
@@ -115,14 +96,19 @@ impl<'a> Transaction<'a> {
         }
     }
 
-    fn write_at<T: ServiceEntity>(&mut self, value: &T, ptr: Option<Ptr<T>>) -> Ptr<T> {
+    fn write_at<T: ServiceEntity>(
+        &self,
+        tx: &mut Transaction,
+        value: &T,
+        ptr: Option<Ptr<T>>,
+    ) -> Ptr<T> {
         let mut buffer = Cursor::new(Vec::new());
         buffer.write_all(&[0, 0, 0, 0]).unwrap();
         // reserving 4 bytes at the begining of the block
         value.write_to(&mut buffer);
         let size = buffer.position() as usize;
         let ptr = ptr.unwrap_or_else(|| Ptr {
-            addr: self.alloc(size),
+            addr: self.alloc(tx, size),
             _phantom: PhantomData::<T>,
         });
 
@@ -131,15 +117,23 @@ impl<'a> Transaction<'a> {
         // writing object size
         let buffer = buffer.into_inner();
 
-        self.write_bytes(ptr.addr, &buffer);
+        self.write_bytes(tx, ptr.addr, &buffer);
         ptr
     }
 
-    pub fn update<T: ServiceEntity>(&mut self, handle: &Handle<T>) {
+    pub fn update<T: ServiceEntity>(&self, tx: &mut Transaction, handle: &Handle<T>) {
         let value = RefCell::borrow(&handle.value);
-        self.write_at(&*value, Some(handle.ptr()));
+        self.write_at(tx, &*value, Some(handle.ptr()));
     }
 }
+
+pub struct Transaction {
+    snapshot: Snapshot,
+    next_addr: Addr,
+    seq: u32,
+}
+
+impl Transaction {}
 
 #[derive(BinRead, BinWrite)]
 pub struct Ptr<T> {
