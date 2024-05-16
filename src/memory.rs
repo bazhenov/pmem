@@ -1,12 +1,11 @@
 use crate::page::{Addr, Page, PageOffset, Snapshot};
-use binrw::{BinRead, BinWrite};
+use binrw::{meta::WriteEndian, BinRead, BinWrite};
 use std::{
     borrow::Cow,
-    cell::{Ref, RefCell, RefMut},
     io::{Cursor, Seek, SeekFrom, Write},
     marker::PhantomData,
     mem,
-    rc::Rc,
+    ops::{Deref, DerefMut},
 };
 const START_ADDR: PageOffset = 4;
 
@@ -72,10 +71,7 @@ impl Transaction {
         let mut cursor = Cursor::new(bytes);
         let value: T = cursor.read_ne().unwrap();
 
-        Handle {
-            addr,
-            value: Rc::new(RefCell::new(value)),
-        }
+        Handle { addr, value }
     }
 
     pub fn read<T>(&self, ptr: Ptr<T>) -> T
@@ -112,24 +108,27 @@ impl Transaction {
         addr
     }
 
-    pub fn write<T: ServiceEntity>(&mut self, value: T) -> Handle<T> {
+    pub fn write<T>(&mut self, value: T) -> Handle<T>
+    where
+        for<'a> T: BinWrite<Args<'a> = ()> + WriteEndian,
+    {
         let addr = self.write_to_memory(&value, None).addr;
 
-        Handle {
-            addr,
-            value: Rc::new(RefCell::new(value)),
-        }
+        Handle { addr, value }
     }
 
     /// Writes object to a given address or allocates new memory for an object and writes to it
-    fn write_to_memory<T: ServiceEntity>(&mut self, value: &T, ptr: Option<Ptr<T>>) -> Ptr<T> {
+    fn write_to_memory<T>(&mut self, value: &T, ptr: Option<Ptr<T>>) -> Ptr<T>
+    where
+        for<'a> T: BinWrite<Args<'a> = ()> + WriteEndian,
+    {
         let mut buffer = Cursor::new(Vec::new());
 
         // reserving space at the begining for the header
         buffer.write_all(&[0; HEADER_SIZE]).unwrap();
 
         // writing body
-        value.write_to(&mut buffer);
+        value.write(&mut buffer).unwrap();
         let size = buffer.position() as usize;
         let ptr = ptr.unwrap_or_else(|| Ptr {
             addr: self.alloc(size),
@@ -148,9 +147,11 @@ impl Transaction {
         ptr
     }
 
-    pub fn update<T: ServiceEntity>(&mut self, handle: &Handle<T>) {
-        let value = RefCell::borrow(&handle.value);
-        self.write_to_memory(&*value, Some(handle.ptr()));
+    pub fn update<T>(&mut self, handle: &Handle<T>)
+    where
+        for<'a> T: BinWrite<Args<'a> = ()> + WriteEndian,
+    {
+        self.write_to_memory(&handle.value, Some(handle.ptr()));
     }
 }
 
@@ -188,20 +189,20 @@ impl<T> Ptr<T> {
     }
 }
 
+pub trait Storable {
+    type Seed: Sized;
+
+    fn allocate(tx: Transaction) -> Self;
+    fn open(tx: Transaction, ptr: Ptr<Self::Seed>) -> Self;
+    fn finish(self) -> Transaction;
+}
+
 pub struct Handle<T> {
     addr: Addr,
-    value: Rc<RefCell<T>>,
+    value: T,
 }
 
 impl<T> Handle<T> {
-    pub fn as_ref(&self) -> Ref<T> {
-        RefCell::borrow(&self.value)
-    }
-
-    pub fn as_mut(&self) -> RefMut<T> {
-        RefCell::borrow_mut(&self.value)
-    }
-
     pub fn ptr(&self) -> Ptr<T> {
         Ptr {
             addr: self.addr,
@@ -210,8 +211,18 @@ impl<T> Handle<T> {
     }
 }
 
-pub trait ServiceEntity {
-    fn write_to(&self, buffer: &mut Cursor<Vec<u8>>);
+impl<T> Deref for Handle<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+
+impl<T> DerefMut for Handle<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.value
+    }
 }
 
 #[cfg(test)]

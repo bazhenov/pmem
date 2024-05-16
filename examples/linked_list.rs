@@ -1,23 +1,20 @@
 use binrw::{BinRead, BinWrite};
-use pmem::{Handle, Memory, Ptr, ServiceEntity, Transaction};
-use std::io::Cursor;
+use pmem::{Handle, Memory, Ptr, Storable, Transaction};
 
 fn main() {
-    let mut memory = Memory::default();
+    let memory = Memory::default();
 
     let tx = memory.start();
 
-    let mut list = LinkedList::new(tx, Ptr::null());
+    let mut list = LinkedList::allocate(tx);
     list.push_front(3);
     list.push_front(2);
     list.push_front(1);
 
     let ptr = list.ptr();
     let tx = list.finish();
-    memory.commit(tx);
 
-    let tx = memory.start();
-    let list: LinkedList = LinkedList::new(tx, ptr);
+    let list: LinkedList = LinkedList::open(tx, ptr);
     let values = list.iter().collect::<Vec<_>>();
     assert_eq!(list.len(), 3);
     assert_eq!(values, vec![1, 2, 3]);
@@ -35,27 +32,10 @@ struct LinkedListNode {
     first: Ptr<ListNode>,
 }
 
-impl ServiceEntity for LinkedListNode {
-    fn write_to(&self, buffer: &mut Cursor<Vec<u8>>) {
-        self.write(buffer).unwrap();
-    }
-}
+impl Storable for LinkedList {
+    type Seed = LinkedListNode;
 
-#[derive(BinRead, BinWrite)]
-#[brw(little)]
-struct ListNode {
-    value: i32,
-    next: Ptr<ListNode>,
-}
-
-impl ServiceEntity for ListNode {
-    fn write_to(&self, buffer: &mut Cursor<Vec<u8>>) {
-        self.write(buffer).unwrap();
-    }
-}
-
-impl LinkedList {
-    fn new(tx: Transaction, ptr: Ptr<LinkedListNode>) -> Self {
+    fn open(tx: Transaction, ptr: Ptr<Self::Seed>) -> Self {
         let root = tx.lookup(ptr);
         Self { tx, root, ptr }
     }
@@ -66,20 +46,34 @@ impl LinkedList {
         Self { tx, root, ptr }
     }
 
+    fn finish(mut self) -> Transaction {
+        self.tx.update(&self.root);
+        self.tx
+    }
+}
+
+#[derive(BinRead, BinWrite)]
+#[brw(little)]
+struct ListNode {
+    value: i32,
+    next: Ptr<ListNode>,
+}
+
+impl LinkedList {
     fn push_front(&mut self, value: i32) {
         let handle = self.tx.write(ListNode {
             value,
-            next: self.root.as_ref().first,
+            next: self.root.first,
         });
-        self.root.as_mut().first = handle.ptr();
+        self.root.first = handle.ptr();
     }
 
     fn len(&self) -> usize {
-        let mut node: Ptr<_> = self.root.as_ref().first;
+        let mut node: Ptr<_> = self.root.first;
         let mut len = 0;
         while !node.is_null() {
             len += 1;
-            node = self.tx.lookup(node).as_ref().next;
+            node = self.tx.lookup(node).next;
         }
         len
     }
@@ -87,17 +81,12 @@ impl LinkedList {
     fn iter(&self) -> impl Iterator<Item = i32> + '_ {
         ListIterator {
             tx: &self.tx,
-            ptr: self.root.as_ref().first,
+            ptr: self.root.first,
         }
     }
 
     fn ptr(&self) -> Ptr<LinkedListNode> {
         self.ptr
-    }
-
-    fn finish(mut self) -> Transaction {
-        self.tx.update(&self.root);
-        self.tx
     }
 }
 
@@ -114,7 +103,6 @@ impl<'a> Iterator for ListIterator<'a> {
             None
         } else {
             let node = self.tx.lookup(self.ptr);
-            let node = node.as_ref();
             self.ptr = node.next;
             Some(node.value)
         }
@@ -135,7 +123,7 @@ mod tests {
         });
 
         let handle = tx.lookup(a.ptr());
-        assert_eq!(handle.as_ref().value, 42);
+        assert_eq!(handle.value, 42);
     }
 
     #[test]
@@ -153,7 +141,7 @@ mod tests {
         });
         let root = tx.write(LinkedListNode { first: a.ptr() });
 
-        let list = LinkedList::new(tx, root.ptr());
+        let list = LinkedList::open(tx, root.ptr());
         assert_eq!(list.len(), 2);
     }
 
@@ -171,7 +159,7 @@ mod tests {
         memory.commit(list.finish());
 
         let tx = memory.start();
-        let list = LinkedList::new(tx, root);
+        let list = LinkedList::open(tx, root);
         let values = list.iter().collect::<Vec<_>>();
         assert_eq!(list.len(), 3);
         assert_eq!(values, vec![1, 2, 3]);
