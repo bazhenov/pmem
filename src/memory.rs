@@ -2,7 +2,7 @@ use crate::page::{Addr, Page, PageOffset, Snapshot};
 use binrw::{BinRead, BinWrite};
 use std::{
     borrow::Cow,
-    cell::{Ref, RefCell},
+    cell::{Ref, RefCell, RefMut},
     io::{Cursor, Seek, SeekFrom, Write},
     marker::PhantomData,
     mem,
@@ -78,6 +78,20 @@ impl Transaction {
         }
     }
 
+    pub fn read<T>(&self, ptr: Ptr<T>) -> T
+    where
+        for<'a> T: BinRead<Args<'a> = ()>,
+    {
+        use binrw::BinReaderExt;
+
+        let addr = ptr.addr;
+        let bytes = self.read_static::<4>(addr);
+        let len = u32::from_be_bytes(bytes);
+        let bytes = self.read_uncommited(addr + 4, len);
+        let mut cursor = Cursor::new(bytes);
+        cursor.read_ne().unwrap()
+    }
+
     fn read_static<const N: usize>(&self, offset: PageOffset) -> [u8; N] {
         let mut ret = [0; N];
         let bytes = self.read_uncommited(offset, N as PageOffset);
@@ -142,8 +156,9 @@ impl Transaction {
 
 #[derive(BinRead, BinWrite)]
 pub struct Ptr<T> {
-    addr: u32,
-    _phantom: PhantomData<T>,
+    // TODO make private
+    pub addr: u32,
+    pub _phantom: PhantomData<T>,
 }
 
 impl<T> Clone for Ptr<T> {
@@ -181,6 +196,10 @@ pub struct Handle<T> {
 impl<T> Handle<T> {
     pub fn as_ref(&self) -> Ref<T> {
         RefCell::borrow(&self.value)
+    }
+
+    pub fn as_mut(&self) -> RefMut<T> {
+        RefCell::borrow_mut(&self.value)
     }
 
     pub fn ptr(&self) -> Ptr<T> {
