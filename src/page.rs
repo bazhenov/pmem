@@ -6,39 +6,12 @@ pub type Addr = u32;
 pub type PageOffset = u32;
 pub type LSN = u64;
 
+#[derive(Default)]
 pub struct Page {
     snapshot: Rc<CommitedSnapshot>,
 }
 
 impl Page {
-    pub fn new() -> Self {
-        Self {
-            snapshot: Rc::default(),
-        }
-    }
-
-    pub fn snapshot(&self) -> Snapshot {
-        Snapshot {
-            patches: vec![],
-            base: Rc::clone(&self.snapshot),
-        }
-    }
-
-    pub fn commit(&mut self, snapshot: Snapshot, lsn: LSN) {
-        // Given snapshot should have current snapshot as a parent
-        // Otherwise changes are not linear
-        assert!(
-            Rc::ptr_eq(&self.snapshot, &snapshot.base),
-            "Proposed snaphot is not linear"
-        );
-        assert!(lsn > self.snapshot.lsn, "New LSN should be larger");
-        self.snapshot = Rc::new(CommitedSnapshot {
-            lsn,
-            patches: snapshot.patches,
-            parent: Some(Rc::clone(&self.snapshot)),
-        });
-    }
-
     #[cfg(test)]
     fn read(&self, addr: PageOffset, len: PageOffset) -> Cow<'_, [u8]> {
         self.snapshot.read(addr, len)
@@ -54,8 +27,41 @@ impl From<CommitedSnapshot> for Page {
 }
 
 #[derive(Default)]
-pub struct CommitedSnapshot {
+pub struct PagePool {
+    page: Page,
     lsn: LSN,
+}
+
+impl PagePool {
+    pub fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            patches: vec![],
+            base: Rc::clone(&self.page.snapshot),
+        }
+    }
+
+    pub fn commit(&mut self, snapshot: Snapshot) {
+        // Given snapshot should have current snapshot as a parent
+        // Otherwise changes are not linear
+        assert!(
+            Rc::ptr_eq(&self.page.snapshot, &snapshot.base),
+            "Proposed snaphot is not linear"
+        );
+        self.lsn += 1;
+        self.page.snapshot = Rc::new(CommitedSnapshot {
+            patches: snapshot.patches,
+            parent: Some(Rc::clone(&self.page.snapshot)),
+        });
+    }
+
+    #[cfg(test)]
+    fn read(&self, addr: PageOffset, len: PageOffset) -> Cow<'_, [u8]> {
+        self.page.snapshot.read(addr, len)
+    }
+}
+
+#[derive(Default)]
+pub struct CommitedSnapshot {
     patches: Vec<Patch>,
     parent: Option<Rc<CommitedSnapshot>>,
 }
@@ -159,41 +165,40 @@ mod tests {
 
     #[test]
     fn commited_changes_should_be_visible_on_a_page() {
-        let mut page = Page::from("Jekyll");
-        let mut snapshot = page.snapshot();
+        let mut mem = PagePool::from("Jekyll");
+
+        let mut snapshot = mem.snapshot();
         snapshot.write(0, b"Hide");
-        page.commit(snapshot, 2);
-        assert_str_eq(page.read(0, 4), b"Hide");
+        mem.commit(snapshot);
+
+        assert_str_eq(mem.read(0, 4), b"Hide");
     }
 
     #[test]
     fn uncommited_changes_should_be_visible_only_on_the_snapshot() {
-        let page = Page::from("Jekyll");
-        let mut snapshot = page.snapshot();
+        let mem = PagePool::from("Jekyll");
 
+        let mut snapshot = mem.snapshot();
         snapshot.write(0, b"Hide");
+
         assert_str_eq(snapshot.read(0, 4), "Hide");
-        assert_str_eq(page.read(0, 6), "Jekyll");
+        assert_str_eq(mem.read(0, 6), "Jekyll");
     }
 
     #[test]
     fn patch_page() {
-        let mut page = Page::from("Hello panic!");
+        let mut mem = PagePool::from("Hello panic!");
 
-        let mut snapshot = page.snapshot();
+        let mut snapshot = mem.snapshot();
         snapshot.write(6, b"world");
-        page.commit(snapshot, 2);
+        mem.commit(snapshot);
 
-        assert_str_eq(page.read(0, 12), "Hello world!");
-        assert_str_eq(page.read(0, 8), "Hello wo");
-        assert_str_eq(page.read(3, 9), "lo world!");
-        assert_str_eq(page.read(6, 5), "world");
-        assert_str_eq(page.read(8, 4), "rld!");
-        assert_str_eq(page.read(7, 3), "orl");
-    }
-
-    fn as_bytes(page: &Page, addr: PageOffset, len: PageOffset) -> Cow<[u8]> {
-        page.read(addr, len)
+        assert_str_eq(mem.read(0, 12), "Hello world!");
+        assert_str_eq(mem.read(0, 8), "Hello wo");
+        assert_str_eq(mem.read(3, 9), "lo world!");
+        assert_str_eq(mem.read(6, 5), "world");
+        assert_str_eq(mem.read(8, 4), "rld!");
+        assert_str_eq(mem.read(7, 3), "orl");
     }
 
     impl<T: AsRef<str>> From<T> for Page {
@@ -201,12 +206,20 @@ mod tests {
             let bytes = value.as_ref().as_bytes();
             assert!(bytes.len() <= PAGE_SIZE, "String is too large");
 
-            let mut page = Page::new();
-            let mut snapshot = page.snapshot();
-            snapshot.write(0, bytes);
-            page.commit(snapshot, 1);
+            let snapshot = CommitedSnapshot {
+                patches: vec![(0, bytes.to_vec())],
+                parent: None,
+            };
+            Page {
+                snapshot: Rc::new(snapshot),
+            }
+        }
+    }
 
-            page
+    impl<T: AsRef<str>> From<T> for PagePool {
+        fn from(value: T) -> Self {
+            let page = Page::from(value);
+            PagePool { page, lsn: 0 }
         }
     }
 
@@ -221,9 +234,8 @@ mod tests {
                 // Mirror buffer where we track all the patches being applied.
                 // In the end page content should be equal mirror buffer
                 let mut mirror = [0; PAGE_SIZE];
-                let mut page = Page::new();
+                let mut page = PagePool::default();
 
-                let mut lsn = 1;
                 for patches in snapshots {
                     for (offset, bytes) in patches.into_iter() {
                         let mut snapshot = page.snapshot();
@@ -231,12 +243,11 @@ mod tests {
 
                         let range = offset..offset + bytes.len();
                         mirror[range].copy_from_slice(bytes.as_slice());
-                        page.commit(snapshot, lsn);
-                        lsn += 1;
+                        page.commit(snapshot);
                     }
                 }
 
-                assert_eq!(&*as_bytes(&page, 0, PAGE_SIZE as PageOffset), mirror);
+                assert_eq!(&*page.read(0, PAGE_SIZE as PageOffset), mirror);
             }
         }
 
