@@ -4,9 +4,10 @@ const PAGE_SIZE: usize = 1 << 16; // 64KB
 type Patch = (usize, Vec<u8>);
 pub type Addr = u32;
 pub type PageOffset = u32;
+pub type LSN = u64;
 
 pub struct Page {
-    snapshot: Rc<Snapshot>,
+    snapshot: Rc<CommitedSnapshot>,
 }
 
 impl Page {
@@ -19,27 +20,23 @@ impl Page {
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
             patches: vec![],
-            parent: Some(Rc::clone(&self.snapshot)),
+            base: Rc::clone(&self.snapshot),
         }
     }
 
-    pub fn commit(&mut self, snapshot: Snapshot) {
+    pub fn commit(&mut self, snapshot: Snapshot, lsn: LSN) {
         // Given snapshot should have current snapshot as a parent
         // Otherwise changes are not linear
-
-        // In case of future changes explicitly calling as_ref()/Rc::clone to be sure
-        // we cloning Rc, and not the inner object. Snapshots itself can be costly to clone.
-        #[allow(clippy::useless_asref)]
-        let parent = snapshot
-            .parent
-            .as_ref()
-            .map(Rc::clone)
-            .expect("Proposed snapshot has no parent");
         assert!(
-            Rc::ptr_eq(&self.snapshot, &parent),
+            Rc::ptr_eq(&self.snapshot, &snapshot.base),
             "Proposed snaphot is not linear"
         );
-        self.snapshot = Rc::new(snapshot);
+        assert!(lsn > self.snapshot.lsn, "New LSN should be larger");
+        self.snapshot = Rc::new(CommitedSnapshot {
+            lsn,
+            patches: snapshot.patches,
+            parent: Some(Rc::clone(&self.snapshot)),
+        });
     }
 
     #[cfg(test)]
@@ -48,8 +45,8 @@ impl Page {
     }
 }
 
-impl From<Snapshot> for Page {
-    fn from(snapshot: Snapshot) -> Self {
+impl From<CommitedSnapshot> for Page {
+    fn from(snapshot: CommitedSnapshot) -> Self {
         Self {
             snapshot: Rc::new(snapshot),
         }
@@ -57,9 +54,36 @@ impl From<Snapshot> for Page {
 }
 
 #[derive(Default)]
+pub struct CommitedSnapshot {
+    lsn: LSN,
+    patches: Vec<Patch>,
+    parent: Option<Rc<CommitedSnapshot>>,
+}
+
+impl CommitedSnapshot {
+    #[cfg(test)]
+    pub fn read(&self, addr: PageOffset, len: PageOffset) -> Cow<'_, [u8]> {
+        assert!(len <= PAGE_SIZE as u32, "Out of bounds read");
+        let mut buffer = vec![0; len as usize];
+        let range = (addr as usize)..(addr + len) as usize;
+
+        let mut patch_list = vec![self.patches.as_slice()];
+        let snapshots = self
+            .parent
+            .as_ref()
+            .map(Rc::clone)
+            .map(collect_snapshots)
+            .unwrap_or_default();
+        patch_list.extend(snapshots.iter().map(|s| s.patches.as_slice()));
+
+        apply_patches(&patch_list, &mut buffer, &range);
+        Cow::Owned(buffer)
+    }
+}
+
 pub struct Snapshot {
     patches: Vec<Patch>,
-    parent: Option<Rc<Snapshot>>,
+    base: Rc<CommitedSnapshot>,
 }
 
 impl Snapshot {
@@ -73,16 +97,29 @@ impl Snapshot {
         let mut buffer = vec![0; len as usize];
         let range = (addr as usize)..(addr + len) as usize;
 
-        self.apply_patches(&mut buffer, &range);
+        // We need to collect a chain of snapshots into a Vec first.
+        // Otherwise borrowcher is unable to reason about lifecycles
+        let snapshots = collect_snapshots(Rc::clone(&self.base));
+        let mut patch_list = vec![self.patches.as_slice()];
+        patch_list.extend(snapshots.iter().map(|s| s.patches.as_slice()));
 
+        apply_patches(&patch_list, &mut buffer, &range);
         Cow::Owned(buffer)
     }
+}
 
-    fn apply_patches(&self, buffer: &mut [u8], range: &Range<usize>) {
-        if let Some(parent) = self.parent.as_ref() {
-            parent.apply_patches(buffer, range);
-        }
-        let patches = &self.patches;
+fn collect_snapshots(snapshot: Rc<CommitedSnapshot>) -> Vec<Rc<CommitedSnapshot>> {
+    let mut snapshots = vec![];
+    let mut snapshot = Some(snapshot);
+    while let Some(s) = snapshot {
+        snapshots.push(Rc::clone(&s));
+        snapshot = s.parent.as_ref().map(Rc::clone);
+    }
+    snapshots
+}
+
+fn apply_patches(snapshots: &[&[Patch]], buffer: &mut [u8], range: &Range<usize>) {
+    for patches in snapshots.iter().rev() {
         for (offset, bytes) in patches.iter().filter(|p| intersects(p, range)) {
             // Calculating intersection of the path and input interval
             let start = range.start.max(*offset);
@@ -100,15 +137,6 @@ impl Snapshot {
             };
 
             buffer[slice_range].copy_from_slice(&bytes[patch_range])
-        }
-    }
-}
-
-impl From<Patch> for Snapshot {
-    fn from(value: Patch) -> Self {
-        Self {
-            patches: vec![value],
-            parent: None,
         }
     }
 }
@@ -134,7 +162,7 @@ mod tests {
         let mut page = Page::from("Jekyll");
         let mut snapshot = page.snapshot();
         snapshot.write(0, b"Hide");
-        page.commit(snapshot);
+        page.commit(snapshot, 2);
         assert_str_eq(page.read(0, 4), b"Hide");
     }
 
@@ -154,7 +182,7 @@ mod tests {
 
         let mut snapshot = page.snapshot();
         snapshot.write(6, b"world");
-        page.commit(snapshot);
+        page.commit(snapshot, 2);
 
         assert_str_eq(page.read(0, 12), "Hello world!");
         assert_str_eq(page.read(0, 8), "Hello wo");
@@ -173,7 +201,12 @@ mod tests {
             let bytes = value.as_ref().as_bytes();
             assert!(bytes.len() <= PAGE_SIZE, "String is too large");
 
-            Page::from(Snapshot::from((0, bytes.to_vec())))
+            let mut page = Page::new();
+            let mut snapshot = page.snapshot();
+            snapshot.write(0, bytes);
+            page.commit(snapshot, 1);
+
+            page
         }
     }
 
@@ -190,14 +223,16 @@ mod tests {
                 let mut mirror = [0; PAGE_SIZE];
                 let mut page = Page::new();
 
+                let mut lsn = 1;
                 for patches in snapshots {
-                    for (offset, bytes) in patches {
+                    for (offset, bytes) in patches.into_iter() {
                         let mut snapshot = page.snapshot();
                         snapshot.write(offset as u32, &bytes);
 
                         let range = offset..offset + bytes.len();
                         mirror[range].copy_from_slice(bytes.as_slice());
-                        page.commit(snapshot);
+                        page.commit(snapshot, lsn);
+                        lsn += 1;
                     }
                 }
 
@@ -217,6 +252,7 @@ mod tests {
         }
     }
 
+    #[track_caller]
     fn assert_str_eq<A: AsRef<[u8]>, B: AsRef<[u8]>>(a: A, b: B) {
         let a = String::from_utf8_lossy(a.as_ref());
         let b = String::from_utf8_lossy(b.as_ref());

@@ -1,4 +1,4 @@
-use crate::page::{Addr, Page, PageOffset, Snapshot};
+use crate::page::{Addr, Page, PageOffset, Snapshot, LSN};
 use binrw::{meta::WriteEndian, BinRead, BinWrite};
 use std::{
     borrow::Cow,
@@ -16,6 +16,7 @@ pub struct Memory {
     page: Page,
     next_addr: PageOffset,
     seq: u32,
+    lsn: LSN,
 }
 
 impl Memory {
@@ -23,8 +24,9 @@ impl Memory {
         assert!(tx.next_addr >= self.next_addr);
         assert!(tx.seq == self.seq);
         // Page should be commited first, because it's check for snapshot linearity
-        self.page.commit(tx.snapshot);
+        self.page.commit(tx.snapshot, self.lsn);
         self.seq += 1;
+        self.lsn += 1;
         self.next_addr = tx.next_addr;
     }
 
@@ -43,6 +45,7 @@ impl Default for Memory {
             page: Page::new(),
             next_addr: START_ADDR,
             seq: 0,
+            lsn: 1,
         }
     }
 }
