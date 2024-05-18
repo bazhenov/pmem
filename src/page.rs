@@ -1,10 +1,20 @@
-use std::{borrow::Cow, ops::Range, rc::Rc};
+use crate::ensure;
+use std::{borrow::Cow, ops::Range, rc::Rc, usize};
 
-const PAGE_SIZE: usize = 1 << 16; // 64KB
+const PAGE_SIZE: usize = 1 << 24; // 16Mb
 type Patch = (usize, Vec<u8>);
 pub type Addr = u32;
 pub type PageOffset = u32;
+pub type PageNo = u32;
 pub type LSN = u64;
+
+#[derive(Debug, thiserror::Error, PartialEq)]
+pub enum Error {
+    #[error("Memory not allocated")]
+    NotAllocated,
+}
+
+type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Default)]
 pub struct Page {
@@ -30,9 +40,17 @@ impl From<CommitedSnapshot> for Page {
 pub struct PagePool {
     page: Page,
     lsn: LSN,
+    max_page_no: PageNo,
 }
 
 impl PagePool {
+    pub fn new(pages: usize) -> Self {
+        Self {
+            page: Page::default(),
+            lsn: 0,
+            max_page_no: (pages - 1) as PageNo,
+        }
+    }
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
             patches: vec![],
@@ -55,8 +73,11 @@ impl PagePool {
     }
 
     #[cfg(test)]
-    fn read(&self, addr: PageOffset, len: PageOffset) -> Cow<'_, [u8]> {
-        self.page.snapshot.read(addr, len)
+    fn read(&self, addr: PageOffset, len: PageOffset) -> Result<Cow<'_, [u8]>> {
+        let (page_no, offset) = split_ptr(addr);
+        ensure!(page_no <= self.max_page_no, Error::NotAllocated);
+
+        Ok(self.page.snapshot.read(offset, len))
     }
 }
 
@@ -147,6 +168,13 @@ fn apply_patches(snapshots: &[&[Patch]], buffer: &mut [u8], range: &Range<usize>
     }
 }
 
+fn split_ptr(addr: Addr) -> (PageNo, PageOffset) {
+    const PAGE_SIZE_BITS: u32 = PAGE_SIZE.trailing_zeros() as u32;
+    let page_no = addr >> PAGE_SIZE_BITS;
+    let offset = addr & ((PAGE_SIZE - 1) as u32);
+    (page_no, offset)
+}
+
 /// Returns true of given patch intersects given range of bytes
 fn intersects((offset, patch): &Patch, range: &Range<usize>) -> bool {
     *offset < range.end && offset + patch.len() > range.start
@@ -154,77 +182,114 @@ fn intersects((offset, patch): &Patch, range: &Range<usize>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    pub use super::*;
 
     #[test]
-    fn create_new_page() {
+    fn create_new_page() -> Result<()> {
         let page = Page::from("foo");
         assert_str_eq(page.read(0, 3), "foo");
         assert_str_eq(page.read(3, 1), [0]);
+        Ok(())
     }
 
     #[test]
-    fn commited_changes_should_be_visible_on_a_page() {
+    fn commited_changes_should_be_visible_on_a_page() -> Result<()> {
         let mut mem = PagePool::from("Jekyll");
 
         let mut snapshot = mem.snapshot();
         snapshot.write(0, b"Hide");
         mem.commit(snapshot);
 
-        assert_str_eq(mem.read(0, 4), b"Hide");
+        assert_str_eq(mem.read(0, 4)?, b"Hide");
+        Ok(())
     }
 
     #[test]
-    fn uncommited_changes_should_be_visible_only_on_the_snapshot() {
+    fn uncommited_changes_should_be_visible_only_on_the_snapshot() -> Result<()> {
         let mem = PagePool::from("Jekyll");
 
         let mut snapshot = mem.snapshot();
         snapshot.write(0, b"Hide");
 
         assert_str_eq(snapshot.read(0, 4), "Hide");
-        assert_str_eq(mem.read(0, 6), "Jekyll");
+        assert_str_eq(mem.read(0, 6)?, "Jekyll");
+        Ok(())
     }
 
     #[test]
-    fn patch_page() {
+    fn patch_page() -> Result<()> {
         let mut mem = PagePool::from("Hello panic!");
 
         let mut snapshot = mem.snapshot();
         snapshot.write(6, b"world");
         mem.commit(snapshot);
 
-        assert_str_eq(mem.read(0, 12), "Hello world!");
-        assert_str_eq(mem.read(0, 8), "Hello wo");
-        assert_str_eq(mem.read(3, 9), "lo world!");
-        assert_str_eq(mem.read(6, 5), "world");
-        assert_str_eq(mem.read(8, 4), "rld!");
-        assert_str_eq(mem.read(7, 3), "orl");
+        assert_str_eq(mem.read(0, 12)?, "Hello world!");
+        assert_str_eq(mem.read(0, 8)?, "Hello wo");
+        assert_str_eq(mem.read(3, 9)?, "lo world!");
+        assert_str_eq(mem.read(6, 5)?, "world");
+        assert_str_eq(mem.read(8, 4)?, "rld!");
+        assert_str_eq(mem.read(7, 3)?, "orl");
+        Ok(())
     }
 
-    impl<T: AsRef<str>> From<T> for Page {
-        fn from(value: T) -> Self {
-            let bytes = value.as_ref().as_bytes();
-            assert!(bytes.len() <= PAGE_SIZE, "String is too large");
+    #[test]
+    fn page_pool_should_return_error_of_ptr_out_of_bounds() -> Result<()> {
+        let mem = PagePool::default();
 
-            let snapshot = CommitedSnapshot {
-                patches: vec![(0, bytes.to_vec())],
-                parent: None,
-            };
-            Page {
-                snapshot: Rc::new(snapshot),
-            }
+        let result = mem.read(PAGE_SIZE as u32, 1);
+        assert_eq!(result, Err(Error::NotAllocated));
+        Ok(())
+    }
+
+    mod ptr {
+        use super::*;
+
+        #[test]
+        fn split_ptr_generic() {
+            let addr = 0x0A_F01234;
+            let (page_no, offset) = split_ptr(addr);
+
+            assert_eq!(page_no, 0x0A, "Unexpected page number");
+            assert_eq!(offset, 0xF01234, "Unexpected offset");
         }
-    }
 
-    impl<T: AsRef<str>> From<T> for PagePool {
-        fn from(value: T) -> Self {
-            let page = Page::from(value);
-            PagePool { page, lsn: 0 }
+        #[test]
+        fn split_ptr_at_boundary() {
+            let addr = PAGE_SIZE as u32 - 1; // Last address of the first page
+            let (page_no, offset) = split_ptr(addr);
+
+            assert_eq!(
+                page_no, 0,
+                "Page number should be 0 at the last address of the first page"
+            );
+            assert_eq!(
+                offset,
+                PAGE_SIZE as u32 - 1,
+                "Offset should be at the page boundary"
+            );
+        }
+
+        #[test]
+        fn test_split_ptr_zero() {
+            let addr = 0x00000000;
+            let (page_no, offset) = split_ptr(addr);
+
+            assert_eq!(page_no, 0);
+            assert_eq!(offset, 0);
+        }
+
+        #[test]
+        fn test_split_ptr_max_addr() {
+            let addr = Addr::MAX; // Maximum possible address
+            let (page_no, offset) = split_ptr(addr);
+
+            assert_eq!(page_no, 0xFF, "Unexpected page number for maximum address");
+            assert_eq!(offset, 0xFFFFFF, "Unexpected offset for maximum address");
         }
     }
 
     mod proptests {
-        use super::super::*;
         use super::*;
         use proptest::{collection::vec, prelude::*};
 
@@ -233,21 +298,21 @@ mod tests {
             fn arbitrary_page_patches(snapshots in vec(any_snapshot(), 0..5)) {
                 // Mirror buffer where we track all the patches being applied.
                 // In the end page content should be equal mirror buffer
-                let mut mirror = [0; PAGE_SIZE];
-                let mut page = PagePool::default();
+                let mut mirror = vec![0; PAGE_SIZE];
+                let mut mem = PagePool::default();
 
                 for patches in snapshots {
                     for (offset, bytes) in patches.into_iter() {
-                        let mut snapshot = page.snapshot();
+                        let mut snapshot = mem.snapshot();
                         snapshot.write(offset as u32, &bytes);
 
                         let range = offset..offset + bytes.len();
                         mirror[range].copy_from_slice(bytes.as_slice());
-                        page.commit(snapshot);
+                        mem.commit(snapshot);
                     }
                 }
 
-                assert_eq!(&*page.read(0, PAGE_SIZE as PageOffset), mirror);
+                assert_eq!(&*mem.read(0, PAGE_SIZE as PageOffset).unwrap(), mirror);
             }
         }
 
@@ -268,5 +333,31 @@ mod tests {
         let a = String::from_utf8_lossy(a.as_ref());
         let b = String::from_utf8_lossy(b.as_ref());
         assert_eq!(a, b);
+    }
+
+    impl<T: AsRef<str>> From<T> for Page {
+        fn from(value: T) -> Self {
+            let bytes = value.as_ref().as_bytes();
+            assert!(bytes.len() <= PAGE_SIZE, "String is too large");
+
+            let snapshot = CommitedSnapshot {
+                patches: vec![(0, bytes.to_vec())],
+                parent: None,
+            };
+            Page {
+                snapshot: Rc::new(snapshot),
+            }
+        }
+    }
+
+    impl<T: AsRef<str>> From<T> for PagePool {
+        fn from(value: T) -> Self {
+            let page = Page::from(value);
+            PagePool {
+                page,
+                lsn: 0,
+                max_page_no: 0,
+            }
+        }
     }
 }
