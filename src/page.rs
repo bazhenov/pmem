@@ -2,7 +2,7 @@ use std::ops::Deref;
 use std::{borrow::Cow, cell::RefCell, ops::Range, rc::Rc, usize};
 
 const PAGE_SIZE: usize = 1 << 24; // 16Mb
-type Patch = (usize, Vec<u8>);
+type Patch = (PageOffset, Vec<u8>);
 pub type Addr = u32;
 pub type PageOffset = u32;
 pub type PageNo = u32;
@@ -23,7 +23,7 @@ pub struct Page {
 
 impl Page {
     #[cfg(test)]
-    fn read(&self, addr: PageOffset, len: PageOffset) -> Cow<'_, [u8]> {
+    fn read(&self, addr: PageOffset, len: usize) -> Cow<'_, [u8]> {
         self.snapshot.read(addr, len)
     }
 }
@@ -75,7 +75,7 @@ impl PagePool {
     }
 
     #[cfg(test)]
-    fn read(&self, addr: PageOffset, len: PageOffset) -> Result<Ref> {
+    fn read(&self, addr: PageOffset, len: usize) -> Result<Ref> {
         use crate::ensure;
 
         let (page_no, offset) = split_ptr(addr);
@@ -112,7 +112,7 @@ impl Ref {
     ///
     /// 3. By dropping `bytes` before `_snapshot`, we ensure that the borrowed view into the snapshot's data does not
     /// outlive the snapshot itself. This guarantee relies on the Rust drop order of struct fields.
-    fn create(snapshot: Rc<CommitedSnapshot>, offset: PageOffset, len: PageOffset) -> Self {
+    fn create(snapshot: Rc<CommitedSnapshot>, offset: PageOffset, len: usize) -> Self {
         use std::mem;
 
         let bytes = snapshot.read(offset, len);
@@ -140,15 +140,15 @@ impl AsRef<[u8]> for Ref {
 
 #[derive(Default)]
 pub struct CommitedSnapshot {
-    patches: Vec<Patch>,
+    patches: Vec<(Addr, Vec<u8>)>,
     parent: Option<Rc<CommitedSnapshot>>,
 }
 
 impl CommitedSnapshot {
-    pub fn read(&self, addr: PageOffset, len: PageOffset) -> Cow<'_, [u8]> {
-        assert!(len <= PAGE_SIZE as u32, "Out of bounds read");
+    pub fn read(&self, addr: PageOffset, len: usize) -> Cow<'_, [u8]> {
+        assert!(len <= PAGE_SIZE, "Out of bounds read");
         let mut buffer = vec![0; len as usize];
-        let range = (addr as usize)..(addr + len) as usize;
+        let range = (addr as usize)..addr as usize + len;
 
         let mut patch_list = vec![self.patches.as_slice()];
         let snapshots = self
@@ -163,7 +163,7 @@ impl CommitedSnapshot {
         Cow::Owned(buffer)
     }
 
-    pub fn read_ref<'a>(self: &Rc<Self>, addr: PageOffset, len: PageOffset) -> Ref {
+    pub fn read_ref<'a>(self: &Rc<Self>, addr: PageOffset, len: usize) -> Ref {
         Ref::create(Rc::clone(self), addr, len)
     }
 }
@@ -176,13 +176,13 @@ pub struct Snapshot {
 impl Snapshot {
     pub fn write(&mut self, addr: Addr, bytes: &[u8]) {
         assert!(bytes.len() <= PAGE_SIZE, "Buffer too large");
-        self.patches.push((addr as usize, bytes.to_vec()))
+        self.patches.push((addr, bytes.to_vec()))
     }
 
-    pub fn read(&self, addr: PageOffset, len: PageOffset) -> Cow<'_, [u8]> {
-        assert!(len <= PAGE_SIZE as u32, "Out of bounds read");
-        let mut buffer = vec![0; len as usize];
-        let range = (addr as usize)..(addr + len) as usize;
+    pub fn read(&self, addr: PageOffset, len: usize) -> Result<Cow<'_, [u8]>> {
+        assert!(len <= PAGE_SIZE, "Out of bounds read");
+        let mut buffer = vec![0; len];
+        let range = (addr as usize)..addr as usize + len;
 
         // We need to collect a chain of snapshots into a Vec first.
         // Otherwise borrowcher is unable to reason about lifecycles
@@ -191,7 +191,7 @@ impl Snapshot {
         patch_list.extend(snapshots.iter().map(|s| s.patches.as_slice()));
 
         apply_patches(&patch_list, &mut buffer, &range);
-        Cow::Owned(buffer)
+        Ok(Cow::Owned(buffer))
     }
 }
 
@@ -209,12 +209,13 @@ fn apply_patches(snapshots: &[&[Patch]], buffer: &mut [u8], range: &Range<usize>
     for patches in snapshots.iter().rev() {
         for (offset, bytes) in patches.iter().filter(|p| intersects(p, range)) {
             // Calculating intersection of the path and input interval
-            let start = range.start.max(*offset);
+            let offset = *offset as usize;
+            let start = range.start.max(offset);
             let end = range.end.min(offset + bytes.len());
             let len = end - start;
 
             let patch_range = {
-                let from = start.saturating_sub(*offset);
+                let from = start.saturating_sub(offset);
                 from..from + len
             };
 
@@ -237,7 +238,7 @@ fn split_ptr(addr: Addr) -> (PageNo, PageOffset) {
 
 /// Returns true of given patch intersects given range of bytes
 fn intersects((offset, patch): &Patch, range: &Range<usize>) -> bool {
-    *offset < range.end && offset + patch.len() > range.start
+    (*offset as usize) < range.end && *offset as usize + patch.len() > range.start
 }
 
 #[cfg(test)]
@@ -271,7 +272,7 @@ mod tests {
         let mut snapshot = mem.snapshot();
         snapshot.write(0, b"Hide");
 
-        assert_str_eq(snapshot.read(0, 4), "Hide");
+        assert_str_eq(snapshot.read(0, 4)?, "Hide");
         assert_str_eq(mem.read(0, 6)?, "Jekyll");
         Ok(())
     }
@@ -290,6 +291,39 @@ mod tests {
         assert_str_eq(mem.read(6, 5)?, "world");
         assert_str_eq(mem.read(8, 4)?, "rld!");
         assert_str_eq(mem.read(7, 3)?, "orl");
+        Ok(())
+    }
+
+    #[test]
+    fn data_across_multiple_pages_can_be_written() -> Result<()> {
+        let mut mem = PagePool::new(3);
+
+        let alice = b"Alice";
+        let bob = b"Bob";
+        let charlie = b"Charlie";
+
+        // Addresses on 3 consequent pages
+        let page_a = 0;
+        let page_b = 1 * PAGE_SIZE as Addr;
+        let page_c = 2 * PAGE_SIZE as Addr;
+
+        let mut snapshot = mem.snapshot();
+        snapshot.write(page_a, alice);
+        snapshot.write(page_b, bob);
+        snapshot.write(page_c, charlie);
+
+        // Checking that data is visible in snapshot
+        assert_str_eq(snapshot.read(page_a, alice.len())?, alice);
+        assert_str_eq(snapshot.read(page_b, bob.len())?, bob);
+        assert_str_eq(snapshot.read(page_c, charlie.len())?, charlie);
+
+        mem.commit(snapshot);
+
+        // Checking that data is visible after commit to page pool
+        assert_str_eq(mem.read(page_a, alice.len())?, alice);
+        // assert_str_eq(mem.read(page_b, bob.len())?, bob);
+        // assert_str_eq(mem.read(page_c, charlie.len())?, charlie);
+
         Ok(())
     }
 
@@ -359,29 +393,30 @@ mod tests {
             #[cfg_attr(miri, ignore)]
             fn arbitrary_page_patches(snapshots in vec(any_snapshot(), 0..5)) {
                 // Mirror buffer where we track all the patches being applied.
-                // In the end page content should be equal mirror buffer
+                // In the end content should be equal to the mirror buffer
                 let mut mirror = vec![0; PAGE_SIZE];
                 let mut mem = PagePool::default();
 
                 for patches in snapshots {
                     for (offset, bytes) in patches.into_iter() {
                         let mut snapshot = mem.snapshot();
-                        snapshot.write(offset as u32, &bytes);
+                        snapshot.write(offset, &bytes);
 
+                        let offset = offset as usize;
                         let range = offset..offset + bytes.len();
                         mirror[range].copy_from_slice(bytes.as_slice());
                         mem.commit(snapshot);
                     }
                 }
 
-                assert_eq!(&*mem.read(0, PAGE_SIZE as PageOffset).unwrap(), mirror);
+                assert_eq!(&*mem.read(0, PAGE_SIZE).unwrap(), mirror);
             }
         }
 
         fn any_patch() -> impl Strategy<Value = Patch> {
-            (0usize..PAGE_SIZE, vec(any::<u8>(), 1..32))
+            (0u32..(PAGE_SIZE as u32), vec(any::<u8>(), 1..32))
                 .prop_filter("out of bounds patch", |(offset, bytes)| {
-                    offset + bytes.len() < PAGE_SIZE
+                    offset + (bytes.len() as u32) < PAGE_SIZE as u32
                 })
         }
 

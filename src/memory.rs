@@ -1,4 +1,4 @@
-use crate::page::{Addr, PageOffset, PagePool, Snapshot};
+use crate::page::{Addr, Error, PageOffset, PagePool, Snapshot};
 use binrw::{meta::WriteEndian, BinRead, BinWrite};
 use std::{
     borrow::Cow,
@@ -17,6 +17,8 @@ pub struct Memory {
     next_addr: PageOffset,
     seq: u32,
 }
+
+type Result<T> = std::result::Result<T, Error>;
 
 impl Memory {
     pub fn commit(&mut self, tx: Transaction) {
@@ -66,8 +68,8 @@ impl Transaction {
 
         let addr = ptr.addr;
         let bytes = self.read_static::<4>(addr);
-        let len = u32::from_be_bytes(bytes);
-        let bytes = self.read_uncommited(addr + 4, len);
+        let len = u32::from_be_bytes(bytes) as usize;
+        let bytes = self.read_uncommited(addr + 4, len).unwrap();
         let mut cursor = Cursor::new(bytes);
         let value: T = cursor.read_ne().unwrap();
 
@@ -82,22 +84,22 @@ impl Transaction {
 
         let addr = ptr.addr;
         let bytes = self.read_static::<4>(addr);
-        let len = u32::from_be_bytes(bytes);
-        let bytes = self.read_uncommited(addr + 4, len);
+        let len = u32::from_be_bytes(bytes) as usize;
+        let bytes = self.read_uncommited(addr + 4, len).unwrap();
         let mut cursor = Cursor::new(bytes);
         cursor.read_ne().unwrap()
     }
 
     fn read_static<const N: usize>(&self, offset: PageOffset) -> [u8; N] {
         let mut ret = [0; N];
-        let bytes = self.read_uncommited(offset, N as PageOffset);
+        let bytes = self.read_uncommited(offset, N).unwrap();
         for (to, from) in ret.iter_mut().zip(bytes.iter()) {
             *to = *from;
         }
         ret
     }
 
-    fn read_uncommited(&self, addr: PageOffset, len: PageOffset) -> Cow<[u8]> {
+    fn read_uncommited(&self, addr: PageOffset, len: usize) -> Result<Cow<[u8]>> {
         self.snapshot.read(addr, len)
     }
 
@@ -157,9 +159,8 @@ impl Transaction {
 
 #[derive(BinRead, BinWrite)]
 pub struct Ptr<T> {
-    // TODO make private
-    pub addr: u32,
-    pub _phantom: PhantomData<T>,
+    addr: u32,
+    _phantom: PhantomData<T>,
 }
 
 impl<T> Clone for Ptr<T> {
