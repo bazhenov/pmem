@@ -1,0 +1,17 @@
+groups:
+  - name: cargo
+    key: c
+    groups:
+      - name: Tests
+        key: t
+        tasks:
+          - name: All
+            key: a
+            cmd: cargo test -q --lib --examples
+            confirm: true
+            clear: true
+          - name: Lib
+            key: l
+            cmd: cargo test -q --lib
+            confirm: true
+            clear: true
