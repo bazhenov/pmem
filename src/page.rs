@@ -1,5 +1,5 @@
-use crate::ensure;
-use std::{borrow::Cow, ops::Range, rc::Rc, usize};
+use std::ops::Deref;
+use std::{borrow::Cow, cell::RefCell, ops::Range, rc::Rc, usize};
 
 const PAGE_SIZE: usize = 1 << 24; // 16Mb
 type Patch = (usize, Vec<u8>);
@@ -38,7 +38,7 @@ impl From<CommitedSnapshot> for Page {
 
 #[derive(Default)]
 pub struct PagePool {
-    page: Page,
+    page: Rc<RefCell<Page>>,
     lsn: LSN,
     max_page_no: PageNo,
 }
@@ -46,38 +46,95 @@ pub struct PagePool {
 impl PagePool {
     pub fn new(pages: usize) -> Self {
         Self {
-            page: Page::default(),
+            page: Rc::default(),
             lsn: 0,
             max_page_no: (pages - 1) as PageNo,
         }
     }
     pub fn snapshot(&self) -> Snapshot {
+        let page = RefCell::borrow(&self.page);
         Snapshot {
             patches: vec![],
-            base: Rc::clone(&self.page.snapshot),
+            base: Rc::clone(&page.snapshot),
         }
     }
 
     pub fn commit(&mut self, snapshot: Snapshot) {
         // Given snapshot should have current snapshot as a parent
         // Otherwise changes are not linear
+        let mut page = RefCell::borrow_mut(&self.page);
         assert!(
-            Rc::ptr_eq(&self.page.snapshot, &snapshot.base),
+            Rc::ptr_eq(&page.snapshot, &snapshot.base),
             "Proposed snaphot is not linear"
         );
         self.lsn += 1;
-        self.page.snapshot = Rc::new(CommitedSnapshot {
+        page.snapshot = Rc::new(CommitedSnapshot {
             patches: snapshot.patches,
-            parent: Some(Rc::clone(&self.page.snapshot)),
+            parent: Some(Rc::clone(&page.snapshot)),
         });
     }
 
     #[cfg(test)]
-    fn read(&self, addr: PageOffset, len: PageOffset) -> Result<Cow<'_, [u8]>> {
+    fn read(&self, addr: PageOffset, len: PageOffset) -> Result<Ref> {
+        use crate::ensure;
+
         let (page_no, offset) = split_ptr(addr);
         ensure!(page_no <= self.max_page_no, Error::NotAllocated);
 
-        Ok(self.page.snapshot.read(offset, len))
+        let page = RefCell::borrow(&self.page);
+        let snapshot = Rc::clone(&page.snapshot);
+        Ok(Ref::create(snapshot, offset, len))
+    }
+}
+
+pub struct Ref {
+    bytes: Cow<'static, [u8]>,
+    _snapshot: Rc<CommitedSnapshot>,
+}
+
+impl Ref {
+    /// The `Ref::create` function constructs a `Ref` instance by reading bytes from a `CommitedSnapshot`
+    /// through a specified range and extending its lifetime to `'static`.
+    ///
+    /// This is inherently risky since it assumes that the byte slice returned by the `snapshot.read` function
+    /// will remain valid for the 'static lifetime, which is not guaranteed by Rust's safety rules.
+    /// However, this approach is sound under specific preconditions and with strict usage guidelines:
+    ///
+    /// # Safety
+    ///
+    /// 1. External modification or deallocation of `CommitedSnapshot`'s memory is prevented by using
+    ///  reference-counted pointer. `Rc`, ensuring that it remains allocated as long as `Ref` holds
+    /// a reference to it. This setup ties the lifetime of the snapshot's data indirectly to `Ref`'s usage.
+    ///
+    /// 2. The `CommitedSnapshot.patches` and consequently, the byte slices it returns, are immutable. This
+    /// immutability guarantees that once a `Ref` is created, the data it references cannot change,
+    /// thereby making the extended 'static lifetime of the bytes sound.
+    ///
+    /// 3. By dropping `bytes` before `_snapshot`, we ensure that the borrowed view into the snapshot's data does not
+    /// outlive the snapshot itself. This guarantee relies on the Rust drop order of struct fields.
+    fn create(snapshot: Rc<CommitedSnapshot>, offset: PageOffset, len: PageOffset) -> Self {
+        use std::mem;
+
+        let bytes = snapshot.read(offset, len);
+        let bytes = unsafe { mem::transmute(bytes) };
+        Self {
+            _snapshot: snapshot,
+            bytes,
+        }
+    }
+}
+
+impl Deref for Ref {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.bytes.deref()
+    }
+}
+
+impl AsRef<[u8]> for Ref {
+    fn as_ref(&self) -> &[u8] {
+        self.bytes.as_ref()
     }
 }
 
@@ -88,7 +145,6 @@ pub struct CommitedSnapshot {
 }
 
 impl CommitedSnapshot {
-    #[cfg(test)]
     pub fn read(&self, addr: PageOffset, len: PageOffset) -> Cow<'_, [u8]> {
         assert!(len <= PAGE_SIZE as u32, "Out of bounds read");
         let mut buffer = vec![0; len as usize];
@@ -105,6 +161,10 @@ impl CommitedSnapshot {
 
         apply_patches(&patch_list, &mut buffer, &range);
         Cow::Owned(buffer)
+    }
+
+    pub fn read_ref<'a>(self: &Rc<Self>, addr: PageOffset, len: PageOffset) -> Ref {
+        Ref::create(Rc::clone(self), addr, len)
     }
 }
 
@@ -237,8 +297,9 @@ mod tests {
     fn page_pool_should_return_error_of_ptr_out_of_bounds() -> Result<()> {
         let mem = PagePool::default();
 
-        let result = mem.read(PAGE_SIZE as u32, 1);
-        assert_eq!(result, Err(Error::NotAllocated));
+        let Err(Error::NotAllocated) = mem.read(PAGE_SIZE as u32, 1) else {
+            panic!("NotAllocated should be geberated");
+        };
         Ok(())
     }
 
@@ -295,6 +356,7 @@ mod tests {
 
         proptest! {
             #[test]
+            #[cfg_attr(miri, ignore)]
             fn arbitrary_page_patches(snapshots in vec(any_snapshot(), 0..5)) {
                 // Mirror buffer where we track all the patches being applied.
                 // In the end page content should be equal mirror buffer
@@ -352,7 +414,7 @@ mod tests {
 
     impl<T: AsRef<str>> From<T> for PagePool {
         fn from(value: T) -> Self {
-            let page = Page::from(value);
+            let page = Rc::new(RefCell::new(Page::from(value)));
             PagePool {
                 page,
                 lsn: 0,
