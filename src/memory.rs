@@ -13,7 +13,7 @@ const START_ADDR: PageOffset = 4;
 const HEADER_SIZE: usize = mem::size_of::<u32>();
 
 pub struct Memory {
-    page: PagePool,
+    pool: PagePool,
     next_addr: PageOffset,
     seq: u32,
 }
@@ -25,14 +25,14 @@ impl Memory {
         assert!(tx.next_addr >= self.next_addr);
         assert!(tx.seq == self.seq);
         // Page should be commited first, because it's check for snapshot linearity
-        self.page.commit(tx.snapshot);
+        self.pool.commit(tx.snapshot);
         self.seq += 1;
         self.next_addr = tx.next_addr;
     }
 
     pub fn start(&self) -> Transaction {
         Transaction {
-            snapshot: self.page.snapshot(),
+            snapshot: self.pool.snapshot(),
             next_addr: self.next_addr,
             seq: self.seq,
         }
@@ -42,7 +42,7 @@ impl Memory {
 impl Default for Memory {
     fn default() -> Self {
         Self {
-            page: PagePool::default(),
+            pool: PagePool::default(),
             next_addr: START_ADDR,
             seq: 0,
         }

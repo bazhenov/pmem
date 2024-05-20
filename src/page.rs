@@ -1,5 +1,5 @@
 use std::ops::Deref;
-use std::{borrow::Cow, cell::RefCell, ops::Range, rc::Rc, usize};
+use std::{borrow::Cow, ops::Range, rc::Rc, usize};
 
 const PAGE_SIZE: usize = 1 << 24; // 16Mb
 type Patch = (PageOffset, Vec<u8>);
@@ -10,35 +10,15 @@ pub type LSN = u64;
 
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum Error {
-    #[error("Memory not allocated")]
-    NotAllocated,
+    #[error("Read of the page out-of-bounds")]
+    OutOfBounds,
 }
 
 type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Default)]
-pub struct Page {
-    snapshot: Rc<CommitedSnapshot>,
-}
-
-impl Page {
-    #[cfg(test)]
-    fn read(&self, addr: PageOffset, len: usize) -> Cow<'_, [u8]> {
-        self.snapshot.read(addr, len)
-    }
-}
-
-impl From<CommitedSnapshot> for Page {
-    fn from(snapshot: CommitedSnapshot) -> Self {
-        Self {
-            snapshot: Rc::new(snapshot),
-        }
-    }
-}
-
-#[derive(Default)]
 pub struct PagePool {
-    page: Rc<RefCell<Page>>,
+    page: Rc<CommitedSnapshot>,
     lsn: LSN,
     max_page_no: PageNo,
 }
@@ -52,25 +32,21 @@ impl PagePool {
         }
     }
     pub fn snapshot(&self) -> Snapshot {
-        let page = RefCell::borrow(&self.page);
         Snapshot {
             patches: vec![],
-            base: Rc::clone(&page.snapshot),
+            base: Rc::clone(&self.page),
         }
     }
 
     pub fn commit(&mut self, snapshot: Snapshot) {
-        // Given snapshot should have current snapshot as a parent
-        // Otherwise changes are not linear
-        let mut page = RefCell::borrow_mut(&self.page);
         assert!(
-            Rc::ptr_eq(&page.snapshot, &snapshot.base),
+            Rc::ptr_eq(&self.page, &snapshot.base),
             "Proposed snaphot is not linear"
         );
         self.lsn += 1;
-        page.snapshot = Rc::new(CommitedSnapshot {
+        self.page = Rc::new(CommitedSnapshot {
             patches: snapshot.patches,
-            parent: Some(Rc::clone(&page.snapshot)),
+            parent: Some(Rc::clone(&self.page)),
         });
     }
 
@@ -78,12 +54,11 @@ impl PagePool {
     fn read(&self, addr: PageOffset, len: usize) -> Result<Ref> {
         use crate::ensure;
 
-        let (page_no, offset) = split_ptr(addr);
-        ensure!(page_no <= self.max_page_no, Error::NotAllocated);
+        let (page_no, _) = split_ptr(addr);
+        ensure!(page_no <= self.max_page_no, Error::OutOfBounds);
 
-        let page = RefCell::borrow(&self.page);
-        let snapshot = Rc::clone(&page.snapshot);
-        Ok(Ref::create(snapshot, offset, len))
+        let snapshot = Rc::clone(&self.page);
+        Ok(Ref::create(snapshot, addr, len))
     }
 }
 
@@ -247,9 +222,9 @@ mod tests {
 
     #[test]
     fn create_new_page() -> Result<()> {
-        let page = Page::from("foo");
-        assert_str_eq(page.read(0, 3), "foo");
-        assert_str_eq(page.read(3, 1), [0]);
+        let snapshot = CommitedSnapshot::from("foo");
+        assert_str_eq(snapshot.read(0, 3), "foo");
+        assert_str_eq(snapshot.read(3, 1), [0]);
         Ok(())
     }
 
@@ -321,8 +296,8 @@ mod tests {
 
         // Checking that data is visible after commit to page pool
         assert_str_eq(mem.read(page_a, alice.len())?, alice);
-        // assert_str_eq(mem.read(page_b, bob.len())?, bob);
-        // assert_str_eq(mem.read(page_c, charlie.len())?, charlie);
+        assert_str_eq(mem.read(page_b, bob.len())?, bob);
+        assert_str_eq(mem.read(page_c, charlie.len())?, charlie);
 
         Ok(())
     }
@@ -331,8 +306,8 @@ mod tests {
     fn page_pool_should_return_error_of_ptr_out_of_bounds() -> Result<()> {
         let mem = PagePool::default();
 
-        let Err(Error::NotAllocated) = mem.read(PAGE_SIZE as u32, 1) else {
-            panic!("NotAllocated should be geberated");
+        let Err(Error::OutOfBounds) = mem.read(PAGE_SIZE as u32, 1) else {
+            panic!("OutOfBounds should be geberated");
         };
         Ok(())
     }
@@ -432,24 +407,21 @@ mod tests {
         assert_eq!(a, b);
     }
 
-    impl<T: AsRef<str>> From<T> for Page {
+    impl<T: AsRef<str>> From<T> for CommitedSnapshot {
         fn from(value: T) -> Self {
             let bytes = value.as_ref().as_bytes();
             assert!(bytes.len() <= PAGE_SIZE, "String is too large");
 
-            let snapshot = CommitedSnapshot {
+            CommitedSnapshot {
                 patches: vec![(0, bytes.to_vec())],
                 parent: None,
-            };
-            Page {
-                snapshot: Rc::new(snapshot),
             }
         }
     }
 
     impl<T: AsRef<str>> From<T> for PagePool {
         fn from(value: T) -> Self {
-            let page = Rc::new(RefCell::new(Page::from(value)));
+            let page = Rc::new(CommitedSnapshot::from(value));
             PagePool {
                 page,
                 lsn: 0,
