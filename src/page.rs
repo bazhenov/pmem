@@ -1,6 +1,8 @@
 use std::ops::Deref;
 use std::{borrow::Cow, ops::Range, rc::Rc, usize};
 
+use crate::ensure;
+
 pub const PAGE_SIZE: usize = 1 << 24; // 16Mb
 type Patch = (PageOffset, Vec<u8>);
 pub type Addr = u32;
@@ -37,6 +39,7 @@ impl PagePool {
         Snapshot {
             patches: vec![],
             base: Rc::clone(&self.latest),
+            pages: self.latest.max_page_no + 1 as PageNo,
         }
     }
 
@@ -49,7 +52,7 @@ impl PagePool {
         self.latest = Rc::new(CommitedSnapshot {
             patches: snapshot.patches,
             base: Some(Rc::clone(&self.latest)),
-            max_page_no: self.latest.max_page_no,
+            max_page_no: snapshot.pages.saturating_sub(1),
             lsn,
         });
     }
@@ -138,10 +141,11 @@ impl CommitedSnapshot {
         let (page_no, _) = split_ptr(addr);
         ensure!(page_no <= self.max_page_no, Error::OutOfBounds);
 
-        let mut buffer = vec![0; len as usize];
+        let mut buffer = vec![0; len];
         let range = (addr as usize)..addr as usize + len;
 
         let mut patch_list = vec![self.patches.as_slice()];
+        #[allow(clippy::useless_asref)]
         let snapshots = self
             .base
             .as_ref()
@@ -154,7 +158,7 @@ impl CommitedSnapshot {
         Ok(Cow::Owned(buffer))
     }
 
-    pub fn read_ref<'a>(self: &Rc<Self>, addr: PageOffset, len: usize) -> Ref {
+    pub fn read_ref(self: &Rc<Self>, addr: PageOffset, len: usize) -> Ref {
         Ref::create(Rc::clone(self), addr, len)
     }
 }
@@ -163,6 +167,7 @@ impl CommitedSnapshot {
 pub struct Snapshot {
     patches: Vec<Patch>,
     base: Rc<CommitedSnapshot>,
+    pages: PageNo,
 }
 
 impl Snapshot {
@@ -173,6 +178,8 @@ impl Snapshot {
 
     pub fn read(&self, addr: PageOffset, len: usize) -> Result<Cow<'_, [u8]>> {
         assert!(len <= PAGE_SIZE, "Out of bounds read");
+        let (page_no, _) = split_ptr(addr);
+        ensure!(page_no < self.pages, Error::OutOfBounds);
         let mut buffer = vec![0; len];
         let range = (addr as usize)..addr as usize + len;
 
@@ -185,11 +192,18 @@ impl Snapshot {
         apply_patches(&patch_list, &mut buffer, &range);
         Ok(Cow::Owned(buffer))
     }
+
+    #[cfg(test)]
+    fn resize(&mut self, pages: usize) {
+        self.pages = pages as PageNo;
+    }
 }
 
 fn collect_snapshots(snapshot: Rc<CommitedSnapshot>) -> Vec<Rc<CommitedSnapshot>> {
     let mut snapshots = vec![];
+    #[allow(clippy::useless_asref)]
     let mut snapshot = Some(snapshot);
+    #[allow(clippy::useless_asref)]
     while let Some(s) = snapshot {
         snapshots.push(Rc::clone(&s));
         snapshot = s.base.as_ref().map(Rc::clone);
@@ -222,7 +236,7 @@ fn apply_patches(snapshots: &[&[Patch]], buffer: &mut [u8], range: &Range<usize>
 }
 
 fn split_ptr(addr: Addr) -> (PageNo, PageOffset) {
-    const PAGE_SIZE_BITS: u32 = PAGE_SIZE.trailing_zeros() as u32;
+    const PAGE_SIZE_BITS: u32 = PAGE_SIZE.trailing_zeros();
     let page_no = addr >> PAGE_SIZE_BITS;
     let offset = addr & ((PAGE_SIZE - 1) as u32);
     (page_no, offset)
@@ -326,6 +340,37 @@ mod tests {
         let Err(Error::OutOfBounds) = mem.read(PAGE_SIZE as u32, 1) else {
             panic!("OutOfBounds should be geberated");
         };
+        Ok(())
+    }
+
+    #[test]
+    fn change_number_of_pages_on_commit() -> Result<()> {
+        let mut mem = PagePool::new(2); // Initially 2 pages
+
+        let page_a = 0;
+        let page_b = 1 * PAGE_SIZE as Addr;
+
+        let alice = b"Alice";
+        let bob = b"Bob";
+
+        let mut snapshot = mem.snapshot();
+        snapshot.write(page_a, alice);
+        snapshot.write(page_b, bob);
+        mem.commit(snapshot);
+
+        let mut snapshot = mem.snapshot();
+        snapshot.resize(1); // removing second page
+        let Err(Error::OutOfBounds) = snapshot.read(page_b, bob.len()) else {
+            // changes should be visible immediatley on snapshot
+            panic!("{} should be generated", Error::OutOfBounds);
+        };
+        mem.commit(snapshot);
+
+        // changes also should be visible after commit
+        let Err(Error::OutOfBounds) = mem.read(page_b, bob.len()) else {
+            panic!("{} should be generated", Error::OutOfBounds);
+        };
+
         Ok(())
     }
 
