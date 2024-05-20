@@ -18,46 +18,45 @@ type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Default)]
 pub struct PagePool {
-    page: Rc<CommitedSnapshot>,
-    lsn: LSN,
-    max_page_no: PageNo,
+    latest: Rc<CommitedSnapshot>,
 }
 
 impl PagePool {
     pub fn new(pages: usize) -> Self {
+        let snapshot = CommitedSnapshot {
+            patches: vec![],
+            base: None,
+            max_page_no: (pages - 1) as u32,
+            lsn: 1,
+        };
         Self {
-            page: Rc::default(),
-            lsn: 0,
-            max_page_no: (pages - 1) as PageNo,
+            latest: Rc::new(snapshot),
         }
     }
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
             patches: vec![],
-            base: Rc::clone(&self.page),
+            base: Rc::clone(&self.latest),
         }
     }
 
     pub fn commit(&mut self, snapshot: Snapshot) {
         assert!(
-            Rc::ptr_eq(&self.page, &snapshot.base),
+            Rc::ptr_eq(&self.latest, &snapshot.base),
             "Proposed snaphot is not linear"
         );
-        self.lsn += 1;
-        self.page = Rc::new(CommitedSnapshot {
+        let lsn = self.latest.lsn + 1;
+        self.latest = Rc::new(CommitedSnapshot {
             patches: snapshot.patches,
-            parent: Some(Rc::clone(&self.page)),
+            base: Some(Rc::clone(&self.latest)),
+            max_page_no: self.latest.max_page_no,
+            lsn,
         });
     }
 
     #[cfg(test)]
     fn read(&self, addr: PageOffset, len: usize) -> Result<Ref> {
-        use crate::ensure;
-
-        let (page_no, _) = split_ptr(addr);
-        ensure!(page_no <= self.max_page_no, Error::OutOfBounds);
-
-        let snapshot = Rc::clone(&self.page);
+        let snapshot = Rc::clone(&self.latest);
         Ok(Ref::create(snapshot, addr, len))
     }
 }
@@ -113,21 +112,38 @@ impl AsRef<[u8]> for Ref {
     }
 }
 
-#[derive(Default)]
 pub struct CommitedSnapshot {
     patches: Vec<(Addr, Vec<u8>)>,
-    parent: Option<Rc<CommitedSnapshot>>,
+    base: Option<Rc<CommitedSnapshot>>,
+    max_page_no: PageNo,
+    lsn: LSN,
+}
+
+impl Default for CommitedSnapshot {
+    fn default() -> Self {
+        Self {
+            patches: vec![],
+            base: None,
+            max_page_no: 0,
+            lsn: 1,
+        }
+    }
 }
 
 impl CommitedSnapshot {
-    pub fn read(&self, addr: PageOffset, len: usize) -> Cow<'_, [u8]> {
+    pub fn read(&self, addr: PageOffset, len: usize) -> Result<Cow<'_, [u8]>> {
+        use crate::ensure;
         assert!(len <= PAGE_SIZE, "Out of bounds read");
+
+        let (page_no, _) = split_ptr(addr);
+        ensure!(page_no <= self.max_page_no, Error::OutOfBounds);
+
         let mut buffer = vec![0; len as usize];
         let range = (addr as usize)..addr as usize + len;
 
         let mut patch_list = vec![self.patches.as_slice()];
         let snapshots = self
-            .parent
+            .base
             .as_ref()
             .map(Rc::clone)
             .map(collect_snapshots)
@@ -135,7 +151,7 @@ impl CommitedSnapshot {
         patch_list.extend(snapshots.iter().map(|s| s.patches.as_slice()));
 
         apply_patches(&patch_list, &mut buffer, &range);
-        Cow::Owned(buffer)
+        Ok(Cow::Owned(buffer))
     }
 
     pub fn read_ref<'a>(self: &Rc<Self>, addr: PageOffset, len: usize) -> Ref {
@@ -176,7 +192,7 @@ fn collect_snapshots(snapshot: Rc<CommitedSnapshot>) -> Vec<Rc<CommitedSnapshot>
     let mut snapshot = Some(snapshot);
     while let Some(s) = snapshot {
         snapshots.push(Rc::clone(&s));
-        snapshot = s.parent.as_ref().map(Rc::clone);
+        snapshot = s.base.as_ref().map(Rc::clone);
     }
     snapshots
 }
@@ -224,8 +240,8 @@ mod tests {
     #[test]
     fn create_new_page() -> Result<()> {
         let snapshot = CommitedSnapshot::from("foo");
-        assert_str_eq(snapshot.read(0, 3), "foo");
-        assert_str_eq(snapshot.read(3, 1), [0]);
+        assert_str_eq(snapshot.read(0, 3)?, "foo");
+        assert_str_eq(snapshot.read(3, 1)?, [0]);
         Ok(())
     }
 
@@ -415,7 +431,9 @@ mod tests {
 
             CommitedSnapshot {
                 patches: vec![(0, bytes.to_vec())],
-                parent: None,
+                base: None,
+                max_page_no: 0,
+                lsn: 1,
             }
         }
     }
@@ -423,11 +441,7 @@ mod tests {
     impl<T: AsRef<str>> From<T> for PagePool {
         fn from(value: T) -> Self {
             let page = Rc::new(CommitedSnapshot::from(value));
-            PagePool {
-                page,
-                lsn: 0,
-                max_page_no: 0,
-            }
+            PagePool { latest: page }
         }
     }
 }
