@@ -1,7 +1,7 @@
 use std::ops::Deref;
 use std::{borrow::Cow, ops::Range, rc::Rc, usize};
 
-const PAGE_SIZE: usize = 1 << 24; // 16Mb
+pub const PAGE_SIZE: usize = 1 << 24; // 16Mb
 type Patch = (PageOffset, Vec<u8>);
 pub type Addr = u32;
 pub type PageOffset = u32;
@@ -143,6 +143,7 @@ impl CommitedSnapshot {
     }
 }
 
+#[derive(Clone)]
 pub struct Snapshot {
     patches: Vec<Patch>,
     base: Rc<CommitedSnapshot>,
@@ -366,7 +367,7 @@ mod tests {
         proptest! {
             #[test]
             #[cfg_attr(miri, ignore)]
-            fn arbitrary_page_patches(snapshots in vec(any_snapshot(), 0..5)) {
+            fn arbitrary_writes(snapshots in vec(any_snapshot(), 0..5)) {
                 // Mirror buffer where we track all the patches being applied.
                 // In the end content should be equal to the mirror buffer
                 let mut mirror = vec![0; PAGE_SIZE];

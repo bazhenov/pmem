@@ -8,4 +8,5 @@ binrw = "0.13.3"
 thiserror = "1.0.61"
 
 [dev-dependencies]
+fatfs = "0.3.6"
 proptest = "1.0.0"
