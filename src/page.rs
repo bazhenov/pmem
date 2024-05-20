@@ -28,7 +28,7 @@ impl PagePool {
         let snapshot = CommitedSnapshot {
             patches: vec![],
             base: None,
-            max_page_no: (pages - 1) as u32,
+            pages: pages as u32,
             lsn: 1,
         };
         Self {
@@ -39,7 +39,7 @@ impl PagePool {
         Snapshot {
             patches: vec![],
             base: Rc::clone(&self.latest),
-            pages: self.latest.max_page_no + 1 as PageNo,
+            pages: self.latest.pages,
         }
     }
 
@@ -52,7 +52,7 @@ impl PagePool {
         self.latest = Rc::new(CommitedSnapshot {
             patches: snapshot.patches,
             base: Some(Rc::clone(&self.latest)),
-            max_page_no: snapshot.pages.saturating_sub(1),
+            pages: snapshot.pages,
             lsn,
         });
     }
@@ -118,7 +118,7 @@ impl AsRef<[u8]> for Ref {
 pub struct CommitedSnapshot {
     patches: Vec<(Addr, Vec<u8>)>,
     base: Option<Rc<CommitedSnapshot>>,
-    max_page_no: PageNo,
+    pages: PageNo,
     lsn: LSN,
 }
 
@@ -127,7 +127,7 @@ impl Default for CommitedSnapshot {
         Self {
             patches: vec![],
             base: None,
-            max_page_no: 0,
+            pages: 1,
             lsn: 1,
         }
     }
@@ -139,7 +139,7 @@ impl CommitedSnapshot {
         assert!(len <= PAGE_SIZE, "Out of bounds read");
 
         let (page_no, _) = split_ptr(addr);
-        ensure!(page_no <= self.max_page_no, Error::OutOfBounds);
+        ensure!(page_no < self.pages, Error::OutOfBounds);
 
         let mut buffer = vec![0; len];
         let range = (addr as usize)..addr as usize + len;
@@ -477,7 +477,7 @@ mod tests {
             CommitedSnapshot {
                 patches: vec![(0, bytes.to_vec())],
                 base: None,
-                max_page_no: 0,
+                pages: 1,
                 lsn: 1,
             }
         }
