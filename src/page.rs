@@ -1,14 +1,70 @@
+//! # Page Management
+//!
+//! This module provides a system for managing and manipulating snapshots of a memory. It is designed
+//! to facilitate operations on persistent memory (pmem), allowing for efficient snapshots, modifications, and commits
+//! of data changes. The core functionality revolves around the `PagePool` structure, which manages a pool of pages,
+//! and the `Snapshot` structure, which represents a modifiable snapshot of the page pool's state at a given point
+//! in time.
+//!
+//! ## Concepts
+//!
+//! - **Page Pool**: A collection of pages that can be snapshot, modified, and committed. It acts as the primary
+//! interface for interacting with the page memory.
+//!
+//! - **Snapshot**: A snapshot represents the state of the page pool at a specific moment.
+//!   It can be modified independently of the pool, and later committed back to the pool to update its state.
+//! - **Commit**: The act of applying the changes made in a snapshot back to the page pool, updating the pool's state
+//!   to reflect those changes.
+//! - **Patch**: A modification recorded in a snapshot. It consists of the address where the modification starts and
+//!   the bytes that were written.
+//!
+//! ## Usage
+//!
+//! The module is designed to be used as follows:
+//!
+//! 1. **Initialization**: Create a `PagePool` with a specified number of pages.
+//! 2. **Snapshotting**: Create a snapshot of the current state of the `PagePool`.
+//! 3. **Modification**: Use the snapshot to perform modifications. Each modification is recorded as a patch.
+//! 4. **Commit**: Commit the snapshot back to the `PagePool`, applying all the patches and updating the pool's state.
+//!
+//! ## Example
+//!
+//! ```rust
+//! use pmem::page::PagePool;
+//!
+//! let mut pool = PagePool::new(5); // Initialize a pool with 5 pages
+//! let mut snapshot = pool.snapshot(); // Create a snapshot of the current state
+//! snapshot.write(0, &[1, 2, 3, 4]); // Write 4 bytes at offset 0.
+//! pool.commit(snapshot); // Commit the changes back to the pool
+//! ```
+//!
+//! ## Safety and Correctness
+//!
+//! The module ensures safety and correctness through the following mechanisms:
+//!
+//! - **Immutability of Committed Snapshots**: Once a snapshot is committed, it becomes immutable, ensuring that
+//! any reference to its data remains valid and unchanged until corresponding `Rc` reference is held.
+//! - **Linear Snapshot History**: The module enforces a linear history of snapshots, preventing branches in the
+//! snapshot history and ensuring consistency of changes proposed in snapshots.
+//!
+//! ## Performance Considerations
+//!
+//! Since snapshots do not require duplicating the entire state of the page pool, they can be created with minimal
+//! overhead, making it perfectly valid and cost-effective to create a snapshot even when the intention is only to
+//! read data without any modifications.
+
+use crate::ensure;
 use std::ops::Deref;
 use std::{borrow::Cow, ops::Range, rc::Rc, usize};
 
-use crate::ensure;
-
 pub const PAGE_SIZE: usize = 1 << 24; // 16Mb
-type Patch = (PageOffset, Vec<u8>);
 pub type Addr = u32;
 pub type PageOffset = u32;
 pub type PageNo = u32;
 pub type LSN = u64;
+
+type Patch = (PageOffset, Vec<u8>);
+type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum Error {
@@ -16,14 +72,43 @@ pub enum Error {
     OutOfBounds,
 }
 
-type Result<T> = std::result::Result<T, Error>;
-
+/// A pool of pages that can capture and commit snapshots of data changes.
+///
+/// The `PagePool` struct allows for the creation of snapshots representing the state
+/// of a set of pages at a particular point in time. These snapshots can then be modified
+/// and eventually committed back to the pool, updating the pool's state to reflect the changes
+/// made in the snapshot.
+///
+/// # Examples
+///
+/// Basic usage:
+///
+/// ```
+/// # use pmem::page::PagePool;
+/// let mut pool = PagePool::new(5);    // Initialize a pool with 5 pages
+/// let mut snapshot = pool.snapshot(); // Create a snapshot of the current state
+/// snapshot.write(0, &[0, 1, 2, 3]);   // Modify the snapshot
+/// pool.commit(snapshot);              // Commit the changes back to the pool
+/// ```
+///
+/// This structure is particularly useful for systems that require consistent views of data
+/// at different points in time, or for implementing undo/redo functionality where each snapshot
+/// can represent a state in the history of changes.
 #[derive(Default)]
 pub struct PagePool {
     latest: Rc<CommitedSnapshot>,
 }
 
 impl PagePool {
+    /// Constructs a new `PagePool` with a specified number of pages.
+    ///
+    /// This function initializes a `PagePool` instance with an empty set of patches and
+    /// a given number of pages.
+    ///
+    /// # Arguments
+    ///
+    /// * `pages` - The number of pages the pool should initially contain. This determines
+    /// the range of valid addresses that can be written to in snapshots derived from this pool.
     pub fn new(pages: usize) -> Self {
         let snapshot = CommitedSnapshot {
             patches: vec![],
@@ -35,6 +120,31 @@ impl PagePool {
             latest: Rc::new(snapshot),
         }
     }
+
+    /// Takes a snapshot of the current state of the `PagePool`.
+    ///
+    /// This method creates a `Snapshot` instance representing the current state of the page pool.
+    /// The snapshot can be used to perform modifications independently of the pool. These modifications
+    /// are not reflected in the pool until the snapshot is committed using the [`commit`] method.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// # use pmem::page::PagePool;
+    /// # let mut pool = PagePool::new(5);
+    /// let snapshot = pool.snapshot();
+    /// // The snapshot can now be modified, and those modifications
+    /// // won't affect the original pool until committed.
+    /// ```
+    ///
+    /// # Returns
+    ///
+    /// A `Snapshot` instance representing the current state of the page pool. It can be used both for reading and
+    /// changing state of the page pool.
+    ///
+    /// [`commit`]: Self::commit
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
             patches: vec![],
@@ -43,6 +153,19 @@ impl PagePool {
         }
     }
 
+    /// Commits the changes made in a snapshot back to the page pool.
+    ///
+    /// This method updates the state of the page pool to reflect the modifications
+    /// recorded in the provided snapshot. Once committed, the snapshot becomes part
+    /// of the page pool's history, and its changes are visible in subsequent snapshots.
+    ///
+    /// Each snapshot is linked to the pool state it was created from. If the page poll was changed
+    /// since the moment when snapshot was created, attempt to commit such a snapshot will return an error,
+    /// because such changes might not be consistent anymore.
+    ///
+    /// # Arguments
+    ///
+    /// * `snapshot` - A snapshot containing modifications to commit to the page pool.
     pub fn commit(&mut self, snapshot: Snapshot) {
         assert!(
             Rc::ptr_eq(&self.latest, &snapshot.base),
@@ -115,10 +238,33 @@ impl AsRef<[u8]> for Ref {
     }
 }
 
+/// Represents a committed snapshot of a page pool.
+///
+/// A `CommitedSnapshot` captures the state of a page pool at a specific point in time,
+/// including any patches (modifications) that have been applied up to that point. It serves
+/// as a read-only view into the historical state of the pool, allowing for consistent reads
+/// of pages as they existed at the time of the snapshot.
+///
+/// Each `CommitedSnapshot` can optionally reference a base snapshot, forming a chain
+/// that represents the full history of modifications leading up to the current state.
+/// This chain is traversed backwards when reading from a snapshot to reconstruct the state
+/// of a page by applying patches in reverse chronological order.
 pub struct CommitedSnapshot {
+    /// A vector of patches that have been applied in this snapshot. Each patch
+    /// consists of a page address and the bytes that were written to that page.
     patches: Vec<(Addr, Vec<u8>)>,
+
+    /// A reference to the base snapshot from which this snapshot was derived.
+    /// If present, the base snapshot represents the state of the page pool
+    /// immediately before the current snapshot's patches were applied.
     base: Option<Rc<CommitedSnapshot>>,
+
+    /// The total number of pages represented by this snapshot. This is used to
+    /// validate read requests and ensure they do not exceed the bounds of the snapshot.
     pages: PageNo,
+
+    /// A log sequence number (LSN) that uniquely identifies this snapshot. The LSN
+    /// is used internally to ensure that snapshots are applied in a linear and consistent order.
     lsn: LSN,
 }
 

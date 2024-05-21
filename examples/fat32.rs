@@ -1,3 +1,6 @@
+//! This example demonstrates how to use a `PagePool` to create and manage
+//! snapshots of a file system created with the `fatfs` crate.
+
 use fatfs::{format_volume, FileSystem, FormatVolumeOptions, FsOptions};
 use pmem::{
     page::{PagePool, Snapshot, PAGE_SIZE},
@@ -18,6 +21,7 @@ fn main() {
     let mut snapshots = vec![];
 
     // Writing 10 snapshots of FS with different contents of a file
+    println!("Writing 10 snapshots...");
     for i in 0..10 {
         let mut layer = FsLayer::new(&pool, page_count);
         let fs = FileSystem::new(&mut layer, FsOptions::new()).unwrap();
@@ -35,7 +39,6 @@ fn main() {
     // Making sure all of the snapshots are accessible independently
     for (i, snapshot) in snapshots.into_iter().enumerate() {
         let mut layer = FsLayer::from(snapshot, page_count);
-        // Reading file
         let fs = FileSystem::new(&mut layer, FsOptions::new()).unwrap();
         let mut buf = vec![];
         fs.root_dir()
@@ -43,8 +46,14 @@ fn main() {
             .unwrap()
             .read_to_end(&mut buf)
             .unwrap();
+        println!(
+            "Reading snapshots #{}: {}",
+            i,
+            String::from_utf8_lossy(&buf)
+        );
         assert_eq!(format!("Hello world {}!", i).as_bytes(), buf);
     }
+    println!("Ok");
 }
 
 struct FsLayer {
