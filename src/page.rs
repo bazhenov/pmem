@@ -63,8 +63,36 @@ pub type PageOffset = u32;
 pub type PageNo = u32;
 pub type LSN = u64;
 
-type Patch = (PageOffset, Vec<u8>);
 type Result<T> = std::result::Result<T, Error>;
+
+/// Represents a modification recorded in a snapshot.
+///
+/// A `Patch` can either write a range of bytes starting at a specified offset
+/// or recalim a range of bytes starting at a specified offset.
+#[derive(Debug, Clone)]
+enum Patch {
+    // Write given data at a specified offset
+    Write(PageOffset, Vec<u8>),
+
+    /// Reclaim given amount of bytes at a specified address
+    Reclaim(PageOffset, usize),
+}
+
+impl Patch {
+    pub fn offset(&self) -> u32 {
+        match self {
+            Patch::Write(offset, _) => *offset,
+            Patch::Reclaim(offset, _) => *offset,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            Patch::Write(_, bytes) => bytes.len(),
+            Patch::Reclaim(_, len) => *len,
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum Error {
@@ -250,9 +278,8 @@ impl AsRef<[u8]> for Ref {
 /// This chain is traversed backwards when reading from a snapshot to reconstruct the state
 /// of a page by applying patches in reverse chronological order.
 pub struct CommitedSnapshot {
-    /// A vector of patches that have been applied in this snapshot. Each patch
-    /// consists of a page address and the bytes that were written to that page.
-    patches: Vec<(Addr, Vec<u8>)>,
+    /// A patches that have been applied in this snapshot.
+    patches: Vec<Patch>,
 
     /// A reference to the base snapshot from which this snapshot was derived.
     /// If present, the base snapshot represents the state of the page pool
@@ -319,13 +346,12 @@ pub struct Snapshot {
 impl Snapshot {
     pub fn write(&mut self, addr: Addr, bytes: &[u8]) {
         assert!(bytes.len() <= PAGE_SIZE, "Buffer too large");
-        self.patches.push((addr, bytes.to_vec()))
+        self.patches.push(Patch::Write(addr, bytes.to_vec()))
     }
 
     pub fn read(&self, addr: PageOffset, len: usize) -> Result<Cow<'_, [u8]>> {
-        assert!(len <= PAGE_SIZE, "Out of bounds read");
         let (page_no, _) = split_ptr(addr);
-        ensure!(page_no < self.pages, Error::OutOfBounds);
+        ensure!(page_no < self.pages && len <= PAGE_SIZE, Error::OutOfBounds);
         let mut buffer = vec![0; len];
         let range = (addr as usize)..addr as usize + len;
 
@@ -337,6 +363,20 @@ impl Snapshot {
 
         apply_patches(&patch_list, &mut buffer, &range);
         Ok(Cow::Owned(buffer))
+    }
+
+    /// Frees the given segment of memory.
+    ///
+    /// Reclaim is guaranteed to follow zeroing semantics. The read operation from the corresponding segment
+    /// after reclaiming will return zeros.
+    ///
+    /// The main purpose of reclaim is to mark memory as not used, so it can be freed from persistent storage
+    /// after snapshot compaction.
+    pub fn reclaim(&mut self, addr: PageOffset, len: usize) -> Result<()> {
+        let (page_no, _) = split_ptr(addr);
+        ensure!(page_no < self.pages && len < PAGE_SIZE, Error::OutOfBounds);
+        self.patches.push(Patch::Reclaim(addr, len));
+        Ok(())
     }
 
     #[cfg(test)]
@@ -359,24 +399,27 @@ fn collect_snapshots(snapshot: Rc<CommitedSnapshot>) -> Vec<Rc<CommitedSnapshot>
 
 fn apply_patches(snapshots: &[&[Patch]], buffer: &mut [u8], range: &Range<usize>) {
     for patches in snapshots.iter().rev() {
-        for (offset, bytes) in patches.iter().filter(|p| intersects(p, range)) {
+        for patch in patches.iter().filter(|p| intersects(p, range)) {
             // Calculating intersection of the path and input interval
-            let offset = *offset as usize;
+            let offset = patch.offset() as usize;
             let start = range.start.max(offset);
-            let end = range.end.min(offset + bytes.len());
+            let end = range.end.min(offset + patch.len());
             let len = end - start;
-
-            let patch_range = {
-                let from = start.saturating_sub(offset);
-                from..from + len
-            };
 
             let slice_range = {
                 let from = start.saturating_sub(range.start);
                 from..from + len
             };
 
-            buffer[slice_range].copy_from_slice(&bytes[patch_range])
+            let patch_range = {
+                let from = start.saturating_sub(offset);
+                from..from + len
+            };
+
+            match patch {
+                Patch::Write(_, bytes) => buffer[slice_range].copy_from_slice(&bytes[patch_range]),
+                Patch::Reclaim(_, _) => buffer[slice_range].fill(0),
+            }
         }
     }
 }
@@ -389,8 +432,10 @@ fn split_ptr(addr: Addr) -> (PageNo, PageOffset) {
 }
 
 /// Returns true of given patch intersects given range of bytes
-fn intersects((offset, patch): &Patch, range: &Range<usize>) -> bool {
-    (*offset as usize) < range.end && *offset as usize + patch.len() > range.start
+fn intersects(patch: &Patch, range: &Range<usize>) -> bool {
+    let start = patch.offset() as usize;
+    let end = start + patch.len();
+    start < range.end && end > range.start
 }
 
 #[cfg(test)]
@@ -399,7 +444,7 @@ mod tests {
 
     #[test]
     fn create_new_page() -> Result<()> {
-        let snapshot = CommitedSnapshot::from("foo");
+        let snapshot = CommitedSnapshot::from("foo".as_bytes());
         assert_str_eq(snapshot.read(0, 3)?, "foo");
         assert_str_eq(snapshot.read(3, 1)?, [0]);
         Ok(())
@@ -476,6 +521,18 @@ mod tests {
         assert_str_eq(mem.read(page_b, bob.len())?, bob);
         assert_str_eq(mem.read(page_c, charlie.len())?, charlie);
 
+        Ok(())
+    }
+
+    #[test]
+    fn data_can_be_removed_on_snapshot() -> Result<()> {
+        let data = [1, 2, 3, 4, 5];
+        let mem = PagePool::from(data.as_slice());
+
+        let mut snapshot = mem.snapshot();
+        snapshot.reclaim(1, 3)?;
+
+        assert_eq!(snapshot.read(0, 5)?, [1u8, 0, 0, 0, 5].as_slice());
         Ok(())
     }
 
@@ -581,14 +638,22 @@ mod tests {
                 let mut mem = PagePool::default();
 
                 for patches in snapshots {
-                    for (offset, bytes) in patches.into_iter() {
-                        let mut snapshot = mem.snapshot();
-                        snapshot.write(offset, &bytes);
+                    for patch in patches.into_iter() {
+                        match patch {
+                            Patch::Write(offset, bytes) => {
+                                let mut snapshot = mem.snapshot();
+                                snapshot.write(offset, &bytes);
 
-                        let offset = offset as usize;
-                        let range = offset..offset + bytes.len();
-                        mirror[range].copy_from_slice(bytes.as_slice());
-                        mem.commit(snapshot);
+                                let offset = offset as usize;
+                                let range = offset..offset + bytes.len();
+                                mirror[range].copy_from_slice(bytes.as_slice());
+                                mem.commit(snapshot);
+                            },
+                            Patch::Reclaim(_, _) => {
+                                unimplemented!()
+                            }
+                        }
+
                     }
                 }
 
@@ -601,6 +666,7 @@ mod tests {
                 .prop_filter("out of bounds patch", |(offset, bytes)| {
                     offset + (bytes.len() as u32) < PAGE_SIZE as u32
                 })
+                .prop_map(|(offset, bytes)| Patch::Write(offset, bytes))
         }
 
         fn any_snapshot() -> impl Strategy<Value = Vec<Patch>> {
@@ -615,13 +681,12 @@ mod tests {
         assert_eq!(a, b);
     }
 
-    impl<T: AsRef<str>> From<T> for CommitedSnapshot {
-        fn from(value: T) -> Self {
-            let bytes = value.as_ref().as_bytes();
+    impl From<&[u8]> for CommitedSnapshot {
+        fn from(bytes: &[u8]) -> Self {
             assert!(bytes.len() <= PAGE_SIZE, "String is too large");
 
             CommitedSnapshot {
-                patches: vec![(0, bytes.to_vec())],
+                patches: vec![Patch::Write(0, bytes.to_vec())],
                 base: None,
                 pages: 1,
                 lsn: 1,
@@ -629,8 +694,15 @@ mod tests {
         }
     }
 
-    impl<T: AsRef<str>> From<T> for PagePool {
-        fn from(value: T) -> Self {
+    impl From<&str> for PagePool {
+        fn from(value: &str) -> Self {
+            let page = Rc::new(CommitedSnapshot::from(value.as_bytes()));
+            PagePool { latest: page }
+        }
+    }
+
+    impl From<&[u8]> for PagePool {
+        fn from(value: &[u8]) -> Self {
             let page = Rc::new(CommitedSnapshot::from(value));
             PagePool { latest: page }
         }
