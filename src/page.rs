@@ -308,14 +308,23 @@ impl Default for CommitedSnapshot {
 
 impl CommitedSnapshot {
     pub fn read(&self, addr: PageOffset, len: usize) -> Result<Cow<'_, [u8]>> {
-        use crate::ensure;
         assert!(len <= PAGE_SIZE, "Out of bounds read");
 
         let (page_no, _) = split_ptr(addr);
         ensure!(page_no < self.pages, Error::OutOfBounds);
 
         let mut buffer = vec![0; len];
-        let range = (addr as usize)..addr as usize + len;
+        self.read_to_buf(addr, &mut buffer)?;
+        Ok(Cow::Owned(buffer))
+    }
+
+    pub fn read_to_buf(&self, addr: PageOffset, buf: &mut [u8]) -> Result<()> {
+        assert!(buf.len() <= PAGE_SIZE, "Out of bounds read");
+
+        let (page_no, _) = split_ptr(addr);
+        ensure!(page_no < self.pages, Error::OutOfBounds);
+
+        let range = (addr as usize)..addr as usize + buf.len();
 
         let mut patch_list = vec![self.patches.as_slice()];
         #[allow(clippy::useless_asref)]
@@ -327,8 +336,8 @@ impl CommitedSnapshot {
             .unwrap_or_default();
         patch_list.extend(snapshots.iter().map(|s| s.patches.as_slice()));
 
-        apply_patches(&patch_list, &mut buffer, &range);
-        Ok(Cow::Owned(buffer))
+        apply_patches(&patch_list, buf, &range);
+        Ok(())
     }
 
     pub fn read_ref(self: &Rc<Self>, addr: PageOffset, len: usize) -> Ref {
@@ -351,18 +360,15 @@ impl Snapshot {
 
     pub fn read(&self, addr: PageOffset, len: usize) -> Result<Cow<'_, [u8]>> {
         let (page_no, _) = split_ptr(addr);
-        ensure!(page_no < self.pages && len <= PAGE_SIZE, Error::OutOfBounds);
-        let mut buffer = vec![0; len];
-        let range = (addr as usize)..addr as usize + len;
+        ensure!(page_no < self.pages, Error::OutOfBounds);
 
-        // We need to collect a chain of snapshots into a Vec first.
-        // Otherwise borrowcher is unable to reason about lifecycles
-        let snapshots = collect_snapshots(Rc::clone(&self.base));
-        let mut patch_list = vec![self.patches.as_slice()];
-        patch_list.extend(snapshots.iter().map(|s| s.patches.as_slice()));
+        let mut buf = vec![0; len];
+        self.base.read_to_buf(addr, &mut buf)?;
 
-        apply_patches(&patch_list, &mut buffer, &range);
-        Ok(Cow::Owned(buffer))
+        let addr = addr as usize;
+        let range = addr..addr + len;
+        apply_patches(&[self.patches.as_slice()], &mut buf, &range);
+        Ok(Cow::Owned(buf))
     }
 
     /// Frees the given segment of memory.
@@ -397,6 +403,19 @@ fn collect_snapshots(snapshot: Rc<CommitedSnapshot>) -> Vec<Rc<CommitedSnapshot>
     snapshots
 }
 
+/// Applies a list of patches to a given buffer within a specified range.
+///
+/// This function iterates over the provided snapshots and applies each patch from each snapshot
+/// that intersects with the specified range to the given buffer. Snapshots must be provided in reversed order
+/// (recent first).
+///
+/// # Arguments
+///
+/// * `snapshots` - A slice of slices of `Patch` instances. Each inner slice represents
+///                 a set of patches to be applied, and the outer slice represents a chain
+///                 of snapshots, with the most recent snapshot first.
+/// * `buffer` - A mutable reference to the buffer where the patches will be applied.
+/// * `range` - A range specifying the portion of the buffer to which the patches should be applied.
 fn apply_patches(snapshots: &[&[Patch]], buffer: &mut [u8], range: &Range<usize>) {
     for patches in snapshots.iter().rev() {
         for patch in patches.iter().filter(|p| intersects(p, range)) {
@@ -628,45 +647,60 @@ mod tests {
         use super::*;
         use proptest::{collection::vec, prelude::*};
 
+        /// The size of database for testing
+        const DB_SIZE: usize = 1024;
+
         proptest! {
             #[test]
             #[cfg_attr(miri, ignore)]
-            fn arbitrary_writes(snapshots in vec(any_snapshot(), 0..5)) {
+            fn arbitrary_writes(snapshots in vec(any_snapshot(), 0..10)) {
                 // Mirror buffer where we track all the patches being applied.
                 // In the end content should be equal to the mirror buffer
-                let mut mirror = vec![0; PAGE_SIZE];
+                let mut mirror = vec![0; DB_SIZE];
                 let mut mem = PagePool::default();
 
                 for patches in snapshots {
-                    for patch in patches.into_iter() {
+                    let mut snapshot = mem.snapshot();
+                    for patch in patches {
+                        let offset = patch.offset() as usize;
+                        let range = offset..offset + patch.len();
                         match patch {
                             Patch::Write(offset, bytes) => {
-                                let mut snapshot = mem.snapshot();
                                 snapshot.write(offset, &bytes);
-
-                                let offset = offset as usize;
-                                let range = offset..offset + bytes.len();
                                 mirror[range].copy_from_slice(bytes.as_slice());
-                                mem.commit(snapshot);
                             },
-                            Patch::Reclaim(_, _) => {
-                                unimplemented!()
+                            Patch::Reclaim(offset, len) => {
+                                snapshot.reclaim(offset, len)?;
+                                mirror[range].fill(0);
+
                             }
                         }
-
                     }
+                    mem.commit(snapshot);
                 }
 
-                assert_eq!(&*mem.read(0, PAGE_SIZE).unwrap(), mirror);
+                assert_buffers_eq(&*mem.read(0, DB_SIZE).unwrap(), mirror.as_slice());
             }
         }
 
         fn any_patch() -> impl Strategy<Value = Patch> {
-            (0u32..(PAGE_SIZE as u32), vec(any::<u8>(), 1..32))
+            prop_oneof![any_write_patch(), any_reclaim_patch()]
+        }
+
+        fn any_write_patch() -> impl Strategy<Value = Patch> {
+            (0u32..(DB_SIZE as u32), vec(any::<u8>(), 1..32))
                 .prop_filter("out of bounds patch", |(offset, bytes)| {
-                    offset + (bytes.len() as u32) < PAGE_SIZE as u32
+                    offset + (bytes.len() as u32) < DB_SIZE as u32
                 })
                 .prop_map(|(offset, bytes)| Patch::Write(offset, bytes))
+        }
+
+        fn any_reclaim_patch() -> impl Strategy<Value = Patch> {
+            (0..DB_SIZE, 1usize..32)
+                .prop_filter("out of bounds patch", |(offset, len)| {
+                    (*offset + *len) < DB_SIZE
+                })
+                .prop_map(|(offset, len)| Patch::Reclaim(offset as u32, len))
         }
 
         fn any_snapshot() -> impl Strategy<Value = Vec<Patch>> {
@@ -679,6 +713,30 @@ mod tests {
         let a = String::from_utf8_lossy(a.as_ref());
         let b = String::from_utf8_lossy(b.as_ref());
         assert_eq!(a, b);
+    }
+
+    #[track_caller]
+    fn assert_buffers_eq(a: &[u8], b: &[u8]) {
+        assert_eq!(a.len(), b.len(), "Buffers should have the same length");
+
+        let mut mismatch = a
+            .iter()
+            .zip(b.into_iter())
+            .enumerate()
+            .skip_while(|(_, (a, b))| *a == *b)
+            .take_while(|(_, (a, b))| *a != *b)
+            .map(|(idx, _)| idx);
+
+        if let Some(start) = mismatch.next() {
+            let end = mismatch.last().unwrap_or(start) + 1;
+            assert_eq!(
+                &a[start..end],
+                &b[start..end],
+                "Mismatch detected at {}..{}",
+                start,
+                end
+            );
+        }
     }
 
     impl From<&[u8]> for CommitedSnapshot {
