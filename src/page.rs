@@ -54,7 +54,6 @@
 //! read data without any modifications.
 
 use crate::ensure;
-use std::ops::Deref;
 use std::{borrow::Cow, ops::Range, rc::Rc, usize};
 
 pub const PAGE_SIZE: usize = 1 << 24; // 16Mb
@@ -209,60 +208,8 @@ impl PagePool {
     }
 
     #[cfg(test)]
-    fn read(&self, addr: PageOffset, len: usize) -> Result<Ref> {
-        let snapshot = Rc::clone(&self.latest);
-        Ok(Ref::create(snapshot, addr, len))
-    }
-}
-
-pub struct Ref {
-    bytes: Cow<'static, [u8]>,
-    _snapshot: Rc<CommitedSnapshot>,
-}
-
-impl Ref {
-    /// The `Ref::create` function constructs a `Ref` instance by reading bytes from a `CommitedSnapshot`
-    /// through a specified range and extending its lifetime to `'static`.
-    ///
-    /// This is inherently risky since it assumes that the byte slice returned by the `snapshot.read` function
-    /// will remain valid for the 'static lifetime, which is not guaranteed by Rust's safety rules.
-    /// However, this approach is sound under specific preconditions and with strict usage guidelines:
-    ///
-    /// # Safety
-    ///
-    /// 1. External modification or deallocation of `CommitedSnapshot`'s memory is prevented by using
-    ///  reference-counted pointer. `Rc`, ensuring that it remains allocated as long as `Ref` holds
-    /// a reference to it. This setup ties the lifetime of the snapshot's data indirectly to `Ref`'s usage.
-    ///
-    /// 2. The `CommitedSnapshot.patches` and consequently, the byte slices it returns, are immutable. This
-    /// immutability guarantees that once a `Ref` is created, the data it references cannot change,
-    /// thereby making the extended 'static lifetime of the bytes sound.
-    ///
-    /// 3. By dropping `bytes` before `_snapshot`, we ensure that the borrowed view into the snapshot's data does not
-    /// outlive the snapshot itself. This guarantee relies on the Rust drop order of struct fields.
-    fn create(snapshot: Rc<CommitedSnapshot>, offset: PageOffset, len: usize) -> Self {
-        use std::mem;
-
-        let bytes = snapshot.read(offset, len);
-        let bytes = unsafe { mem::transmute(bytes) };
-        Self {
-            _snapshot: snapshot,
-            bytes,
-        }
-    }
-}
-
-impl Deref for Ref {
-    type Target = [u8];
-
-    fn deref(&self) -> &Self::Target {
-        self.bytes.deref()
-    }
-}
-
-impl AsRef<[u8]> for Ref {
-    fn as_ref(&self) -> &[u8] {
-        self.bytes.as_ref()
+    fn read(&self, addr: PageOffset, len: usize) -> Result<Cow<[u8]>> {
+        self.latest.read(addr, len)
     }
 }
 
@@ -338,10 +285,6 @@ impl CommitedSnapshot {
 
         apply_patches(&patch_list, buf, &range);
         Ok(())
-    }
-
-    pub fn read_ref(self: &Rc<Self>, addr: PageOffset, len: usize) -> Ref {
-        Ref::create(Rc::clone(self), addr, len)
     }
 }
 
@@ -459,7 +402,7 @@ fn intersects(patch: &Patch, range: &Range<usize>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    pub use super::*;
+    use super::*;
 
     #[test]
     fn create_new_page() -> Result<()> {
