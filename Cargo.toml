@@ -10,3 +10,9 @@ thiserror = "1.0.61"
 [dev-dependencies]
 fatfs = "0.3.6"
 proptest = "1.0.0"
+rand = { version = "0.8.5", features = ["small_rng"] }
+tango-bench = "0.5.0"
+
+[[bench]]
+name = "page"
+harness = false
