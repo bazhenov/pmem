@@ -68,7 +68,8 @@ type Result<T> = std::result::Result<T, Error>;
 ///
 /// A `Patch` can either write a range of bytes starting at a specified offset
 /// or recalim a range of bytes starting at a specified offset.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
+#[cfg_attr(test, derive(PartialEq, Debug))]
 enum Patch {
     // Write given data at a specified offset
     Write(PageOffset, Vec<u8>),
@@ -90,6 +91,62 @@ impl Patch {
             Patch::Write(_, bytes) => bytes.len(),
             Patch::Reclaim(_, len) => *len,
         }
+    }
+
+    pub fn end(&self) -> u32 {
+        self.offset() + self.len() as u32
+    }
+
+    pub fn to_range(&self) -> Range<u32> {
+        self.offset()..self.offset() + self.len() as u32
+    }
+
+    pub fn intersects(&self, other: &Patch) -> bool {
+        let a = self.to_range();
+        let b = other.to_range();
+
+        a.contains(&b.start) || a.contains(&b.end)
+    }
+
+    pub fn adjacent(&self, other: &Patch) -> bool {
+        let a = self.to_range();
+        let b = other.to_range();
+
+        a.start == b.end || b.start == a.end
+    }
+
+    pub fn extend(&mut self, other: Patch) -> std::result::Result<(), Patch> {
+        if !self.intersects(&other) && !self.adjacent(&other) {
+            return Err(other);
+        }
+
+        // We can extend only patches of the same type
+        let (Patch::Write(_, a_data), Patch::Write(_, b_data)) = (&self, &other) else {
+            return Err(other);
+        };
+
+        let start = self.offset().min(other.offset()) as usize;
+        let end = self.end().max(other.end()) as usize;
+
+        let mut result_data = vec![0; end - start];
+
+        let range = {
+            let start = self.offset() as usize - start;
+            let end = start + self.len();
+            start..end
+        };
+        result_data[range].copy_from_slice(&a_data[..]);
+
+        let range = {
+            let start = other.offset() as usize - start;
+            let end = start + other.len();
+            start..end
+        };
+        result_data[range].copy_from_slice(&b_data[..]);
+
+        *self = Patch::Write(start as u32, result_data);
+
+        Ok(())
     }
 }
 
@@ -386,6 +443,27 @@ fn apply_patches(snapshots: &[&[Patch]], buffer: &mut [u8], range: &Range<usize>
     }
 }
 
+fn merge_patches(mut input: Vec<Patch>) -> Vec<Patch> {
+    input.sort_unstable_by_key(Patch::offset);
+
+    if input.is_empty() {
+        return vec![];
+    }
+
+    let mut result = Vec::with_capacity(input.capacity());
+    result.push(input.remove(0));
+
+    for next in input {
+        // always Some(_) because we start with non empty result
+        let last = result.last().unwrap();
+        if next.intersects(last) {
+            let last = result.pop().unwrap();
+        }
+    }
+
+    result
+}
+
 fn split_ptr(addr: Addr) -> (PageNo, PageOffset) {
     const PAGE_SIZE_BITS: u32 = PAGE_SIZE.trailing_zeros();
     let page_no = addr >> PAGE_SIZE_BITS;
@@ -537,6 +615,55 @@ mod tests {
         };
 
         Ok(())
+    }
+
+    mod patch {
+        use super::*;
+
+        #[test]
+        fn adjacent_patches_of_the_same_type() {
+            assert_merged(
+                Patch::Write(0, vec![0, 1, 2]),
+                Patch::Write(3, vec![3, 4, 5]),
+                Patch::Write(0, vec![0, 1, 2, 3, 4, 5]),
+            );
+
+            assert_merged(
+                Patch::Write(3, vec![3, 4, 5]),
+                Patch::Write(0, vec![0, 1, 2]),
+                Patch::Write(0, vec![0, 1, 2, 3, 4, 5]),
+            );
+        }
+
+        #[test]
+        fn adjacent_patches_of_different_types() {
+            assert_not_merged(Patch::Write(0, vec![0, 1, 2]), Patch::Reclaim(3, 3))
+        }
+
+        #[test]
+        fn intersecting_patchesof_the_same_type() {
+            assert_merged(
+                Patch::Write(0, vec![0, 1, 2]),
+                Patch::Write(2, vec![20, 30, 40]),
+                Patch::Write(0, vec![0, 1, 20, 30, 40]),
+            );
+
+            assert_merged(
+                Patch::Write(2, vec![20, 30, 40]),
+                Patch::Write(0, vec![0, 1, 2]),
+                Patch::Write(0, vec![0, 1, 2, 30, 40]),
+            );
+        }
+
+        fn assert_merged(mut a: Patch, b: Patch, expected: Patch) {
+            a.extend(b).expect("Patches should be merged");
+            assert_eq!(a, expected);
+        }
+
+        fn assert_not_merged(mut a: Patch, mut b: Patch) {
+            a.extend(b.clone()).expect_err("Should not be extended");
+            b.extend(a.clone()).expect_err("Should not be extended");
+        }
     }
 
     mod ptr {
