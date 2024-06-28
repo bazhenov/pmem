@@ -153,83 +153,79 @@ impl Patch {
 
         if !self.intersects(&other) && !self.adjacent(&other) {
             let (a, b) = self.reorder(other);
-            return Reordered(a, b);
-        }
+            Reordered(a, b)
+        } else if other.includes(&self) {
+            Merged(other)
+        } else if self.includes(&other) {
+            match (self, other) {
+                (Write(a_offset, mut bytes), b @ Reclaim(_, _)) => {
+                    let split_idx = (b.offset() - a_offset) as usize + b.len();
+                    let right = Write(b.end(), bytes.split_off(split_idx));
 
-        match (self, other) {
-            (Write(a_offset, a_data), Write(b_offset, b_data)) => {
-                let a_end = a_offset as usize + a_data.len();
-                let b_end = b_offset as usize + b_data.len();
-                let start = a_offset.min(b_offset) as usize;
-                let end = a_end.max(b_end);
+                    bytes.truncate(bytes.len() - b.len());
+                    let left = Write(a_offset, bytes);
 
-                let mut result_data = vec![0; end - start];
-
-                let range = {
-                    let start = a_offset as usize - start;
-                    let end = start + a_data.len();
-                    start..end
-                };
-                result_data[range].copy_from_slice(&a_data[..]);
-
-                let range = {
-                    let start = b_offset as usize - start;
-                    let end = start + b_data.len();
-                    start..end
-                };
-                result_data[range].copy_from_slice(&b_data[..]);
-
-                Merged(Write(start as u32, result_data))
-            }
-            (mut a @ Write(_, _), b @ Reclaim(_, _)) => {
-                if a.adjacent(&b) {
-                    let (a, b) = a.reorder(b);
-                    Reordered(a, b)
-                } else if b.includes(&a) {
-                    Merged(b)
-                } else if a.includes(&b) && !a.adjacent(&b) {
-                    let Write(a_offset, a_data) = a else {
-                        panic!("Not possible")
-                    };
-                    let (left_part, tail) = a_data.split_at((b.offset() - a_offset) as usize);
-                    let (_, right_part) = tail.split_at(b.len());
-
-                    let e = b.end();
-                    Splitted(
-                        Write(a_offset, left_part.to_vec()),
-                        b,
-                        Write(e, right_part.to_vec()),
-                    )
-                } else {
-                    if a.offset() < b.offset() {
-                        a.trim_after(b.offset());
-                    } else {
-                        a.trim_before(b.end());
-                    }
-                    let (a, b) = a.reorder(b);
-                    Reordered(a, b)
+                    Splitted(left, b, right)
                 }
+                (a @ Reclaim(_, _), b @ Write(_, _)) => {
+                    let left = Reclaim(a.offset(), (b.offset() - a.offset()) as usize);
+                    let right = Reclaim(b.end(), (a.end() - b.end()) as usize);
+                    Splitted(left, b, right)
+                }
+                (Write(a_offset, mut a_data), Write(b_offset, b_data)) => {
+                    let start = (b_offset - a_offset) as usize;
+                    let end = start + b_data.len();
+                    a_data[start..end].copy_from_slice(&b_data);
+
+                    Merged(Write(a_offset, a_data))
+                }
+                (a @ Reclaim(_, _), Reclaim(_, _)) => Merged(a),
             }
-            (a @ Reclaim(_, _), b @ Reclaim(_, _)) => {
-                let offset = a.offset().min(b.offset());
-                let end = a.end().max(b.end()) as usize;
-                let len = end - offset as usize;
-                Merged(Reclaim(offset, len))
+        } else if self.adjacent(&other) {
+            let (left, right) = self.reorder(other);
+            // Only adjacent patches of the same type can be merged
+            match (left, right) {
+                (Write(offset, mut a), Write(_, b)) => {
+                    a.extend(b);
+                    Merged(Write(offset, a))
+                }
+                (Reclaim(offset, a), Reclaim(_, b)) => Merged(Reclaim(offset, a + b)),
+                (a, b) => Reordered(a, b),
             }
-            (mut a @ Reclaim(_, _), b @ Write(_, _)) => {
-                if a.adjacent(&b) {
-                    let (a, b) = a.reorder(b);
-                    Reordered(a, b)
-                } else if b.includes(&a) {
-                    Merged(b)
-                } else if a.includes(&b) && !a.adjacent(&b) {
-                    let b_end = b.end();
-                    Splitted(
-                        Reclaim(a.offset(), b.offset() as usize),
-                        b,
-                        Reclaim(b_end, (a.end() - b_end) as usize),
-                    )
-                } else {
+        } else {
+            // Partial overlap case
+            match (self, other) {
+                (Write(a_offset, a_data), Write(b_offset, b_data)) => {
+                    let a_end = a_offset as usize + a_data.len();
+                    let b_end = b_offset as usize + b_data.len();
+                    let start = a_offset.min(b_offset) as usize;
+                    let end = a_end.max(b_end);
+
+                    let mut result_data = vec![0; end - start];
+
+                    let range = {
+                        let start = a_offset as usize - start;
+                        let end = start + a_data.len();
+                        start..end
+                    };
+                    result_data[range].copy_from_slice(&a_data[..]);
+
+                    let range = {
+                        let start = b_offset as usize - start;
+                        let end = start + b_data.len();
+                        start..end
+                    };
+                    result_data[range].copy_from_slice(&b_data[..]);
+
+                    Merged(Write(start as u32, result_data))
+                }
+                (a @ Reclaim(_, _), b @ Reclaim(_, _)) => {
+                    let offset = a.offset().min(b.offset());
+                    let end = a.end().max(b.end()) as usize;
+                    let len = end - offset as usize;
+                    Merged(Reclaim(offset, len))
+                }
+                (mut a, b) => {
                     if a.offset() < b.offset() {
                         a.trim_after(b.offset());
                     } else {
