@@ -126,6 +126,28 @@ impl Patch {
         other.offset() <= self.offset() && other.end() >= self.end()
     }
 
+    fn trim_after(&mut self, at: u32) {
+        let end = self.end();
+        assert!(self.offset() < at && at < end, "Out-of-bounds");
+        match self {
+            Patch::Write(offset, data) => data.truncate((at - *offset) as usize),
+            Patch::Reclaim(_, len) => {
+                *len -= (at - end) as usize;
+            }
+        }
+    }
+
+    fn trim_before(&mut self, at: u32) {
+        assert!(self.offset() < at && at < self.end(), "Out-of-bounds");
+        match self {
+            Patch::Write(offset, data) => data.truncate((at - *offset) as usize),
+            Patch::Reclaim(offset, len) => {
+                *len -= (at - *offset) as usize;
+                *offset = at;
+            }
+        }
+    }
+
     pub fn normalize(self, other: Patch) -> NormalizedPatches {
         if !self.intersects(&other) && !self.adjacent(&other) {
             let (a, b) = self.reorder(other);
@@ -157,10 +179,18 @@ impl Patch {
 
                 NormalizedPatches::Merged(Patch::Write(start as u32, result_data))
             }
-            (a @ Patch::Write(_, _), b @ Patch::Reclaim(_, _)) => {
-                if a.covered_by(&b) {
+            (mut a @ Patch::Write(_, _), b @ Patch::Reclaim(_, _)) => {
+                if a.adjacent(&b) {
+                    let (a, b) = a.reorder(b);
+                    NormalizedPatches::Reordered(a, b)
+                } else if a.covered_by(&b) {
                     NormalizedPatches::Merged(b)
                 } else {
+                    if a.offset() < b.offset() {
+                        a.trim_after(b.offset());
+                    } else {
+                        a.trim_before(b.end());
+                    }
                     let (a, b) = a.reorder(b);
                     NormalizedPatches::Reordered(a, b)
                 }
@@ -171,7 +201,22 @@ impl Patch {
                 let len = end - offset as usize;
                 NormalizedPatches::Merged(Patch::Reclaim(offset, len))
             }
-            (Patch::Reclaim(_, _), Patch::Write(_, _)) => todo!(),
+            (mut a @ Patch::Reclaim(_, _), b @ Patch::Write(_, _)) => {
+                if a.adjacent(&b) {
+                    let (a, b) = a.reorder(b);
+                    NormalizedPatches::Reordered(a, b)
+                } else if a.covered_by(&b) {
+                    NormalizedPatches::Merged(b)
+                } else {
+                    if a.offset() < b.offset() {
+                        a.trim_after(b.offset());
+                    } else {
+                        a.trim_before(b.end());
+                    }
+                    let (a, b) = a.reorder(b);
+                    NormalizedPatches::Reordered(a, b)
+                }
+            }
         }
     }
 
@@ -677,7 +722,17 @@ mod tests {
 
         #[test]
         fn overlapping_patches_of_different_types() {
-            assert_not_merged(Patch::Write(0, vec![0, 1, 2]), Patch::Reclaim(1, 15));
+            assert_reordered(
+                Patch::Write(0, vec![0, 1, 2]),
+                Patch::Reclaim(1, 15),
+                (Patch::Write(0, vec![0]), Patch::Reclaim(1, 15)),
+            );
+
+            assert_reordered(
+                Patch::Reclaim(1, 15),
+                Patch::Write(0, vec![0, 1, 2]),
+                (Patch::Write(0, vec![0, 1, 2]), Patch::Reclaim(3, 13)),
+            );
         }
 
         #[test]
@@ -732,6 +787,14 @@ mod tests {
             let result = a.normalize(b);
             match result {
                 NormalizedPatches::Merged(patch) => assert_eq!(patch, expected),
+                result @ _ => panic!("Patch should be merged: {:?}", result),
+            }
+        }
+
+        fn assert_reordered(a: Patch, b: Patch, expected: (Patch, Patch)) {
+            let result = a.normalize(b);
+            match result {
+                NormalizedPatches::Reordered(p1, p2) => assert_eq!((p1, p2), expected),
                 result @ _ => panic!("Patch should be merged: {:?}", result),
             }
         }
