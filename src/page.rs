@@ -78,6 +78,13 @@ enum Patch {
     Reclaim(PageOffset, usize),
 }
 
+#[cfg_attr(test, derive(Debug))]
+enum NormalizedPatches {
+    Merged(Patch),
+    Reordered(Patch, Patch),
+    Splitted(Patch, Patch, Patch),
+}
+
 impl Patch {
     pub fn offset(&self) -> u32 {
         match self {
@@ -115,38 +122,65 @@ impl Patch {
         a.start == b.end || b.start == a.end
     }
 
-    pub fn extend(&mut self, other: Patch) -> std::result::Result<(), Patch> {
+    pub fn covered_by(&self, other: &Patch) -> bool {
+        other.offset() <= self.offset() && other.end() >= self.end()
+    }
+
+    pub fn normalize(self, other: Patch) -> NormalizedPatches {
         if !self.intersects(&other) && !self.adjacent(&other) {
-            return Err(other);
+            let (a, b) = self.reorder(other);
+            return NormalizedPatches::Reordered(a, b);
         }
 
-        // We can extend only patches of the same type
-        let (Patch::Write(_, a_data), Patch::Write(_, b_data)) = (&self, &other) else {
-            return Err(other);
-        };
+        match (self, other) {
+            (Patch::Write(a_offset, a_data), Patch::Write(b_offset, b_data)) => {
+                let a_end = a_offset as usize + a_data.len();
+                let b_end = b_offset as usize + b_data.len();
+                let start = a_offset.min(b_offset) as usize;
+                let end = a_end.max(b_end);
 
-        let start = self.offset().min(other.offset()) as usize;
-        let end = self.end().max(other.end()) as usize;
+                let mut result_data = vec![0; end - start];
 
-        let mut result_data = vec![0; end - start];
+                let range = {
+                    let start = a_offset as usize - start;
+                    let end = start + a_data.len();
+                    start..end
+                };
+                result_data[range].copy_from_slice(&a_data[..]);
 
-        let range = {
-            let start = self.offset() as usize - start;
-            let end = start + self.len();
-            start..end
-        };
-        result_data[range].copy_from_slice(&a_data[..]);
+                let range = {
+                    let start = b_offset as usize - start;
+                    let end = start + b_data.len();
+                    start..end
+                };
+                result_data[range].copy_from_slice(&b_data[..]);
 
-        let range = {
-            let start = other.offset() as usize - start;
-            let end = start + other.len();
-            start..end
-        };
-        result_data[range].copy_from_slice(&b_data[..]);
+                NormalizedPatches::Merged(Patch::Write(start as u32, result_data))
+            }
+            (a @ Patch::Write(_, _), b @ Patch::Reclaim(_, _)) => {
+                if a.covered_by(&b) {
+                    NormalizedPatches::Merged(b)
+                } else {
+                    let (a, b) = a.reorder(b);
+                    NormalizedPatches::Reordered(a, b)
+                }
+            }
+            (a @ Patch::Reclaim(_, _), b @ Patch::Reclaim(_, _)) => {
+                let offset = a.offset().min(b.offset());
+                let end = a.end().max(b.end()) as usize;
+                let len = end - offset as usize;
+                NormalizedPatches::Merged(Patch::Reclaim(offset, len))
+            }
+            (Patch::Reclaim(_, _), Patch::Write(_, _)) => todo!(),
+        }
+    }
 
-        *self = Patch::Write(start as u32, result_data);
-
-        Ok(())
+    fn reorder(self, other: Patch) -> (Patch, Patch) {
+        if self.offset() < other.offset() {
+            (self, other)
+        } else {
+            (other, self)
+        }
     }
 }
 
@@ -628,6 +662,7 @@ mod tests {
                 Patch::Write(0, vec![0, 1, 2, 3, 4, 5]),
             );
 
+            // TODO replace with proptests
             assert_merged(
                 Patch::Write(3, vec![3, 4, 5]),
                 Patch::Write(0, vec![0, 1, 2]),
@@ -641,7 +676,12 @@ mod tests {
         }
 
         #[test]
-        fn intersecting_patchesof_the_same_type() {
+        fn overlapping_patches_of_different_types() {
+            assert_not_merged(Patch::Write(0, vec![0, 1, 2]), Patch::Reclaim(1, 15));
+        }
+
+        #[test]
+        fn overlapping_patches_of_the_same_type() {
             assert_merged(
                 Patch::Write(0, vec![0, 1, 2]),
                 Patch::Write(2, vec![20, 30, 40]),
@@ -653,16 +693,58 @@ mod tests {
                 Patch::Write(0, vec![0, 1, 2]),
                 Patch::Write(0, vec![0, 1, 2, 30, 40]),
             );
+
+            assert_merged(
+                Patch::Reclaim(2, 3),
+                Patch::Reclaim(4, 6),
+                Patch::Reclaim(2, 8),
+            );
         }
 
-        fn assert_merged(mut a: Patch, b: Patch, expected: Patch) {
-            a.extend(b).expect("Patches should be merged");
-            assert_eq!(a, expected);
+        #[test]
+        fn identical_patches_of_the_same_type() {
+            assert_merged(
+                Patch::Write(0, vec![0, 1, 2]),
+                Patch::Write(0, vec![0, 1, 2]),
+                Patch::Write(0, vec![0, 1, 2]),
+            );
         }
 
-        fn assert_not_merged(mut a: Patch, mut b: Patch) {
-            a.extend(b.clone()).expect_err("Should not be extended");
-            b.extend(a.clone()).expect_err("Should not be extended");
+        #[test]
+        fn identical_patches_of_different_types() {
+            assert_merged(
+                Patch::Write(0, vec![0, 1, 2]),
+                Patch::Reclaim(0, 3),
+                Patch::Reclaim(0, 3),
+            );
+        }
+
+        #[test]
+        fn covered_patches() {
+            assert_merged(
+                Patch::Write(0, vec![0, 1, 2]),
+                Patch::Reclaim(0, 4),
+                Patch::Reclaim(0, 4),
+            );
+        }
+
+        fn assert_merged(a: Patch, b: Patch, expected: Patch) {
+            let result = a.normalize(b);
+            match result {
+                NormalizedPatches::Merged(patch) => assert_eq!(patch, expected),
+                result @ _ => panic!("Patch should be merged: {:?}", result),
+            }
+        }
+
+        fn assert_not_merged(a: Patch, b: Patch) {
+            let result = a.clone().normalize(b.clone());
+            match result {
+                NormalizedPatches::Reordered(p1, p2) => {
+                    assert_eq!(p1, a);
+                    assert_eq!(p2, b);
+                }
+                result @ _ => panic!("Patch should not be merged: {:?}", result),
+            }
         }
     }
 
