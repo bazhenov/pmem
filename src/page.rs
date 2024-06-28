@@ -78,13 +78,6 @@ enum Patch {
     Reclaim(PageOffset, usize),
 }
 
-#[cfg_attr(test, derive(Debug))]
-enum NormalizedPatches {
-    Merged(Patch),
-    Reordered(Patch, Patch),
-    Splitted(Patch, Patch, Patch),
-}
-
 impl Patch {
     pub fn offset(&self) -> u32 {
         match self {
@@ -243,6 +236,32 @@ impl Patch {
             (self, other)
         } else {
             (other, self)
+        }
+    }
+
+    #[cfg(test)]
+    fn set_offset(&mut self, value: u32) {
+        match self {
+            Patch::Write(offset, _) => *offset = value,
+            Patch::Reclaim(offset, _) => *offset = value,
+        }
+    }
+}
+
+#[cfg_attr(test, derive(Debug, PartialEq))]
+enum NormalizedPatches {
+    Merged(Patch),
+    Reordered(Patch, Patch),
+    Splitted(Patch, Patch, Patch),
+}
+
+impl NormalizedPatches {
+    #[cfg(test)]
+    fn len(self) -> usize {
+        match self {
+            NormalizedPatches::Merged(p1) => p1.len(),
+            NormalizedPatches::Reordered(p1, p2) => p1.len() + p2.len(),
+            NormalizedPatches::Splitted(p1, p2, p3) => p1.len() + p2.len() + p3.len(),
         }
     }
 }
@@ -899,6 +918,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(miri))]
     mod proptests {
         use super::*;
         use proptest::{collection::vec, prelude::*};
@@ -907,8 +927,12 @@ mod tests {
         const DB_SIZE: usize = 1024;
 
         proptest! {
+            #![proptest_config(ProptestConfig {
+                cases: 1000,
+                ..ProptestConfig::default()
+            })]
+
             #[test]
-            #[cfg_attr(miri, ignore)]
             fn arbitrary_writes(snapshots in vec(any_snapshot(), 0..10)) {
                 // Mirror buffer where we track all the patches being applied.
                 // In the end content should be equal to the mirror buffer
@@ -937,6 +961,56 @@ mod tests {
 
                 assert_buffers_eq(&*mem.read(0, DB_SIZE).unwrap(), mirror.as_slice());
             }
+
+            #[test]
+            fn adjacent_patches_commutativity((p1, p2) in any_adjacent_patches()) {
+                let forward = p1.clone().normalize(p2.clone());
+                let backward = p2.normalize(p1);
+                prop_assert_eq!(forward, backward);
+            }
+
+            #[test]
+            fn adjacent_patches_length((p1, p2) in any_adjacent_patches()) {
+                let sum = p1.len() + p2.len();
+                let result = p1.normalize(p2);
+                prop_assert_eq!(result.len(), sum);
+            }
+
+            #[test]
+            fn covered_patches_length((p1, p2) in any_covered_patches()) {
+                let max_len = p1.len().max(p2.len());
+                let result = p1.normalize(p2);
+                prop_assert_eq!(result.len(), max_len);
+            }
+        }
+
+        fn any_adjacent_patches() -> impl Strategy<Value = (Patch, Patch)> {
+            (any_patch(), any_patch()).prop_map(|(mut a, b)| {
+                a.set_offset(b.end());
+                (a, b)
+            })
+        }
+
+        fn any_covered_patches() -> impl Strategy<Value = (Patch, Patch)> {
+            (any_patch(), any_patch())
+                .prop_map(|(a, b)| {
+                    // reordering so that A is always longer or the same length as B
+                    if a.len() > b.len() {
+                        (a, b)
+                    } else {
+                        (b, a)
+                    }
+                })
+                .prop_flat_map(|(a, b)| {
+                    // generating offset of B into A, so that B is randomized, but A is still fully covering B
+                    let offset = a.len() - b.len() + 1;
+                    (Just(a), Just(b), 0..offset)
+                })
+                .prop_map(|(a, mut b, b_offset)| {
+                    // placing B so that A covers it
+                    b.set_offset(a.offset() + b_offset as u32);
+                    (a, b)
+                })
         }
 
         fn any_patch() -> impl Strategy<Value = Patch> {
@@ -944,15 +1018,15 @@ mod tests {
         }
 
         fn any_write_patch() -> impl Strategy<Value = Patch> {
-            (0u32..(DB_SIZE as u32), vec(any::<u8>(), 1..32))
+            (0..DB_SIZE, vec(any::<u8>(), 1..5))
                 .prop_filter("out of bounds patch", |(offset, bytes)| {
-                    offset + (bytes.len() as u32) < DB_SIZE as u32
+                    offset + bytes.len() < DB_SIZE
                 })
-                .prop_map(|(offset, bytes)| Patch::Write(offset, bytes))
+                .prop_map(|(offset, bytes)| Patch::Write(offset as u32, bytes))
         }
 
         fn any_reclaim_patch() -> impl Strategy<Value = Patch> {
-            (0..DB_SIZE, 1usize..32)
+            (0..DB_SIZE, 1usize..5)
                 .prop_filter("out of bounds patch", |(offset, len)| {
                     (*offset + *len) < DB_SIZE
                 })
@@ -962,6 +1036,30 @@ mod tests {
         fn any_snapshot() -> impl Strategy<Value = Vec<Patch>> {
             vec(any_patch(), 1..10)
         }
+
+        #[track_caller]
+        fn assert_buffers_eq(a: &[u8], b: &[u8]) {
+            assert_eq!(a.len(), b.len(), "Buffers should have the same length");
+
+            let mut mismatch = a
+                .iter()
+                .zip(b.into_iter())
+                .enumerate()
+                .skip_while(|(_, (a, b))| *a == *b)
+                .take_while(|(_, (a, b))| *a != *b)
+                .map(|(idx, _)| idx);
+
+            if let Some(start) = mismatch.next() {
+                let end = mismatch.last().unwrap_or(start) + 1;
+                assert_eq!(
+                    &a[start..end],
+                    &b[start..end],
+                    "Mismatch detected at {}..{}",
+                    start,
+                    end
+                );
+            }
+        }
     }
 
     #[track_caller]
@@ -969,30 +1067,6 @@ mod tests {
         let a = String::from_utf8_lossy(a.as_ref());
         let b = String::from_utf8_lossy(b.as_ref());
         assert_eq!(a, b);
-    }
-
-    #[track_caller]
-    fn assert_buffers_eq(a: &[u8], b: &[u8]) {
-        assert_eq!(a.len(), b.len(), "Buffers should have the same length");
-
-        let mut mismatch = a
-            .iter()
-            .zip(b.into_iter())
-            .enumerate()
-            .skip_while(|(_, (a, b))| *a == *b)
-            .take_while(|(_, (a, b))| *a != *b)
-            .map(|(idx, _)| idx);
-
-        if let Some(start) = mismatch.next() {
-            let end = mismatch.last().unwrap_or(start) + 1;
-            assert_eq!(
-                &a[start..end],
-                &b[start..end],
-                "Mismatch detected at {}..{}",
-                start,
-                end
-            );
-        }
     }
 
     impl From<&[u8]> for CommitedSnapshot {
