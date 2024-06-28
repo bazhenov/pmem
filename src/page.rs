@@ -100,30 +100,30 @@ impl Patch {
         }
     }
 
-    pub fn end(&self) -> u32 {
+    fn end(&self) -> u32 {
         self.offset() + self.len() as u32
     }
 
-    pub fn to_range(&self) -> Range<u32> {
+    fn to_range(&self) -> Range<u32> {
         self.offset()..self.offset() + self.len() as u32
     }
 
-    pub fn intersects(&self, other: &Patch) -> bool {
+    fn intersects(&self, other: &Patch) -> bool {
         let a = self.to_range();
         let b = other.to_range();
 
-        a.contains(&b.start) || a.contains(&b.end)
+        a.contains(&b.start) || a.contains(&b.end) || b.contains(&a.start) || b.contains(&a.end)
     }
 
-    pub fn adjacent(&self, other: &Patch) -> bool {
+    fn adjacent(&self, other: &Patch) -> bool {
         let a = self.to_range();
         let b = other.to_range();
 
         a.start == b.end || b.start == a.end
     }
 
-    pub fn covered_by(&self, other: &Patch) -> bool {
-        other.offset() <= self.offset() && other.end() >= self.end()
+    fn includes(&self, other: &Patch) -> bool {
+        self.offset() <= other.offset() && other.end() <= self.end()
     }
 
     fn trim_after(&mut self, at: u32) {
@@ -149,13 +149,15 @@ impl Patch {
     }
 
     pub fn normalize(self, other: Patch) -> NormalizedPatches {
+        use {NormalizedPatches::*, Patch::*};
+
         if !self.intersects(&other) && !self.adjacent(&other) {
             let (a, b) = self.reorder(other);
-            return NormalizedPatches::Reordered(a, b);
+            return Reordered(a, b);
         }
 
         match (self, other) {
-            (Patch::Write(a_offset, a_data), Patch::Write(b_offset, b_data)) => {
+            (Write(a_offset, a_data), Write(b_offset, b_data)) => {
                 let a_end = a_offset as usize + a_data.len();
                 let b_end = b_offset as usize + b_data.len();
                 let start = a_offset.min(b_offset) as usize;
@@ -177,14 +179,27 @@ impl Patch {
                 };
                 result_data[range].copy_from_slice(&b_data[..]);
 
-                NormalizedPatches::Merged(Patch::Write(start as u32, result_data))
+                Merged(Write(start as u32, result_data))
             }
-            (mut a @ Patch::Write(_, _), b @ Patch::Reclaim(_, _)) => {
+            (mut a @ Write(_, _), b @ Reclaim(_, _)) => {
                 if a.adjacent(&b) {
                     let (a, b) = a.reorder(b);
-                    NormalizedPatches::Reordered(a, b)
-                } else if a.covered_by(&b) {
-                    NormalizedPatches::Merged(b)
+                    Reordered(a, b)
+                } else if b.includes(&a) {
+                    Merged(b)
+                } else if a.includes(&b) && !a.adjacent(&b) {
+                    let Write(a_offset, a_data) = a else {
+                        panic!("Not possible")
+                    };
+                    let (left_part, tail) = a_data.split_at((b.offset() - a_offset) as usize);
+                    let (_, right_part) = tail.split_at(b.len());
+
+                    let e = b.end();
+                    Splitted(
+                        Write(a_offset, left_part.to_vec()),
+                        b,
+                        Write(e, right_part.to_vec()),
+                    )
                 } else {
                     if a.offset() < b.offset() {
                         a.trim_after(b.offset());
@@ -192,21 +207,28 @@ impl Patch {
                         a.trim_before(b.end());
                     }
                     let (a, b) = a.reorder(b);
-                    NormalizedPatches::Reordered(a, b)
+                    Reordered(a, b)
                 }
             }
-            (a @ Patch::Reclaim(_, _), b @ Patch::Reclaim(_, _)) => {
+            (a @ Reclaim(_, _), b @ Reclaim(_, _)) => {
                 let offset = a.offset().min(b.offset());
                 let end = a.end().max(b.end()) as usize;
                 let len = end - offset as usize;
-                NormalizedPatches::Merged(Patch::Reclaim(offset, len))
+                Merged(Reclaim(offset, len))
             }
-            (mut a @ Patch::Reclaim(_, _), b @ Patch::Write(_, _)) => {
+            (mut a @ Reclaim(_, _), b @ Write(_, _)) => {
                 if a.adjacent(&b) {
                     let (a, b) = a.reorder(b);
-                    NormalizedPatches::Reordered(a, b)
-                } else if a.covered_by(&b) {
-                    NormalizedPatches::Merged(b)
+                    Reordered(a, b)
+                } else if b.includes(&a) {
+                    Merged(b)
+                } else if a.includes(&b) && !a.adjacent(&b) {
+                    let b_end = b.end();
+                    Splitted(
+                        Reclaim(a.offset(), b.offset() as usize),
+                        b,
+                        Reclaim(b_end, (a.end() - b_end) as usize),
+                    )
                 } else {
                     if a.offset() < b.offset() {
                         a.trim_after(b.offset());
@@ -214,7 +236,7 @@ impl Patch {
                         a.trim_before(b.end());
                     }
                     let (a, b) = a.reorder(b);
-                    NormalizedPatches::Reordered(a, b)
+                    Reordered(a, b)
                 }
             }
         }
@@ -698,110 +720,133 @@ mod tests {
 
     mod patch {
         use super::*;
+        use Patch::*;
 
         #[test]
         fn adjacent_patches_of_the_same_type() {
             assert_merged(
-                Patch::Write(0, vec![0, 1, 2]),
-                Patch::Write(3, vec![3, 4, 5]),
-                Patch::Write(0, vec![0, 1, 2, 3, 4, 5]),
+                Write(0, vec![0, 1, 2]),
+                Write(3, vec![3, 4, 5]),
+                Write(0, vec![0, 1, 2, 3, 4, 5]),
             );
 
             // TODO replace with proptests
             assert_merged(
-                Patch::Write(3, vec![3, 4, 5]),
-                Patch::Write(0, vec![0, 1, 2]),
-                Patch::Write(0, vec![0, 1, 2, 3, 4, 5]),
+                Write(3, vec![3, 4, 5]),
+                Write(0, vec![0, 1, 2]),
+                Write(0, vec![0, 1, 2, 3, 4, 5]),
             );
         }
 
         #[test]
         fn adjacent_patches_of_different_types() {
-            assert_not_merged(Patch::Write(0, vec![0, 1, 2]), Patch::Reclaim(3, 3))
+            assert_not_merged(Write(0, vec![0, 1, 2]), Reclaim(3, 3))
+        }
+
+        #[test]
+        fn island_patches_of_the_same_type() {
+            assert_merged(
+                Write(0, vec![0, 1, 2]),
+                Write(1, vec![10]),
+                Write(0, vec![0, 10, 2]),
+            );
+
+            assert_merged(
+                Write(1, vec![10]),
+                Write(0, vec![0, 1, 2]),
+                Write(0, vec![0, 1, 2]),
+            );
+        }
+
+        #[test]
+        fn island_patches_of_different_types() {
+            assert_splitted(
+                Write(0, vec![0, 1, 2]),
+                Reclaim(1, 1),
+                (Write(0, vec![0]), Reclaim(1, 1), Write(2, vec![2])),
+            );
+
+            assert_splitted(
+                Reclaim(0, 3),
+                Write(1, vec![1]),
+                (Reclaim(0, 1), Write(1, vec![1]), Reclaim(2, 1)),
+            );
         }
 
         #[test]
         fn overlapping_patches_of_different_types() {
             assert_reordered(
-                Patch::Write(0, vec![0, 1, 2]),
-                Patch::Reclaim(1, 15),
-                (Patch::Write(0, vec![0]), Patch::Reclaim(1, 15)),
+                Write(0, vec![0, 1, 2]),
+                Reclaim(1, 15),
+                (Write(0, vec![0]), Reclaim(1, 15)),
             );
 
             assert_reordered(
-                Patch::Reclaim(1, 15),
-                Patch::Write(0, vec![0, 1, 2]),
-                (Patch::Write(0, vec![0, 1, 2]), Patch::Reclaim(3, 13)),
+                Reclaim(1, 15),
+                Write(0, vec![0, 1, 2]),
+                (Write(0, vec![0, 1, 2]), Reclaim(3, 13)),
             );
         }
 
         #[test]
         fn overlapping_patches_of_the_same_type() {
             assert_merged(
-                Patch::Write(0, vec![0, 1, 2]),
-                Patch::Write(2, vec![20, 30, 40]),
-                Patch::Write(0, vec![0, 1, 20, 30, 40]),
+                Write(0, vec![0, 1, 2]),
+                Write(2, vec![20, 30, 40]),
+                Write(0, vec![0, 1, 20, 30, 40]),
             );
 
             assert_merged(
-                Patch::Write(2, vec![20, 30, 40]),
-                Patch::Write(0, vec![0, 1, 2]),
-                Patch::Write(0, vec![0, 1, 2, 30, 40]),
+                Write(2, vec![20, 30, 40]),
+                Write(0, vec![0, 1, 2]),
+                Write(0, vec![0, 1, 2, 30, 40]),
             );
 
-            assert_merged(
-                Patch::Reclaim(2, 3),
-                Patch::Reclaim(4, 6),
-                Patch::Reclaim(2, 8),
-            );
+            assert_merged(Reclaim(2, 3), Reclaim(4, 6), Reclaim(2, 8));
         }
 
         #[test]
         fn identical_patches_of_the_same_type() {
             assert_merged(
-                Patch::Write(0, vec![0, 1, 2]),
-                Patch::Write(0, vec![0, 1, 2]),
-                Patch::Write(0, vec![0, 1, 2]),
+                Write(0, vec![0, 1, 2]),
+                Write(0, vec![0, 1, 2]),
+                Write(0, vec![0, 1, 2]),
             );
         }
 
         #[test]
         fn identical_patches_of_different_types() {
-            assert_merged(
-                Patch::Write(0, vec![0, 1, 2]),
-                Patch::Reclaim(0, 3),
-                Patch::Reclaim(0, 3),
-            );
+            assert_merged(Write(0, vec![0, 1, 2]), Reclaim(0, 3), Reclaim(0, 3));
         }
 
         #[test]
         fn covered_patches() {
-            assert_merged(
-                Patch::Write(0, vec![0, 1, 2]),
-                Patch::Reclaim(0, 4),
-                Patch::Reclaim(0, 4),
-            );
+            assert_merged(Write(0, vec![0, 1, 2]), Reclaim(0, 4), Reclaim(0, 4));
         }
 
         fn assert_merged(a: Patch, b: Patch, expected: Patch) {
-            let result = a.normalize(b);
-            match result {
+            match a.normalize(b) {
                 NormalizedPatches::Merged(patch) => assert_eq!(patch, expected),
                 result @ _ => panic!("Patch should be merged: {:?}", result),
             }
         }
 
         fn assert_reordered(a: Patch, b: Patch, expected: (Patch, Patch)) {
-            let result = a.normalize(b);
-            match result {
+            match a.normalize(b) {
                 NormalizedPatches::Reordered(p1, p2) => assert_eq!((p1, p2), expected),
                 result @ _ => panic!("Patch should be merged: {:?}", result),
             }
         }
 
+        fn assert_splitted(a: Patch, b: Patch, expected: (Patch, Patch, Patch)) {
+            match a.normalize(b) {
+                NormalizedPatches::Splitted(p1, p2, p3) => assert_eq!((p1, p2, p3), expected),
+                result @ _ => panic!("Patch should be splitted: {:?}", result),
+            }
+        }
+
         fn assert_not_merged(a: Patch, b: Patch) {
-            let result = a.clone().normalize(b.clone());
-            match result {
+            match a.clone().normalize(b.clone()) {
                 NormalizedPatches::Reordered(p1, p2) => {
                     assert_eq!(p1, a);
                     assert_eq!(p2, b);
