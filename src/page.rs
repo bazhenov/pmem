@@ -54,7 +54,7 @@
 //! read data without any modifications.
 
 use crate::ensure;
-use std::{borrow::Cow, ops::Range, rc::Rc, usize};
+use std::{borrow::Cow, iter, ops::Range, rc::Rc, usize};
 
 pub const PAGE_SIZE: usize = 1 << 24; // 16Mb
 pub type Addr = u32;
@@ -79,7 +79,7 @@ enum Patch {
 }
 
 impl Patch {
-    pub fn offset(&self) -> u32 {
+    pub fn addr(&self) -> u32 {
         match self {
             Patch::Write(offset, _) => *offset,
             Patch::Reclaim(offset, _) => *offset,
@@ -93,19 +93,35 @@ impl Patch {
         }
     }
 
+    pub fn normalize(self, other: Patch) -> NormalizedPatches {
+        if other.fully_covers(&self) {
+            NormalizedPatches::Merged(other)
+        } else if self.fully_covers(&other) {
+            self.normalize_covered(other)
+        } else if self.adjacent(&other) {
+            self.normalize_adjacency(other)
+        } else if self.overlaps(&other) {
+            self.normalize_overlap(other)
+        } else {
+            // Not connected patches
+            let (a, b) = self.reorder(other);
+            NormalizedPatches::Reordered(a, b)
+        }
+    }
+
     fn end(&self) -> u32 {
-        self.offset() + self.len() as u32
+        self.addr() + self.len() as u32
     }
 
     fn to_range(&self) -> Range<u32> {
-        self.offset()..self.offset() + self.len() as u32
+        self.addr()..self.addr() + self.len() as u32
     }
 
-    fn intersects(&self, other: &Patch) -> bool {
+    fn overlaps(&self, other: &Patch) -> bool {
         let a = self.to_range();
         let b = other.to_range();
 
-        a.contains(&b.start) || a.contains(&b.end) || b.contains(&a.start) || b.contains(&a.end)
+        a.contains(&b.start) || b.contains(&a.start)
     }
 
     fn adjacent(&self, other: &Patch) -> bool {
@@ -115,25 +131,28 @@ impl Patch {
         a.start == b.end || b.start == a.end
     }
 
-    fn includes(&self, other: &Patch) -> bool {
-        self.offset() <= other.offset() && other.end() <= self.end()
+    fn fully_covers(&self, other: &Patch) -> bool {
+        self.addr() <= other.addr() && other.end() <= self.end()
     }
 
     fn trim_after(&mut self, at: u32) {
         let end = self.end();
-        assert!(self.offset() < at && at < end, "Out-of-bounds");
+        assert!(self.addr() < at && at < end, "Out-of-bounds");
         match self {
             Patch::Write(offset, data) => data.truncate((at - *offset) as usize),
             Patch::Reclaim(_, len) => {
-                *len -= (at - end) as usize;
+                *len -= (end - at) as usize;
             }
         }
     }
 
     fn trim_before(&mut self, at: u32) {
-        assert!(self.offset() < at && at < self.end(), "Out-of-bounds");
+        assert!(self.addr() < at && at < self.end(), "Out-of-bounds");
         match self {
-            Patch::Write(offset, data) => data.truncate((at - *offset) as usize),
+            Patch::Write(offset, data) => {
+                data.truncate((at - *offset) as usize);
+                *offset = at;
+            }
             Patch::Reclaim(offset, len) => {
                 *len -= (at - *offset) as usize;
                 *offset = at;
@@ -141,98 +160,118 @@ impl Patch {
         }
     }
 
-    pub fn normalize(self, other: Patch) -> NormalizedPatches {
+    /// Normalize 2 patches when they are overlapping
+    fn normalize_overlap(self, other: Patch) -> NormalizedPatches {
         use {NormalizedPatches::*, Patch::*};
+        assert!(self.overlaps(&other));
 
-        if !self.intersects(&other) && !self.adjacent(&other) {
-            let (a, b) = self.reorder(other);
-            Reordered(a, b)
-        } else if other.includes(&self) {
-            Merged(other)
-        } else if self.includes(&other) {
-            match (self, other) {
-                (Write(a_offset, mut bytes), b @ Reclaim(_, _)) => {
-                    let split_idx = (b.offset() - a_offset) as usize + b.len();
-                    let right = Write(b.end(), bytes.split_off(split_idx));
+        match (self, other) {
+            (Write(a_offset, a_data), Write(b_offset, b_data)) => {
+                let a_end = a_offset as usize + a_data.len();
+                let b_end = b_offset as usize + b_data.len();
+                let start = a_offset.min(b_offset) as usize;
+                let end = a_end.max(b_end);
 
-                    bytes.truncate(bytes.len() - b.len());
-                    let left = Write(a_offset, bytes);
+                let mut result_data = vec![0; end - start];
 
-                    Splitted(left, b, right)
-                }
-                (a @ Reclaim(_, _), b @ Write(_, _)) => {
-                    let left = Reclaim(a.offset(), (b.offset() - a.offset()) as usize);
-                    let right = Reclaim(b.end(), (a.end() - b.end()) as usize);
-                    Splitted(left, b, right)
-                }
-                (Write(a_offset, mut a_data), Write(b_offset, b_data)) => {
-                    let start = (b_offset - a_offset) as usize;
+                let range = {
+                    let start = a_offset as usize - start;
+                    let end = start + a_data.len();
+                    start..end
+                };
+                result_data[range].copy_from_slice(&a_data[..]);
+
+                let range = {
+                    let start = b_offset as usize - start;
                     let end = start + b_data.len();
-                    a_data[start..end].copy_from_slice(&b_data);
+                    start..end
+                };
+                result_data[range].copy_from_slice(&b_data[..]);
 
-                    Merged(Write(a_offset, a_data))
-                }
-                (a @ Reclaim(_, _), Reclaim(_, _)) => Merged(a),
+                Merged(Write(start as u32, result_data))
             }
-        } else if self.adjacent(&other) {
-            let (left, right) = self.reorder(other);
-            // Only adjacent patches of the same type can be merged
-            match (left, right) {
-                (Write(offset, mut a), Write(_, b)) => {
-                    a.extend(b);
-                    Merged(Write(offset, a))
-                }
-                (Reclaim(offset, a), Reclaim(_, b)) => Merged(Reclaim(offset, a + b)),
-                (a, b) => Reordered(a, b),
+            (a @ Reclaim(_, _), b @ Reclaim(_, _)) => {
+                let offset = a.addr().min(b.addr());
+                let end = a.end().max(b.end()) as usize;
+                let len = end - offset as usize;
+                Merged(Reclaim(offset, len))
             }
-        } else {
-            // Partial overlap case
-            match (self, other) {
-                (Write(a_offset, a_data), Write(b_offset, b_data)) => {
-                    let a_end = a_offset as usize + a_data.len();
-                    let b_end = b_offset as usize + b_data.len();
-                    let start = a_offset.min(b_offset) as usize;
-                    let end = a_end.max(b_end);
-
-                    let mut result_data = vec![0; end - start];
-
-                    let range = {
-                        let start = a_offset as usize - start;
-                        let end = start + a_data.len();
-                        start..end
-                    };
-                    result_data[range].copy_from_slice(&a_data[..]);
-
-                    let range = {
-                        let start = b_offset as usize - start;
-                        let end = start + b_data.len();
-                        start..end
-                    };
-                    result_data[range].copy_from_slice(&b_data[..]);
-
-                    Merged(Write(start as u32, result_data))
+            (mut a, b) => {
+                if a.addr() < b.addr() {
+                    a.trim_after(b.addr());
+                } else {
+                    a.trim_before(b.end());
                 }
-                (a @ Reclaim(_, _), b @ Reclaim(_, _)) => {
-                    let offset = a.offset().min(b.offset());
-                    let end = a.end().max(b.end()) as usize;
-                    let len = end - offset as usize;
-                    Merged(Reclaim(offset, len))
-                }
-                (mut a, b) => {
-                    if a.offset() < b.offset() {
-                        a.trim_after(b.offset());
-                    } else {
-                        a.trim_before(b.end());
-                    }
-                    let (a, b) = a.reorder(b);
-                    Reordered(a, b)
-                }
+                let (a, b) = a.reorder(b);
+                Reordered(a, b)
             }
         }
     }
 
+    /// Normalize 2 patches if the are adjacent
+    ///
+    /// Only adjacent patches of the same type can be merged
+    fn normalize_adjacency(self, other: Patch) -> NormalizedPatches {
+        use {NormalizedPatches::*, Patch::*};
+        assert!(self.adjacent(&other));
+
+        match self.reorder(other) {
+            (Write(addr, mut a), Write(_, b)) => {
+                a.extend(b);
+                Merged(Write(addr, a))
+            }
+            (Reclaim(addr, a), Reclaim(_, b)) => Merged(Reclaim(addr, a + b)),
+            (a, b) => Reordered(a, b),
+        }
+    }
+
+    fn normalize_covered(self, other: Patch) -> NormalizedPatches {
+        use {NormalizedPatches::*, Patch::*};
+        assert!(self.fully_covers(&other));
+
+        match (self, other) {
+            (Write(a_addr, mut bytes), b @ Reclaim(_, _)) => {
+                let split_idx = (b.addr() - a_addr) as usize + b.len();
+                let right = Write(b.end(), bytes.split_off(split_idx));
+
+                bytes.truncate(bytes.len() - b.len());
+                let left = Write(a_addr, bytes);
+
+                assert!(left.len() != 0 || right.len() != 0);
+                if left.len() == 0 {
+                    Reordered(b, right)
+                } else if right.len() == 0 {
+                    Reordered(left, b)
+                } else {
+                    Splitted(left, b, right)
+                }
+            }
+            (a @ Reclaim(_, _), b @ Write(_, _)) => {
+                let left = Reclaim(a.addr(), (b.addr() - a.addr()) as usize);
+                let right = Reclaim(b.end(), (a.end() - b.end()) as usize);
+
+                assert!(left.len() != 0 || right.len() != 0);
+                if left.len() == 0 {
+                    Reordered(b, right)
+                } else if right.len() == 0 {
+                    Reordered(left, b)
+                } else {
+                    Splitted(left, b, right)
+                }
+            }
+            (Write(a_addr, mut a_data), Write(b_addr, b_data)) => {
+                let start = (b_addr - a_addr) as usize;
+                let end = start + b_data.len();
+                a_data[start..end].copy_from_slice(&b_data);
+
+                Merged(Write(a_addr, a_data))
+            }
+            (a @ Reclaim(_, _), Reclaim(_, _)) => Merged(a),
+        }
+    }
+
     fn reorder(self, other: Patch) -> (Patch, Patch) {
-        if self.offset() < other.offset() {
+        if self.addr() < other.addr() {
             (self, other)
         } else {
             (other, self)
@@ -240,10 +279,10 @@ impl Patch {
     }
 
     #[cfg(test)]
-    fn set_offset(&mut self, value: u32) {
+    fn set_addr(&mut self, value: u32) {
         match self {
-            Patch::Write(offset, _) => *offset = value,
-            Patch::Reclaim(offset, _) => *offset = value,
+            Patch::Write(addr, _) => *addr = value,
+            Patch::Reclaim(addr, _) => *addr = value,
         }
     }
 }
@@ -263,6 +302,16 @@ impl NormalizedPatches {
             NormalizedPatches::Reordered(p1, p2) => p1.len() + p2.len(),
             NormalizedPatches::Splitted(p1, p2, p3) => p1.len() + p2.len() + p3.len(),
         }
+    }
+
+    #[cfg(test)]
+    pub fn iter(&self) -> impl Iterator<Item = &Patch> {
+        let slice = match self {
+            NormalizedPatches::Merged(a) => [Some(a), None, None],
+            NormalizedPatches::Reordered(a, b) => [Some(a), Some(b), None],
+            NormalizedPatches::Splitted(a, b, c) => [Some(a), Some(b), Some(c)],
+        };
+        slice.into_iter().filter_map(|i| i)
     }
 }
 
@@ -536,7 +585,7 @@ fn apply_patches(snapshots: &[&[Patch]], buffer: &mut [u8], range: &Range<usize>
     for patches in snapshots.iter().rev() {
         for patch in patches.iter().filter(|p| intersects(p, range)) {
             // Calculating intersection of the path and input interval
-            let offset = patch.offset() as usize;
+            let offset = patch.addr() as usize;
             let start = range.start.max(offset);
             let end = range.end.min(offset + patch.len());
             let len = end - start;
@@ -560,7 +609,7 @@ fn apply_patches(snapshots: &[&[Patch]], buffer: &mut [u8], range: &Range<usize>
 }
 
 fn merge_patches(mut input: Vec<Patch>) -> Vec<Patch> {
-    input.sort_unstable_by_key(Patch::offset);
+    input.sort_unstable_by_key(Patch::addr);
 
     if input.is_empty() {
         return vec![];
@@ -572,7 +621,7 @@ fn merge_patches(mut input: Vec<Patch>) -> Vec<Patch> {
     for next in input {
         // always Some(_) because we start with non empty result
         let last = result.last().unwrap();
-        if next.intersects(last) {
+        if next.overlaps(last) {
             let last = result.pop().unwrap();
         }
     }
@@ -589,7 +638,7 @@ fn split_ptr(addr: Addr) -> (PageNo, PageOffset) {
 
 /// Returns true of given patch intersects given range of bytes
 fn intersects(patch: &Patch, range: &Range<usize>) -> bool {
-    let start = patch.offset() as usize;
+    let start = patch.addr() as usize;
     let end = start + patch.len();
     start < range.end && end > range.start
 }
@@ -830,6 +879,20 @@ mod tests {
         }
 
         #[test]
+        fn regression() {
+            assert_reordered(
+                Write(0, vec![0, 0, 0]),
+                Reclaim(0, 1),
+                (Reclaim(0, 1), Write(1, vec![0, 0])),
+            );
+            assert_reordered(
+                Reclaim(0, 3),
+                Write(0, vec![0]),
+                (Write(0, vec![0]), Reclaim(1, 2)),
+            );
+        }
+
+        #[test]
         fn identical_patches_of_different_types() {
             assert_merged(Write(0, vec![0, 1, 2]), Reclaim(0, 3), Reclaim(0, 3));
         }
@@ -918,7 +981,7 @@ mod tests {
         }
     }
 
-    #[cfg(not(miri))]
+    // #[cfg(not(miri))]
     mod proptests {
         use super::*;
         use proptest::{collection::vec, prelude::*};
@@ -932,26 +995,28 @@ mod tests {
                 ..ProptestConfig::default()
             })]
 
+            /// This test uses "shadow writes" to check if snapshot writing and reading
+            /// algorithms are consistent with sequential consistency. We do it by
+            /// mirroring all patches to a shadow buffer sequentially. In the end,
+            /// the final snapshot state should be equal to the shadow buffer.
             #[test]
-            fn arbitrary_writes(snapshots in vec(any_snapshot(), 0..10)) {
-                // Mirror buffer where we track all the patches being applied.
-                // In the end content should be equal to the mirror buffer
-                let mut mirror = vec![0; DB_SIZE];
+            fn shadow_write(snapshots in vec(any_snapshot(), 0..10)) {
+                let mut shadow_buffer = vec![0; DB_SIZE];
                 let mut mem = PagePool::default();
 
                 for patches in snapshots {
                     let mut snapshot = mem.snapshot();
                     for patch in patches {
-                        let offset = patch.offset() as usize;
+                        let offset = patch.addr() as usize;
                         let range = offset..offset + patch.len();
                         match patch {
                             Patch::Write(offset, bytes) => {
                                 snapshot.write(offset, &bytes);
-                                mirror[range].copy_from_slice(bytes.as_slice());
+                                shadow_buffer[range].copy_from_slice(bytes.as_slice());
                             },
                             Patch::Reclaim(offset, len) => {
                                 snapshot.reclaim(offset, len)?;
-                                mirror[range].fill(0);
+                                shadow_buffer[range].fill(0);
 
                             }
                         }
@@ -959,82 +1024,223 @@ mod tests {
                     mem.commit(snapshot);
                 }
 
-                assert_buffers_eq(&*mem.read(0, DB_SIZE).unwrap(), mirror.as_slice());
+                assert_buffers_eq(&*mem.read(0, DB_SIZE).unwrap(), shadow_buffer.as_slice());
             }
 
             #[test]
-            fn adjacent_patches_commutativity((p1, p2) in any_adjacent_patches()) {
-                let forward = p1.clone().normalize(p2.clone());
-                let backward = p2.normalize(p1);
-                prop_assert_eq!(forward, backward);
+            fn any_patches_length_should_be_positive((a, b) in patches::any_pair()) {
+                match a.normalize(b) {
+                    NormalizedPatches::Merged(a) => prop_assert!(a.len() > 0, "{:?}", a),
+                    NormalizedPatches::Reordered(a, b) => prop_assert!(a.len() > 0 && b.len() > 0, "{:?}, {:?}", a, b),
+                    NormalizedPatches::Splitted(a, b, c) => prop_assert!(a.len() > 0 && b.len() > 0 && c.len() > 0, "{:?}, {:?}, {:?}", a, b, c),
+                }
             }
 
             #[test]
-            fn adjacent_patches_length((p1, p2) in any_adjacent_patches()) {
-                let sum = p1.len() + p2.len();
-                let result = p1.normalize(p2);
+            fn patches_commutativity((a, b) in prop_oneof![patches::adjacent(), patches::disconnected()]) {
+                let a_plus_b = a.clone().normalize(b.clone());
+                let b_plus_a = b.normalize(a);
+                prop_assert_eq!(a_plus_b, b_plus_a);
+            }
+
+            #[test]
+            fn adjacent_patches_length((a, b) in patches::adjacent()) {
+                let sum = a.len() + b.len();
+                let result = a.normalize(b);
                 prop_assert_eq!(result.len(), sum);
             }
 
+            /// For any two covered patches the result patch length is a maximum of input patches length
             #[test]
-            fn covered_patches_length((p1, p2) in any_covered_patches()) {
-                let max_len = p1.len().max(p2.len());
-                let result = p1.normalize(p2);
-                prop_assert_eq!(result.len(), max_len);
+            fn covered_patches_length((a, b) in patches::covered()) {
+                let expected_len = a.len().max(b.len());
+                prop_assert_eq!(a.clone().normalize(b.clone()).len(), expected_len);
+                prop_assert_eq!(b.clone().normalize(a.clone()).len(), expected_len);
+            }
+
+            /// If B is fully covered by A, A should fully rewrite B
+            #[test]
+            fn covered_patches_rewrite((covering, covered) in patches::covered()) {
+                let NormalizedPatches::Merged(result) = covered.normalize(covering.clone()) else {
+                    panic!("Merged() expected");
+                };
+                prop_assert_eq!(covering, result);
+            }
+
+            #[test]
+            fn covered_patches_ajacency((covering, covered) in patches::adjacent()) {
+                match covering.normalize(covered.clone()) {
+                    NormalizedPatches::Reordered(p1, p2) => prop_assert!(p1.addr() == p2.end() || p2.addr() == p1.end()),
+                    NormalizedPatches::Merged(_) => {}
+                    NormalizedPatches::Splitted(p1, p2, p3) => prop_assert!(false, "Merged()/Reordered() expected. Got: {:?}, {:?}, {:?}", p1, p2, p3)
+                }
+            }
+
+            #[test]
+            fn connected_patches_are_adjacent_after_normalization((a, b) in patches::any_connected_pair()) {
+                match a.normalize(b) {
+                    NormalizedPatches::Merged(_) => {},
+                    NormalizedPatches::Reordered(a, b) => {
+                        prop_assert!(a.end() == b.addr(), "Patches are not adjacent: {:?}, {:?}", a, b);
+                    },
+                    NormalizedPatches::Splitted(a, b, c) => {
+                        prop_assert!(a.end() == b.addr(), "Patches are not adjacent: {:?}, {:?}", a, b);
+                        prop_assert!(b.end() == c.addr(), "Patches are not adjacent: {:?}, {:?}", b, c);
+                    },
+                }
+            }
+
+            #[test]
+            fn patches_are_ordered_after_normalization((a, b) in patches::any_pair()) {
+                match a.normalize(b) {
+                    NormalizedPatches::Merged(_) => {},
+                    NormalizedPatches::Reordered(a, b) => {
+                        prop_assert!(a.end() <= b.addr(), "Patches are not adjacent: {:?}, {:?}", a, b);
+                    },
+                    NormalizedPatches::Splitted(a, b, c) => {
+                        prop_assert!(a.end() <= b.addr(), "Patches are not adjacent: {:?}, {:?}", a, b);
+                        prop_assert!(b.end() <= c.addr(), "Patches are not adjacent: {:?}, {:?}", b, c);
+                    },
+                }
+            }
+
+            #[test]
+            fn patches_have_positive_length((a, b) in patches::any_pair()) {
+                for patch in a.normalize(b).iter() {
+                    prop_assert!(patch.len() > 0);
+                }
+            }
+
+            #[test]
+            fn patches_do_not_overlaps((a, b) in patches::any_pair()) {
+                match a.normalize(b) {
+                    NormalizedPatches::Merged(_) => {},
+                    NormalizedPatches::Reordered(a, b) => {
+                        prop_assert!(!a.overlaps(&b), "Patches are overlapping: {:?}, {:?}", a, b);
+                    },
+                    NormalizedPatches::Splitted(ref a, ref b, ref c) => {
+                        for (i, j) in [(a, b), (b, c), (c, a)] {
+                            prop_assert!(!i.overlaps(j), "Patches are overlapping: {:?}, {:?}", i, j);
+                        }
+                    },
+                }
+            }
+
+            // #[test]
+            // fn overlapped((a, b) in patches::overlapped()) {
+            //     let NormalizedPatches::Reordered(a, b) = a.normalize(b) else {
+            //         panic!("Reordered() expected: ")
+            //     };
+            // }
+        }
+
+        /// A set of strategies to generate different patches for property testing
+        mod patches {
+            use prop::test_runner::TestRng;
+
+            use super::*;
+            use std::mem;
+
+            pub(super) fn any_pair() -> impl Strategy<Value = (Patch, Patch)> {
+                prop_oneof![
+                    disconnected(),
+                    adjacent(),
+                    overlapped(),
+                    covered().prop_perturb(randomize_order)
+                ]
+            }
+
+            pub(super) fn any_connected_pair() -> impl Strategy<Value = (Patch, Patch)> {
+                prop_oneof![
+                    adjacent(),
+                    overlapped(),
+                    covered().prop_perturb(randomize_order)
+                ]
+            }
+
+            pub(super) fn adjacent() -> impl Strategy<Value = (Patch, Patch)> {
+                (any_patch(), any_patch()).prop_map(|(mut a, b)| {
+                    a.set_addr(b.end());
+                    (a, b)
+                })
+            }
+
+            pub(super) fn disconnected() -> impl Strategy<Value = (Patch, Patch)> {
+                (any_patch(), any_patch())
+                    .prop_filter("Patches should be disconnected", |(p1, p2)| {
+                        !p1.overlaps(&p2) && !p1.adjacent(&p2)
+                    })
+            }
+
+            pub(super) fn overlapped() -> impl Strategy<Value = (Patch, Patch)> {
+                (any_patch_with_len(2..5), any_patch_with_len(2..5))
+                    .prop_perturb(|(a, mut b), mut rng| {
+                        // Position B at the end of A so that they are partially overlaps
+                        let offset = a.len().min(b.len());
+                        let offset = rng.gen_range(1..offset) as u32;
+                        b.set_addr(a.end() - offset);
+                        (a, b)
+                    })
+                    .prop_perturb(randomize_order)
+            }
+
+            /// The first returned patch is covering and the second is covered
+            pub(super) fn covered() -> impl Strategy<Value = (Patch, Patch)> {
+                (any_patch(), any_patch())
+                    .prop_map(|(a, b)| {
+                        // reordering so that A is always longer or the same length as B
+                        if a.len() > b.len() {
+                            (a, b)
+                        } else {
+                            (b, a)
+                        }
+                    })
+                    .prop_flat_map(|(a, b)| {
+                        // generating offset of B into A, so that B is randomized, but A is still fully covering B
+                        let offset = a.len() - b.len() + 1;
+                        (Just(a), Just(b), 0..offset)
+                    })
+                    .prop_map(|(a, mut b, b_offset)| {
+                        // placing B so that A covers it
+                        b.set_addr(a.addr() + b_offset as u32);
+                        (a, b)
+                    })
+            }
+
+            pub(super) fn any_patch_with_len(len: Range<usize>) -> impl Strategy<Value = Patch> {
+                prop_oneof![write_patch(len.clone()), reclaim_patch(len)]
+            }
+
+            pub(super) fn any_patch() -> impl Strategy<Value = Patch> {
+                prop_oneof![write_patch(1..5), reclaim_patch(1..5)]
+            }
+
+            pub(super) fn write_patch(len: Range<usize>) -> impl Strategy<Value = Patch> {
+                (0..DB_SIZE, vec(any::<u8>(), len))
+                    .prop_filter("out of bounds patch", |(offset, bytes)| {
+                        offset + bytes.len() < DB_SIZE
+                    })
+                    .prop_map(|(offset, bytes)| Patch::Write(offset as u32, bytes))
+            }
+
+            pub(super) fn reclaim_patch(len: Range<usize>) -> impl Strategy<Value = Patch> {
+                (0..DB_SIZE, len)
+                    .prop_filter("out of bounds patch", |(offset, len)| {
+                        (*offset + *len) < DB_SIZE
+                    })
+                    .prop_map(|(offset, len)| Patch::Reclaim(offset as u32, len))
+            }
+
+            fn randomize_order((mut a, mut b): (Patch, Patch), mut rng: TestRng) -> (Patch, Patch) {
+                if rng.gen_bool(0.5) {
+                    mem::swap(&mut a, &mut b);
+                }
+                (a, b)
             }
         }
 
-        fn any_adjacent_patches() -> impl Strategy<Value = (Patch, Patch)> {
-            (any_patch(), any_patch()).prop_map(|(mut a, b)| {
-                a.set_offset(b.end());
-                (a, b)
-            })
-        }
-
-        fn any_covered_patches() -> impl Strategy<Value = (Patch, Patch)> {
-            (any_patch(), any_patch())
-                .prop_map(|(a, b)| {
-                    // reordering so that A is always longer or the same length as B
-                    if a.len() > b.len() {
-                        (a, b)
-                    } else {
-                        (b, a)
-                    }
-                })
-                .prop_flat_map(|(a, b)| {
-                    // generating offset of B into A, so that B is randomized, but A is still fully covering B
-                    let offset = a.len() - b.len() + 1;
-                    (Just(a), Just(b), 0..offset)
-                })
-                .prop_map(|(a, mut b, b_offset)| {
-                    // placing B so that A covers it
-                    b.set_offset(a.offset() + b_offset as u32);
-                    (a, b)
-                })
-        }
-
-        fn any_patch() -> impl Strategy<Value = Patch> {
-            prop_oneof![any_write_patch(), any_reclaim_patch()]
-        }
-
-        fn any_write_patch() -> impl Strategy<Value = Patch> {
-            (0..DB_SIZE, vec(any::<u8>(), 1..5))
-                .prop_filter("out of bounds patch", |(offset, bytes)| {
-                    offset + bytes.len() < DB_SIZE
-                })
-                .prop_map(|(offset, bytes)| Patch::Write(offset as u32, bytes))
-        }
-
-        fn any_reclaim_patch() -> impl Strategy<Value = Patch> {
-            (0..DB_SIZE, 1usize..5)
-                .prop_filter("out of bounds patch", |(offset, len)| {
-                    (*offset + *len) < DB_SIZE
-                })
-                .prop_map(|(offset, len)| Patch::Reclaim(offset as u32, len))
-        }
-
         fn any_snapshot() -> impl Strategy<Value = Vec<Patch>> {
-            vec(any_patch(), 1..10)
+            vec(patches::any_patch(), 1..10)
         }
 
         #[track_caller]
