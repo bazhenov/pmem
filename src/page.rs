@@ -54,7 +54,7 @@
 //! read data without any modifications.
 
 use crate::ensure;
-use std::{borrow::Cow, iter, ops::Range, rc::Rc, usize};
+use std::{borrow::Cow, ops::Range, rc::Rc, usize};
 
 pub const PAGE_SIZE: usize = 1 << 24; // 16Mb
 pub type Addr = u32;
@@ -79,20 +79,6 @@ enum Patch {
 }
 
 impl Patch {
-    pub fn addr(&self) -> u32 {
-        match self {
-            Patch::Write(offset, _) => *offset,
-            Patch::Reclaim(offset, _) => *offset,
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        match self {
-            Patch::Write(_, bytes) => bytes.len(),
-            Patch::Reclaim(_, len) => *len,
-        }
-    }
-
     pub fn normalize(self, other: Patch) -> NormalizedPatches {
         if other.fully_covers(&self) {
             NormalizedPatches::Merged(other)
@@ -107,14 +93,6 @@ impl Patch {
             let (a, b) = self.reorder(other);
             NormalizedPatches::Reordered(a, b)
         }
-    }
-
-    fn end(&self) -> u32 {
-        self.addr() + self.len() as u32
-    }
-
-    fn to_range(&self) -> Range<u32> {
-        self.addr()..self.addr() + self.len() as u32
     }
 
     fn overlaps(&self, other: &Patch) -> bool {
@@ -283,6 +261,35 @@ impl Patch {
         match self {
             Patch::Write(addr, _) => *addr = value,
             Patch::Reclaim(addr, _) => *addr = value,
+        }
+    }
+}
+
+trait MemRange {
+    fn addr(&self) -> u32;
+    fn len(&self) -> usize;
+
+    fn end(&self) -> u32 {
+        self.addr() + self.len() as u32
+    }
+
+    fn to_range(&self) -> Range<u32> {
+        self.addr()..self.addr() + self.len() as u32
+    }
+}
+
+impl MemRange for Patch {
+    fn addr(&self) -> u32 {
+        match self {
+            Patch::Write(offset, _) => *offset,
+            Patch::Reclaim(offset, _) => *offset,
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Patch::Write(_, bytes) => bytes.len(),
+            Patch::Reclaim(_, len) => *len,
         }
     }
 }
@@ -520,7 +527,14 @@ pub struct Snapshot {
 impl Snapshot {
     pub fn write(&mut self, addr: Addr, bytes: &[u8]) {
         assert!(bytes.len() <= PAGE_SIZE, "Buffer too large");
-        self.patches.push(Patch::Write(addr, bytes.to_vec()))
+
+        // let mut patches = vec![];
+        // mem::swap(&mut self.patches, &mut patches);
+
+        let patch = Patch::Write(addr, bytes.to_vec());
+        // let connected = find_connected_ranges(&patches, &patch);
+
+        self.patches.push(patch)
     }
 
     pub fn read(&self, addr: PageOffset, len: usize) -> Result<Cow<'_, [u8]>> {
@@ -608,6 +622,41 @@ fn apply_patches(snapshots: &[&[Patch]], buffer: &mut [u8], range: &Range<usize>
     }
 }
 
+/// Finds the range of indices in a sorted list of ranges that intersect or adgacent with a given range.
+///
+/// This function assumes that the input list of ranges is sorted and non-overlapping. It uses binary search
+/// to efficiently find the starting and ending indices of the intersecting ranges.
+///
+/// # Arguments
+///
+/// * `range` - A reference to the target range to find intersections with.
+/// * `ranges` - A slice of sorted ranges to search within.
+///
+/// # Returns
+///
+/// A `Range` of indices indicating the start and end of the intersecting ranges within the input slice.
+///
+/// # Panics
+///
+/// This function will panic in debug mode if the input list of ranges is not sorted or contains overlapping ranges
+fn find_connected_ranges<T: MemRange>(ranges: &[T], range: &T) -> Range<usize> {
+    fn check_sorted_and_has_no_overlaps<T: MemRange>(ranges: &[T]) -> bool {
+        let mut pairs = ranges.iter().zip(ranges.iter().skip(1));
+        pairs.all(|(curr, next)| curr.end() <= next.addr())
+    }
+    debug_assert!(check_sorted_and_has_no_overlaps(ranges));
+
+    let start_idx = ranges
+        .binary_search_by(|i| i.end().cmp(&range.addr()))
+        .unwrap_or_else(|idx| idx);
+    let end_idx = ranges
+        .binary_search_by(|i| i.addr().cmp(&range.end()))
+        // because the Range::end is exlusive we need to increment index by 1 on exact match
+        .map(|i| i + 1)
+        .unwrap_or_else(|idx| idx);
+    start_idx..end_idx
+}
+
 fn merge_patches(mut input: Vec<Patch>) -> Vec<Patch> {
     input.sort_unstable_by_key(Patch::addr);
 
@@ -622,7 +671,7 @@ fn merge_patches(mut input: Vec<Patch>) -> Vec<Patch> {
         // always Some(_) because we start with non empty result
         let last = result.last().unwrap();
         if next.overlaps(last) {
-            let last = result.pop().unwrap();
+            let _last = result.pop().unwrap();
         }
     }
 
@@ -1126,12 +1175,48 @@ mod tests {
                 }
             }
 
-            // #[test]
-            // fn overlapped((a, b) in patches::overlapped()) {
-            //     let NormalizedPatches::Reordered(a, b) = a.normalize(b) else {
-            //         panic!("Reordered() expected: ")
-            //     };
-            // }
+            #[test]
+            fn ranges_intersect(ranges in any_non_intersecting_ranges(), range in any_range()) {
+                let connected = find_connected_ranges(ranges.as_slice(), &range);
+
+                // calculating left and right parts that are guaranteed to be disconnected from the target range
+                let left = &ranges[..connected.start];
+                let right = &ranges[connected.end..];
+
+                for r in left.into_iter().chain(right.into_iter()) {
+                    prop_assert!(!ranges_connected(&r, &range), "Must not be connected: {:?}, {:?}", r, range)
+                }
+
+                for r in &ranges[connected] {
+                    prop_assert!(ranges_connected(&r, &range), "Must be connected: {:?}, {:?}", r, range)
+                }
+            }
+        }
+
+        fn any_range() -> impl Strategy<Value = Range<u32>> {
+            (0u32..10, 1u32..5).prop_map(|(offset, length)| offset..(offset + length))
+        }
+
+        fn any_non_intersecting_ranges() -> impl Strategy<Value = Vec<Range<u32>>> {
+            (0usize..10)
+                .prop_flat_map(|size| (vec(1u32..3, size), vec(0u32..3, size)))
+                .prop_map(|(size, skip)| {
+                    size.into_iter()
+                        .zip(skip.into_iter())
+                        .scan(0, |offset, (size, skip)| {
+                            let start = *offset + skip;
+                            let end = start + size;
+                            *offset = end;
+                            Some(start..end)
+                        })
+                        .collect()
+                })
+        }
+
+        fn ranges_connected<T: PartialOrd + PartialEq>(a: &Range<T>, b: &Range<T>) -> bool {
+            let overlapping = a.contains(&b.start) || b.contains(&a.start);
+            let adjacent = a.start == b.end || b.start == a.end;
+            overlapping || adjacent
         }
 
         /// A set of strategies to generate different patches for property testing
@@ -1299,6 +1384,16 @@ mod tests {
         fn from(value: &[u8]) -> Self {
             let page = Rc::new(CommitedSnapshot::from(value));
             PagePool { latest: page }
+        }
+    }
+
+    impl MemRange for Range<u32> {
+        fn addr(&self) -> u32 {
+            self.start
+        }
+
+        fn len(&self) -> usize {
+            (self.end - self.start) as usize
         }
     }
 }
