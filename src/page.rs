@@ -526,8 +526,7 @@ pub struct Snapshot {
 
 impl Snapshot {
     pub fn write(&mut self, addr: Addr, bytes: &[u8]) {
-        assert!(bytes.len() <= PAGE_SIZE, "Buffer too large");
-        self.push_patch(Patch::Write(addr, bytes.to_vec()));
+        self.push_patch(Patch::Write(addr, bytes.to_vec()))
     }
 
     /// Frees the given segment of memory.
@@ -537,13 +536,14 @@ impl Snapshot {
     ///
     /// The main purpose of reclaim is to mark memory as not used, so it can be freed from persistent storage
     /// after snapshot compaction.
-    pub fn reclaim(&mut self, addr: PageOffset, len: usize) -> Result<()> {
-        let (page_no, _) = split_ptr(addr);
-        ensure!(page_no < self.pages && len < PAGE_SIZE, Error::OutOfBounds);
-        self.push_patch(Patch::Reclaim(addr, len));
-        Ok(())
+    pub fn reclaim(&mut self, addr: PageOffset, len: usize) {
+        self.push_patch(Patch::Reclaim(addr, len))
     }
 
+    /// Pushes a patch to a snapshot ensuring the following invariants hold:
+    ///
+    /// 1. All patches are sorted by [Patch:addr()]
+    /// 2. All patches are non-overlapping
     fn push_patch(&mut self, patch: Patch) {
         let connected = find_connected_ranges(&self.patches, &patch);
 
@@ -800,7 +800,7 @@ mod tests {
         let mem = PagePool::from(data.as_slice());
 
         let mut snapshot = mem.snapshot();
-        snapshot.reclaim(1, 3)?;
+        snapshot.reclaim(1, 3);
 
         assert_eq!(snapshot.read(0, 5)?, [1u8, 0, 0, 0, 5].as_slice());
         Ok(())
@@ -1080,7 +1080,7 @@ mod tests {
                                 shadow_buffer[range].copy_from_slice(bytes.as_slice());
                             },
                             Patch::Reclaim(offset, len) => {
-                                snapshot.reclaim(offset, len)?;
+                                snapshot.reclaim(offset, len);
                                 shadow_buffer[range].fill(0);
 
                             }
