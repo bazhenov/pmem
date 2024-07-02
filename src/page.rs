@@ -54,7 +54,7 @@
 //! read data without any modifications.
 
 use crate::ensure;
-use std::{borrow::Cow, ops::Range, rc::Rc, usize};
+use std::{borrow::Cow, ops::Range, rc::Rc};
 
 pub const PAGE_SIZE: usize = 1 << 24; // 16Mb
 pub type Addr = u32;
@@ -128,7 +128,7 @@ impl Patch {
         assert!(self.addr() < at && at < self.end(), "Out-of-bounds");
         match self {
             Patch::Write(offset, data) => {
-                data.truncate((at - *offset) as usize);
+                *data = data.split_off((at - *offset) as usize);
                 *offset = at;
             }
             Patch::Reclaim(offset, len) => {
@@ -527,14 +527,63 @@ pub struct Snapshot {
 impl Snapshot {
     pub fn write(&mut self, addr: Addr, bytes: &[u8]) {
         assert!(bytes.len() <= PAGE_SIZE, "Buffer too large");
+        self.push_patch(Patch::Write(addr, bytes.to_vec()));
+    }
 
-        // let mut patches = vec![];
-        // mem::swap(&mut self.patches, &mut patches);
+    /// Frees the given segment of memory.
+    ///
+    /// Reclaim is guaranteed to follow zeroing semantics. The read operation from the corresponding segment
+    /// after reclaiming will return zeros.
+    ///
+    /// The main purpose of reclaim is to mark memory as not used, so it can be freed from persistent storage
+    /// after snapshot compaction.
+    pub fn reclaim(&mut self, addr: PageOffset, len: usize) -> Result<()> {
+        let (page_no, _) = split_ptr(addr);
+        ensure!(page_no < self.pages && len < PAGE_SIZE, Error::OutOfBounds);
+        self.push_patch(Patch::Reclaim(addr, len));
+        Ok(())
+    }
 
-        let patch = Patch::Write(addr, bytes.to_vec());
-        // let connected = find_connected_ranges(&patches, &patch);
+    fn push_patch(&mut self, patch: Patch) {
+        let connected = find_connected_ranges(&self.patches, &patch);
 
-        self.patches.push(patch)
+        if connected.is_empty() {
+            // inserting new patch preserving order
+            let inser_idx = self
+                .patches
+                .binary_search_by(|i| i.addr().cmp(&patch.addr()))
+                // because new patch is not connected to anything we must get Err() here
+                .unwrap_err();
+            self.patches.insert(inser_idx, patch);
+        } else {
+            // Splitting all the patches on left and right disconnected parts and a middle part
+            // that contains connected patches that need to be normalized. We keep left part in place,
+            // there is no need to move it anywhere
+            let mut middle = self.patches.split_off(connected.start);
+            let right = middle.split_off(connected.len());
+
+            // Normalizing all connected patches one by one with the new patch.
+            // After normalizing any particular pair we need to keep continue normalizing
+            // "tail" patch with the rest of connected patches
+            let mut tail_patch = patch;
+            for p in middle {
+                tail_patch = match p.normalize(tail_patch) {
+                    NormalizedPatches::Merged(a) => a,
+                    NormalizedPatches::Reordered(a, b) => {
+                        self.patches.push(a);
+                        b
+                    }
+                    NormalizedPatches::Splitted(a, b, c) => {
+                        self.patches.extend([a, b]);
+                        c
+                    }
+                }
+            }
+            self.patches.push(tail_patch);
+            self.patches.extend(right);
+        }
+
+        debug_assert_sorted_and_has_no_overlaps(&self.patches);
     }
 
     pub fn read(&self, addr: PageOffset, len: usize) -> Result<Cow<'_, [u8]>> {
@@ -550,20 +599,6 @@ impl Snapshot {
         Ok(Cow::Owned(buf))
     }
 
-    /// Frees the given segment of memory.
-    ///
-    /// Reclaim is guaranteed to follow zeroing semantics. The read operation from the corresponding segment
-    /// after reclaiming will return zeros.
-    ///
-    /// The main purpose of reclaim is to mark memory as not used, so it can be freed from persistent storage
-    /// after snapshot compaction.
-    pub fn reclaim(&mut self, addr: PageOffset, len: usize) -> Result<()> {
-        let (page_no, _) = split_ptr(addr);
-        ensure!(page_no < self.pages && len < PAGE_SIZE, Error::OutOfBounds);
-        self.patches.push(Patch::Reclaim(addr, len));
-        Ok(())
-    }
-
     #[cfg(test)]
     fn resize(&mut self, pages: usize) {
         self.pages = pages as PageNo;
@@ -572,7 +607,6 @@ impl Snapshot {
 
 fn collect_snapshots(snapshot: Rc<CommitedSnapshot>) -> Vec<Rc<CommitedSnapshot>> {
     let mut snapshots = vec![];
-    #[allow(clippy::useless_asref)]
     let mut snapshot = Some(snapshot);
     #[allow(clippy::useless_asref)]
     while let Some(s) = snapshot {
@@ -640,11 +674,7 @@ fn apply_patches(snapshots: &[&[Patch]], buffer: &mut [u8], range: &Range<usize>
 ///
 /// This function will panic in debug mode if the input list of ranges is not sorted or contains overlapping ranges
 fn find_connected_ranges<T: MemRange>(ranges: &[T], range: &T) -> Range<usize> {
-    fn check_sorted_and_has_no_overlaps<T: MemRange>(ranges: &[T]) -> bool {
-        let mut pairs = ranges.iter().zip(ranges.iter().skip(1));
-        pairs.all(|(curr, next)| curr.end() <= next.addr())
-    }
-    debug_assert!(check_sorted_and_has_no_overlaps(ranges));
+    debug_assert_sorted_and_has_no_overlaps(ranges);
 
     let start_idx = ranges
         .binary_search_by(|i| i.end().cmp(&range.addr()))
@@ -657,25 +687,11 @@ fn find_connected_ranges<T: MemRange>(ranges: &[T], range: &T) -> Range<usize> {
     start_idx..end_idx
 }
 
-fn merge_patches(mut input: Vec<Patch>) -> Vec<Patch> {
-    input.sort_unstable_by_key(Patch::addr);
-
-    if input.is_empty() {
-        return vec![];
-    }
-
-    let mut result = Vec::with_capacity(input.capacity());
-    result.push(input.remove(0));
-
-    for next in input {
-        // always Some(_) because we start with non empty result
-        let last = result.last().unwrap();
-        if next.overlaps(last) {
-            let _last = result.pop().unwrap();
-        }
-    }
-
-    result
+fn debug_assert_sorted_and_has_no_overlaps<T: MemRange>(ranges: &[T]) {
+    debug_assert!(
+        ranges.windows(2).all(|p| p[0].end() <= p[1].addr()),
+        "Patches should be ordered and not overlapping"
+    )
 }
 
 fn split_ptr(addr: Addr) -> (PageNo, PageOffset) {
@@ -1073,7 +1089,7 @@ mod tests {
                     mem.commit(snapshot);
                 }
 
-                assert_buffers_eq(&*mem.read(0, DB_SIZE).unwrap(), shadow_buffer.as_slice());
+                assert_buffers_eq(&*mem.read(0, DB_SIZE).unwrap(), shadow_buffer.as_slice())?;
             }
 
             #[test]
@@ -1119,8 +1135,8 @@ mod tests {
             #[test]
             fn covered_patches_ajacency((covering, covered) in patches::adjacent()) {
                 match covering.normalize(covered.clone()) {
-                    NormalizedPatches::Reordered(p1, p2) => prop_assert!(p1.addr() == p2.end() || p2.addr() == p1.end()),
                     NormalizedPatches::Merged(_) => {}
+                    NormalizedPatches::Reordered(p1, p2) => prop_assert!(p1.adjacent(&p2)),
                     NormalizedPatches::Splitted(p1, p2, p3) => prop_assert!(false, "Merged()/Reordered() expected. Got: {:?}, {:?}, {:?}", p1, p2, p3)
                 }
             }
@@ -1161,7 +1177,7 @@ mod tests {
             }
 
             #[test]
-            fn patches_do_not_overlaps((a, b) in patches::any_pair()) {
+            fn normalized_patches_do_not_overlaps((a, b) in patches::any_pair()) {
                 match a.normalize(b) {
                     NormalizedPatches::Merged(_) => {},
                     NormalizedPatches::Reordered(a, b) => {
@@ -1173,6 +1189,19 @@ mod tests {
                         }
                     },
                 }
+            }
+
+            #[test]
+            fn overlapping_patches((a, b) in patches::overlapped()) {
+                let start = a.addr().min(b.addr());
+                let end = a.end().max(b.end());
+                let expected_len = (end - start) as usize;
+
+                let patch = a.normalize(b);
+                if let NormalizedPatches::Splitted(_, _, _) = &patch {
+                    panic!("Merged()/Reordered() extected")
+                }
+                prop_assert_eq!(patch.len(), expected_len);
             }
 
             #[test]
@@ -1329,8 +1358,8 @@ mod tests {
         }
 
         #[track_caller]
-        fn assert_buffers_eq(a: &[u8], b: &[u8]) {
-            assert_eq!(a.len(), b.len(), "Buffers should have the same length");
+        fn assert_buffers_eq(a: &[u8], b: &[u8]) -> std::result::Result<(), TestCaseError> {
+            prop_assert_eq!(a.len(), b.len(), "Buffers should have the same length");
 
             let mut mismatch = a
                 .iter()
@@ -1350,6 +1379,7 @@ mod tests {
                     end
                 );
             }
+            Ok(())
         }
     }
 
