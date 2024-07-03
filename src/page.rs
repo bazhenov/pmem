@@ -630,15 +630,25 @@ fn collect_snapshots(snapshot: Rc<CommitedSnapshot>) -> Vec<Rc<CommitedSnapshot>
 /// * `buffer` - A mutable reference to the buffer where the patches will be applied.
 /// * `range` - A range specifying the portion of the buffer to which the patches should be applied.
 fn apply_patches(snapshots: &[&[Patch]], buffer: &mut [u8], range: &Range<usize>) {
-    for patches in snapshots.iter().rev() {
-        for patch in patches.iter().filter(|p| intersects(p, range)) {
+    for snapshot in snapshots.iter().rev() {
+        debug_assert_sorted_and_has_no_overlaps(snapshot);
+        let first_matching_idx = snapshot
+            // because end address is exclusive we need to subtract 1 from it to find idx of first possibly
+            // intersecting patch
+            .binary_search_by(|i| (i.end() - 1).cmp(&(range.start as u32)))
+            .unwrap_or_else(|idx| idx);
+
+        let overlapping_patches = snapshot[first_matching_idx..]
+            .iter()
+            .take_while(|p| intersects(p, range));
+        for patch in overlapping_patches {
             // Calculating intersection of the path and input interval
             let offset = patch.addr() as usize;
             let start = range.start.max(offset);
             let end = range.end.min(offset + patch.len());
             let len = end - start;
 
-            let slice_range = {
+            let buffer_range = {
                 let from = start.saturating_sub(range.start);
                 from..from + len
             };
@@ -649,8 +659,8 @@ fn apply_patches(snapshots: &[&[Patch]], buffer: &mut [u8], range: &Range<usize>
             };
 
             match patch {
-                Patch::Write(_, bytes) => buffer[slice_range].copy_from_slice(&bytes[patch_range]),
-                Patch::Reclaim(_, _) => buffer[slice_range].fill(0),
+                Patch::Write(_, bytes) => buffer[buffer_range].copy_from_slice(&bytes[patch_range]),
+                Patch::Reclaim(_, _) => buffer[buffer_range].fill(0),
             }
         }
     }
