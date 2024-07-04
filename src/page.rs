@@ -1095,7 +1095,7 @@ mod tests {
         }
     }
 
-    // #[cfg(not(miri))]
+    #[cfg(not(miri))]
     mod proptests {
         use super::*;
         use proptest::{collection::vec, prelude::*};
