@@ -517,6 +517,24 @@ impl CommitedSnapshot {
     }
 }
 
+impl Drop for CommitedSnapshot {
+    /// Custom drop logic is necessary here to prevent a stack overflow that could
+    /// occur due to recursive drop calls on a long chain of `Rc` references to base snapshot.
+    /// Each `Rc` decrement could potentially trigger the drop of another `Rc` in the chain,
+    /// leading to deep recursion.
+    ///
+    /// By explicitly unwrapping and handling the inner `Rc` references, we ensure that the drop sequence
+    /// is performed without any recursion
+    fn drop(&mut self) {
+        let mut next_base = self.base.take();
+        while let Some(base) = next_base {
+            next_base = Rc::try_unwrap(base)
+                .map(|mut base| base.base.take())
+                .unwrap_or(None);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Snapshot {
     patches: Vec<Patch>,
@@ -720,6 +738,8 @@ fn intersects(patch: &Patch, range: &Range<usize>) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::{panic, thread};
+
     use super::*;
 
     #[test]
@@ -855,6 +875,25 @@ mod tests {
         };
 
         Ok(())
+    }
+
+    /// When dropping PagePool all related snapshots will be removed. It may lead
+    /// to stackoverflow if snapshots removed recursively.
+    #[test]
+    fn deep_snapshot_should_not_cause_stack_overflow() {
+        thread::Builder::new()
+            .name("deep_snapshot_should_not_cause_stack_overflow".to_string())
+            // setting stacksize explicitly so not to rely on the running environment
+            .stack_size(1024)
+            .spawn(|| {
+                let mut mem = PagePool::new(1);
+                for _ in 0..1000 {
+                    mem.commit(mem.snapshot())
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     mod patch {
