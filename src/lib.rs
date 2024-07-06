@@ -1,3 +1,4 @@
+pub mod fs;
 mod memory;
 pub mod page;
 

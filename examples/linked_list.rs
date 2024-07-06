@@ -26,7 +26,7 @@ struct LinkedList {
     ptr: Ptr<LinkedListNode>,
 }
 
-#[derive(BinRead, BinWrite)]
+#[derive(BinRead, BinWrite, Debug)]
 #[brw(little)]
 struct LinkedListNode {
     first: Ptr<ListNode>,
@@ -52,7 +52,7 @@ impl Storable for LinkedList {
     }
 }
 
-#[derive(BinRead, BinWrite)]
+#[derive(BinRead, BinWrite, Debug)]
 #[brw(little)]
 struct ListNode {
     value: i32,
