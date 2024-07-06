@@ -2,7 +2,7 @@ use crate::{
     memory::{parse_optional_ptr, write_optional_ptr, SlicePtr},
     Handle, Ptr, Storable, Transaction,
 };
-use binrw::{binrw, BinRead, BinWrite};
+use binrw::binrw;
 use std::{
     ffi::OsStr,
     fmt,
@@ -27,12 +27,12 @@ pub enum Error {
 }
 
 struct Filesystem {
-    root: Ptr<ListNode<FsEntry>>,
+    root: Ptr<FsEntry>,
     tx: Transaction,
 }
 
 impl Storable for Filesystem {
-    type Seed = ListNode<FsEntry>;
+    type Seed = FsEntry;
 
     fn open(tx: Transaction, root: Ptr<Self::Seed>) -> Self {
         Self { root, tx }
@@ -40,15 +40,13 @@ impl Storable for Filesystem {
 
     fn allocate(mut tx: Transaction) -> Self {
         let name = tx.write_slice("/".as_bytes());
-        let list_node = tx.write(ListNode {
-            value: FsEntry {
-                name: Str(name),
-                node_type: NodeType::Directory,
-                children: None,
-            },
+        let entry = FsEntry {
+            name: Str(name),
+            node_type: NodeType::Directory,
+            children: None,
             next: None,
-        });
-        let root = list_node.ptr();
+        };
+        let root = tx.write(entry).ptr();
         Self { root, tx }
     }
 
@@ -59,8 +57,7 @@ impl Storable for Filesystem {
 
 impl Filesystem {
     fn get_root(&self) -> FsEntry {
-        let root = self.tx.lookup(self.root).into_inner();
-        root.value
+        self.tx.lookup(self.root).into_inner()
     }
 
     pub fn lookup(&self, name: impl Into<PathBuf>) -> Result<FsEntry> {
@@ -70,7 +67,7 @@ impl Filesystem {
             return Err(Error::PathMustBeAbsolute);
         };
 
-        let mut cur_node: FsEntry = self.tx.lookup(self.root).into_inner().value;
+        let mut cur_node: FsEntry = self.tx.lookup(self.root).into_inner();
         for component in components {
             let Component::Normal(name) = component else {
                 return Err(Error::NotSupported);
@@ -94,15 +91,15 @@ impl Filesystem {
             return Err(Error::PathMustBeAbsolute);
         };
 
-        let mut node: Handle<ListNode<FsEntry>> = self.tx.lookup(self.root);
+        let mut node: Handle<FsEntry> = self.tx.lookup(self.root);
         for component in components {
             let Component::Normal(name) = component else {
                 return Err(Error::NotSupported);
             };
 
-            if node.value.children.is_none() {
+            if node.children.is_none() {
                 let new_node = self.write_fsnode(name.to_str().unwrap());
-                node.value.children = Some(new_node.ptr());
+                node.children = Some(new_node.ptr());
                 self.tx.update(&node);
                 node = new_node;
             } else {
@@ -110,17 +107,17 @@ impl Filesystem {
             }
         }
 
-        Ok(node.into_inner().value)
+        Ok(node.into_inner())
     }
 
-    fn find_child(&self, start_node: Ptr<ListNode<FsEntry>>, name: &OsStr) -> Option<FsEntry> {
+    fn find_child(&self, start_node: Ptr<FsEntry>, name: &OsStr) -> Option<FsEntry> {
         let name = name.to_str().unwrap();
         let mut cur_node = Some(start_node);
         while let Some(node) = cur_node {
             let value = self.tx.lookup(node);
-            let child_name = value.value.name(&self.tx);
+            let child_name = value.name(&self.tx);
             if name == child_name.as_str() {
-                return Some(value.into_inner().value);
+                return Some(value.into_inner());
             }
             cur_node = value.next;
         }
@@ -129,15 +126,15 @@ impl Filesystem {
 
     fn find_or_insert_child(
         &mut self,
-        start_node: Ptr<ListNode<FsEntry>>,
+        start_node: Ptr<FsEntry>,
         name: &OsStr,
-    ) -> Result<Handle<ListNode<FsEntry>>> {
+    ) -> Result<Handle<FsEntry>> {
         let name = name.to_str().unwrap();
         let mut prev_node = start_node;
         let mut cur_node = Some(start_node);
         while let Some(node) = cur_node {
             let value = self.tx.lookup(node);
-            let child_name = value.value.name(&self.tx);
+            let child_name = value.name(&self.tx);
             if name == child_name.as_str() {
                 return Ok(value);
             }
@@ -151,21 +148,15 @@ impl Filesystem {
         Ok(new_node)
     }
 
-    fn write_fsnode(&mut self, name: &str) -> Handle<ListNode<FsEntry>> {
+    fn write_fsnode(&mut self, name: &str) -> Handle<FsEntry> {
         let name = self.tx.write_slice(name.as_bytes());
-        let fs_entry = self
-            .tx
-            .write(FsEntry {
-                name: Str(name),
-                node_type: NodeType::Directory,
-                children: None,
-            })
-            .into_inner();
-        let node = ListNode {
+        let entry = FsEntry {
+            name: Str(name),
+            node_type: NodeType::Directory,
+            children: None,
             next: None,
-            value: fs_entry.clone(),
         };
-        self.tx.write(node)
+        self.tx.write(entry)
     }
 }
 
@@ -178,7 +169,11 @@ struct FsEntry {
 
     #[br(parse_with = parse_optional_ptr)]
     #[bw(write_with = write_optional_ptr)]
-    children: Option<Ptr<ListNode<FsEntry>>>,
+    children: Option<Ptr<FsEntry>>,
+
+    #[br(parse_with = parse_optional_ptr)]
+    #[bw(write_with = write_optional_ptr)]
+    next: Option<Ptr<FsEntry>>,
 }
 
 impl FsEntry {
@@ -186,19 +181,6 @@ impl FsEntry {
         let bytes = tx.read_slice(self.name.0);
         String::from_utf8(bytes).unwrap()
     }
-}
-
-#[binrw]
-#[brw(little)]
-#[derive(Debug)]
-struct ListNode<T>
-where
-    for<'a> T: BinRead<Args<'a> = ()> + BinWrite<Args<'a> = ()>,
-{
-    #[br(parse_with = parse_optional_ptr)]
-    #[bw(write_with = write_optional_ptr)]
-    next: Option<Ptr<ListNode<T>>>,
-    value: T,
 }
 
 #[binrw]
