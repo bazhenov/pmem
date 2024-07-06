@@ -185,15 +185,6 @@ impl Transaction {
     where
         for<'a> T: BinWrite<Args<'a> = ()> + WriteEndian,
     {
-        if let Some(ptr) = ptr {
-            println!(
-                "Writing object to memory address: #{:?}: {:#20?}",
-                ptr.addr, value
-            );
-        } else {
-            println!("Allocating new object: {:#20?}", value);
-        }
-
         let mut buffer = Cursor::new(Vec::new());
 
         // reserving space at the beginning for the header

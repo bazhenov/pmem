@@ -98,8 +98,10 @@ impl Filesystem {
             };
 
             if node.value.children.is_null() {
-                node.value.children = self.write_fsnode(name.to_str().unwrap()).ptr();
+                let new_node = self.write_fsnode(name.to_str().unwrap());
+                node.value.children = new_node.ptr();
                 self.tx.update(&node);
+                node = new_node;
             } else {
                 node = self.find_or_insert_child(node.ptr(), name)?;
             }
@@ -108,7 +110,7 @@ impl Filesystem {
         Ok(node.into_inner().value)
     }
 
-    fn find_child(&self, node: Ptr<ListNode<FsEntry>>, name: &OsStr) -> Option<FsEntry> {
+    fn find_child(&self, mut node: Ptr<ListNode<FsEntry>>, name: &OsStr) -> Option<FsEntry> {
         let name = name.to_str().unwrap();
         while !node.is_null() {
             let value = self.tx.lookup(node);
@@ -116,13 +118,14 @@ impl Filesystem {
             if name == child_name.as_str() {
                 return Some(value.into_inner().value);
             }
+            node = value.next;
         }
         None
     }
 
     fn find_or_insert_child(
         &mut self,
-        node: Ptr<ListNode<FsEntry>>,
+        mut node: Ptr<ListNode<FsEntry>>,
         name: &OsStr,
     ) -> Result<Handle<ListNode<FsEntry>>> {
         let name = name.to_str().unwrap();
@@ -134,6 +137,7 @@ impl Filesystem {
                 return Ok(value);
             }
             prev_ptr = node;
+            node = value.next;
         }
         let node = self.write_fsnode(name);
         let mut prev_node = self.tx.lookup(prev_ptr);
@@ -236,7 +240,23 @@ mod tests {
         let tx = &fs.tx;
         let node = fs.lookup("/etc").expect("/etc should be found");
         assert_eq!(node.name(&tx), "etc");
-        assert_eq!(node.node_type, NodeType::File);
+        assert_eq!(node.node_type, NodeType::Directory);
+
+        Ok(())
+    }
+
+    #[test]
+    fn check_creating_multiple_directories() -> Result<()> {
+        let mem = Memory::default();
+        let tx = mem.start();
+        let mut fs = Filesystem::allocate(tx);
+
+        fs.create_dir("/usr/bin")?;
+
+        let tx = &fs.tx;
+        let node = fs.lookup("/usr/bin").expect("/usr/bin should be found");
+        assert_eq!(node.name(&tx), "bin");
+        assert_eq!(node.node_type, NodeType::Directory);
 
         Ok(())
     }
