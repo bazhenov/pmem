@@ -1,5 +1,5 @@
 use binrw::{BinRead, BinWrite};
-use pmem::{Handle, Memory, Ptr, Storable, Transaction};
+use pmem::{parse_optional_ptr, write_optional_ptr, Handle, Memory, Ptr, Storable, Transaction};
 
 fn main() {
     let memory = Memory::default();
@@ -29,7 +29,9 @@ struct LinkedList {
 #[derive(BinRead, BinWrite, Debug)]
 #[brw(little)]
 struct LinkedListNode {
-    first: Ptr<ListNode>,
+    #[br(parse_with = parse_optional_ptr)]
+    #[bw(write_with = write_optional_ptr)]
+    first: Option<Ptr<ListNode>>,
 }
 
 impl Storable for LinkedList {
@@ -41,7 +43,7 @@ impl Storable for LinkedList {
     }
 
     fn allocate(mut tx: Transaction) -> Self {
-        let root = tx.write(LinkedListNode { first: Ptr::null() });
+        let root = tx.write(LinkedListNode { first: None });
         let ptr = root.ptr();
         Self { tx, root, ptr }
     }
@@ -56,7 +58,9 @@ impl Storable for LinkedList {
 #[brw(little)]
 struct ListNode {
     value: i32,
-    next: Ptr<ListNode>,
+    #[br(parse_with = parse_optional_ptr)]
+    #[bw(write_with = write_optional_ptr)]
+    next: Option<Ptr<ListNode>>,
 }
 
 impl LinkedList {
@@ -65,15 +69,15 @@ impl LinkedList {
             value,
             next: self.root.first,
         });
-        self.root.first = handle.ptr();
+        self.root.first = Some(handle.ptr());
     }
 
     fn len(&self) -> usize {
-        let mut node: Ptr<_> = self.root.first;
+        let mut cur_node = self.root.first;
         let mut len = 0;
-        while !node.is_null() {
+        while let Some(node) = cur_node {
             len += 1;
-            node = self.tx.lookup(node).next;
+            cur_node = self.tx.lookup(node).next;
         }
         len
     }
@@ -92,20 +96,19 @@ impl LinkedList {
 
 struct ListIterator<'a> {
     tx: &'a Transaction,
-    ptr: Ptr<ListNode>,
+    ptr: Option<Ptr<ListNode>>,
 }
 
 impl<'a> Iterator for ListIterator<'a> {
     type Item = i32;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.ptr.is_null() {
-            None
-        } else {
-            let node = self.tx.lookup(self.ptr);
-            self.ptr = node.next;
-            Some(node.value)
-        }
+        let Some(ptr) = self.ptr else {
+            return None;
+        };
+        let node = self.tx.lookup(ptr);
+        self.ptr = node.next;
+        Some(node.value)
     }
 }
 
@@ -119,7 +122,7 @@ mod tests {
         let mut tx = memory.start();
         let a = tx.write(ListNode {
             value: 42,
-            next: Ptr::null(),
+            next: None,
         });
 
         let handle = tx.lookup(a.ptr());
@@ -133,13 +136,15 @@ mod tests {
         let mut tx = memory.start();
         let b = tx.write(ListNode {
             value: 35,
-            next: Ptr::null(),
+            next: None,
         });
         let a = tx.write(ListNode {
             value: 34,
-            next: b.ptr(),
+            next: Some(b.ptr()),
         });
-        let root = tx.write(LinkedListNode { first: a.ptr() });
+        let root = tx.write(LinkedListNode {
+            first: Some(a.ptr()),
+        });
 
         let list = LinkedList::open(tx, root.ptr());
         assert_eq!(list.len(), 2);

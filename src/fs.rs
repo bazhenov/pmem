@@ -1,10 +1,12 @@
-use crate::{memory::SlicePtr, Handle, Ptr, Storable, Transaction};
+use crate::{
+    memory::{parse_optional_ptr, write_optional_ptr, SlicePtr},
+    Handle, Ptr, Storable, Transaction,
+};
 use binrw::{binrw, BinRead, BinWrite};
 use std::{
     ffi::OsStr,
     fmt,
     path::{Component, PathBuf},
-    ptr,
 };
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -25,28 +27,28 @@ pub enum Error {
 }
 
 struct Filesystem {
-    root: Handle<ListNode<FsEntry>>,
+    root: Ptr<ListNode<FsEntry>>,
     tx: Transaction,
 }
 
 impl Storable for Filesystem {
     type Seed = ListNode<FsEntry>;
 
-    fn open(tx: Transaction, ptr: Ptr<Self::Seed>) -> Self {
-        let root = tx.lookup(ptr);
+    fn open(tx: Transaction, root: Ptr<Self::Seed>) -> Self {
         Self { root, tx }
     }
 
     fn allocate(mut tx: Transaction) -> Self {
         let name = tx.write_slice("/".as_bytes());
-        let root = tx.write(ListNode {
+        let list_node = tx.write(ListNode {
             value: FsEntry {
                 name: Str(name),
                 node_type: NodeType::Directory,
-                children: Ptr::null(),
+                children: None,
             },
-            next: Ptr::null(),
+            next: None,
         });
+        let root = list_node.ptr();
         Self { root, tx }
     }
 
@@ -56,8 +58,9 @@ impl Storable for Filesystem {
 }
 
 impl Filesystem {
-    fn get_root(&self) -> &FsEntry {
-        &self.root.value
+    fn get_root(&self) -> FsEntry {
+        let root = self.tx.lookup(self.root).into_inner();
+        root.value
     }
 
     pub fn lookup(&self, name: impl Into<PathBuf>) -> Result<FsEntry> {
@@ -67,20 +70,20 @@ impl Filesystem {
             return Err(Error::PathMustBeAbsolute);
         };
 
-        let mut node: FsEntry = self.tx.lookup(self.root.ptr()).into_inner().value;
+        let mut cur_node: FsEntry = self.tx.lookup(self.root).into_inner().value;
         for component in components {
             let Component::Normal(name) = component else {
                 return Err(Error::NotSupported);
             };
 
-            if let Some(child) = self.find_child(node.children, name) {
-                node = child;
-            } else {
+            let child = cur_node.children.and_then(|c| self.find_child(c, name));
+            let Some(child) = child else {
                 return Err(Error::NotFound);
-            }
+            };
+            cur_node = child;
         }
 
-        Ok(node)
+        Ok(cur_node)
     }
 
     pub fn create_dir(&mut self, name: impl Into<PathBuf>) -> Result<FsEntry> {
@@ -91,15 +94,15 @@ impl Filesystem {
             return Err(Error::PathMustBeAbsolute);
         };
 
-        let mut node: Handle<ListNode<FsEntry>> = self.tx.lookup(self.root.ptr());
+        let mut node: Handle<ListNode<FsEntry>> = self.tx.lookup(self.root);
         for component in components {
             let Component::Normal(name) = component else {
                 return Err(Error::NotSupported);
             };
 
-            if node.value.children.is_null() {
+            if node.value.children.is_none() {
                 let new_node = self.write_fsnode(name.to_str().unwrap());
-                node.value.children = new_node.ptr();
+                node.value.children = Some(new_node.ptr());
                 self.tx.update(&node);
                 node = new_node;
             } else {
@@ -110,40 +113,42 @@ impl Filesystem {
         Ok(node.into_inner().value)
     }
 
-    fn find_child(&self, mut node: Ptr<ListNode<FsEntry>>, name: &OsStr) -> Option<FsEntry> {
+    fn find_child(&self, start_node: Ptr<ListNode<FsEntry>>, name: &OsStr) -> Option<FsEntry> {
         let name = name.to_str().unwrap();
-        while !node.is_null() {
+        let mut cur_node = Some(start_node);
+        while let Some(node) = cur_node {
             let value = self.tx.lookup(node);
             let child_name = value.value.name(&self.tx);
             if name == child_name.as_str() {
                 return Some(value.into_inner().value);
             }
-            node = value.next;
+            cur_node = value.next;
         }
         None
     }
 
     fn find_or_insert_child(
         &mut self,
-        mut node: Ptr<ListNode<FsEntry>>,
+        start_node: Ptr<ListNode<FsEntry>>,
         name: &OsStr,
     ) -> Result<Handle<ListNode<FsEntry>>> {
         let name = name.to_str().unwrap();
-        let mut prev_ptr = Ptr::null();
-        while !node.is_null() {
+        let mut prev_node = start_node;
+        let mut cur_node = Some(start_node);
+        while let Some(node) = cur_node {
             let value = self.tx.lookup(node);
             let child_name = value.value.name(&self.tx);
             if name == child_name.as_str() {
                 return Ok(value);
             }
-            prev_ptr = node;
-            node = value.next;
+            prev_node = node;
+            cur_node = value.next;
         }
-        let node = self.write_fsnode(name);
-        let mut prev_node = self.tx.lookup(prev_ptr);
-        prev_node.next = node.ptr();
+        let new_node = self.write_fsnode(name);
+        let mut prev_node = self.tx.lookup(prev_node);
+        prev_node.next = Some(new_node.ptr());
         self.tx.update(&prev_node);
-        Ok(node)
+        Ok(new_node)
     }
 
     fn write_fsnode(&mut self, name: &str) -> Handle<ListNode<FsEntry>> {
@@ -153,11 +158,11 @@ impl Filesystem {
             .write(FsEntry {
                 name: Str(name),
                 node_type: NodeType::Directory,
-                children: Ptr::null(),
+                children: None,
             })
             .into_inner();
         let node = ListNode {
-            next: Ptr::null(),
+            next: None,
             value: fs_entry.clone(),
         };
         self.tx.write(node)
@@ -170,7 +175,10 @@ impl Filesystem {
 struct FsEntry {
     name: Str,
     node_type: NodeType,
-    children: Ptr<ListNode<FsEntry>>,
+
+    #[br(parse_with = parse_optional_ptr)]
+    #[bw(write_with = write_optional_ptr)]
+    children: Option<Ptr<ListNode<FsEntry>>>,
 }
 
 impl FsEntry {
@@ -187,7 +195,9 @@ struct ListNode<T>
 where
     for<'a> T: BinRead<Args<'a> = ()> + BinWrite<Args<'a> = ()>,
 {
-    next: Ptr<ListNode<T>>,
+    #[br(parse_with = parse_optional_ptr)]
+    #[bw(write_with = write_optional_ptr)]
+    next: Option<Ptr<ListNode<T>>>,
     value: T,
 }
 

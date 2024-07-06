@@ -1,5 +1,5 @@
 use crate::page::{Addr, Error, PageOffset, PagePool, Snapshot};
-use binrw::{meta::WriteEndian, BinRead, BinWrite};
+use binrw::{meta::WriteEndian, BinRead, BinResult, BinWrite};
 use std::{
     any::type_name,
     borrow::Cow,
@@ -67,7 +67,6 @@ impl Transaction {
         T: BinRead<Args<'a> = ()> + 'static,
     {
         use binrw::BinReaderExt;
-        assert!(!ptr.is_null(), "ptr == null");
 
         let addr = ptr.addr;
         let bytes = self.read_static::<4>(addr);
@@ -136,7 +135,6 @@ impl Transaction {
         for<'a> T: BinWrite<Args<'a> = ()> + WriteEndian + Debug,
     {
         let addr = self.write_to_memory(&value, None).addr;
-
         Handle { addr, value }
     }
 
@@ -181,9 +179,9 @@ impl Transaction {
     }
 
     /// Writes object to a given address or allocates new memory for an object and writes to it
-    fn write_to_memory<T: Debug>(&mut self, value: &T, ptr: Option<Ptr<T>>) -> Ptr<T>
+    fn write_to_memory<T>(&mut self, value: &T, ptr: Option<Ptr<T>>) -> Ptr<T>
     where
-        for<'a> T: BinWrite<Args<'a> = ()> + WriteEndian,
+        for<'a> T: BinWrite<Args<'a> = ()> + WriteEndian + Debug,
     {
         let mut buffer = Cursor::new(Vec::new());
 
@@ -210,12 +208,28 @@ impl Transaction {
         ptr
     }
 
-    pub fn update<T: Debug>(&mut self, handle: &Handle<T>)
+    pub fn update<T>(&mut self, handle: &Handle<T>)
     where
-        for<'a> T: BinWrite<Args<'a> = ()> + WriteEndian,
+        for<'a> T: BinWrite<Args<'a> = ()> + WriteEndian + Debug,
     {
         self.write_to_memory(&handle.value, Some(handle.ptr()));
     }
+}
+
+#[binrw::parser(reader, endian)]
+pub fn parse_optional_ptr<T>() -> BinResult<Option<Ptr<T>>> {
+    let addr = u32::read_options(reader, endian, ())?;
+    if addr == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(Ptr::from_addr(addr)))
+    }
+}
+
+#[binrw::writer(writer, endian)]
+pub fn write_optional_ptr<T>(ptr: &Option<Ptr<T>>) -> BinResult<()> {
+    let addr = ptr.map(|p| p.addr).unwrap_or_default();
+    addr.write_options(writer, endian, ())
 }
 
 #[derive(BinRead, BinWrite)]
@@ -241,19 +255,12 @@ impl<T> Debug for Ptr<T> {
 impl<T> Copy for Ptr<T> {}
 
 impl<T> Ptr<T> {
-    fn from_addr(addr: u32) -> Self {
+    pub fn from_addr(addr: u32) -> Self {
+        assert!(addr > 0);
         Self {
             addr,
             _phantom: PhantomData::<T>,
         }
-    }
-
-    pub fn null() -> Self {
-        Self::from_addr(0)
-    }
-
-    pub fn is_null(&self) -> bool {
-        self.addr == 0
     }
 }
 
@@ -271,18 +278,11 @@ impl<T> Clone for SlicePtr<T> {
 
 impl<T> SlicePtr<T> {
     fn from_addr(addr: u32) -> Self {
+        assert!(addr > 0);
         Self {
             addr,
             _phantom: PhantomData::<T>,
         }
-    }
-
-    pub fn null() -> Self {
-        Self::from_addr(0)
-    }
-
-    pub fn is_null(&self) -> bool {
-        self.addr == 0
     }
 }
 
