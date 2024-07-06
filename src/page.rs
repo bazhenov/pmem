@@ -141,7 +141,7 @@ impl Patch {
     /// Normalize 2 patches when they are overlapping
     fn normalize_overlap(self, other: Patch) -> NormalizedPatches {
         use {NormalizedPatches::*, Patch::*};
-        assert!(self.overlaps(&other));
+        debug_assert!(self.overlaps(&other));
 
         match (self, other) {
             (Write(a_offset, a_data), Write(b_offset, b_data)) => {
@@ -168,7 +168,7 @@ impl Patch {
 
                 Merged(Write(start as u32, result_data))
             }
-            (a @ Reclaim(_, _), b @ Reclaim(_, _)) => {
+            (a @ Reclaim(..), b @ Reclaim(..)) => {
                 let offset = a.addr().min(b.addr());
                 let end = a.end().max(b.end()) as usize;
                 let len = end - offset as usize;
@@ -191,7 +191,7 @@ impl Patch {
     /// Only adjacent patches of the same type can be merged
     fn normalize_adjacency(self, other: Patch) -> NormalizedPatches {
         use {NormalizedPatches::*, Patch::*};
-        assert!(self.adjacent(&other));
+        debug_assert!(self.adjacent(&other));
 
         match self.reorder(other) {
             (Write(addr, mut a), Write(_, b)) => {
@@ -205,37 +205,35 @@ impl Patch {
 
     fn normalize_covered(self, other: Patch) -> NormalizedPatches {
         use {NormalizedPatches::*, Patch::*};
-        assert!(self.fully_covers(&other));
+
+        fn reordered_or_splitted(left: Patch, center: Patch, right: Patch) -> NormalizedPatches {
+            assert!(left.len() != 0 || right.len() != 0);
+            if left.len() == 0 {
+                Reordered(center, right)
+            } else if right.len() == 0 {
+                Reordered(left, center)
+            } else {
+                Splitted(left, center, right)
+            }
+        }
+
+        debug_assert!(self.fully_covers(&other));
 
         match (self, other) {
-            (Write(a_addr, mut bytes), b @ Reclaim(_, _)) => {
+            (Write(a_addr, mut bytes), b @ Reclaim(..)) => {
                 let split_idx = (b.addr() - a_addr) as usize + b.len();
                 let right = Write(b.end(), bytes.split_off(split_idx));
 
                 bytes.truncate(bytes.len() - b.len());
                 let left = Write(a_addr, bytes);
 
-                assert!(left.len() != 0 || right.len() != 0);
-                if left.len() == 0 {
-                    Reordered(b, right)
-                } else if right.len() == 0 {
-                    Reordered(left, b)
-                } else {
-                    Splitted(left, b, right)
-                }
+                reordered_or_splitted(left, b, right)
             }
-            (a @ Reclaim(_, _), b @ Write(_, _)) => {
+            (a @ Reclaim(..), b @ Write(..)) => {
                 let left = Reclaim(a.addr(), (b.addr() - a.addr()) as usize);
                 let right = Reclaim(b.end(), (a.end() - b.end()) as usize);
 
-                assert!(left.len() != 0 || right.len() != 0);
-                if left.len() == 0 {
-                    Reordered(b, right)
-                } else if right.len() == 0 {
-                    Reordered(left, b)
-                } else {
-                    Splitted(left, b, right)
-                }
+                reordered_or_splitted(left, b, right)
             }
             (Write(a_addr, mut a_data), Write(b_addr, b_data)) => {
                 let start = (b_addr - a_addr) as usize;
@@ -244,7 +242,7 @@ impl Patch {
 
                 Merged(Write(a_addr, a_data))
             }
-            (a @ Reclaim(_, _), Reclaim(_, _)) => Merged(a),
+            (a @ Reclaim(..), Reclaim(..)) => Merged(a),
         }
     }
 
@@ -305,20 +303,19 @@ impl NormalizedPatches {
     #[cfg(test)]
     fn len(self) -> usize {
         match self {
-            NormalizedPatches::Merged(p1) => p1.len(),
-            NormalizedPatches::Reordered(p1, p2) => p1.len() + p2.len(),
-            NormalizedPatches::Splitted(p1, p2, p3) => p1.len() + p2.len() + p3.len(),
+            Self::Merged(p1) => p1.len(),
+            Self::Reordered(p1, p2) => p1.len() + p2.len(),
+            Self::Splitted(p1, p2, p3) => p1.len() + p2.len() + p3.len(),
         }
     }
 
     #[cfg(test)]
-    pub fn iter(&self) -> impl Iterator<Item = &Patch> {
-        let slice = match self {
-            NormalizedPatches::Merged(a) => [Some(a), None, None],
-            NormalizedPatches::Reordered(a, b) => [Some(a), Some(b), None],
-            NormalizedPatches::Splitted(a, b, c) => [Some(a), Some(b), Some(c)],
-        };
-        slice.into_iter().filter_map(|i| i)
+    pub fn to_vec(&self) -> Vec<&Patch> {
+        match self {
+            Self::Merged(ref a) => vec![a],
+            Self::Reordered(ref a, ref b) => vec![a, b],
+            Self::Splitted(ref a, ref b, ref c) => vec![a, b, c],
+        }
     }
 }
 
@@ -544,7 +541,9 @@ pub struct Snapshot {
 
 impl Snapshot {
     pub fn write(&mut self, addr: Addr, bytes: &[u8]) {
-        self.push_patch(Patch::Write(addr, bytes.to_vec()))
+        if !bytes.is_empty() {
+            self.push_patch(Patch::Write(addr, bytes.to_vec()))
+        }
     }
 
     /// Frees the given segment of memory.
@@ -555,7 +554,9 @@ impl Snapshot {
     /// The main purpose of reclaim is to mark memory as not used, so it can be freed from persistent storage
     /// after snapshot compaction.
     pub fn reclaim(&mut self, addr: PageOffset, len: usize) {
-        self.push_patch(Patch::Reclaim(addr, len))
+        if len > 0 {
+            self.push_patch(Patch::Reclaim(addr, len))
+        }
     }
 
     /// Pushes a patch to a snapshot ensuring the following invariants hold:
@@ -563,6 +564,7 @@ impl Snapshot {
     /// 1. All patches are sorted by [Patch:addr()]
     /// 2. All patches are non-overlapping
     fn push_patch(&mut self, patch: Patch) {
+        assert!(patch.len() > 0, "Patch should not be empty");
         let connected = find_connected_ranges(&self.patches, &patch);
 
         if connected.is_empty() {
@@ -678,7 +680,7 @@ fn apply_patches(snapshots: &[&[Patch]], buffer: &mut [u8], range: &Range<usize>
 
             match patch {
                 Patch::Write(_, bytes) => buffer[buffer_range].copy_from_slice(&bytes[patch_range]),
-                Patch::Reclaim(_, _) => buffer[buffer_range].fill(0),
+                Patch::Reclaim(..) => buffer[buffer_range].fill(0),
             }
         }
     }
@@ -1099,6 +1101,7 @@ mod tests {
     mod proptests {
         use super::*;
         use proptest::{collection::vec, prelude::*};
+        use NormalizedPatches::*;
 
         /// The size of database for testing
         const DB_SIZE: usize = 1024;
@@ -1143,10 +1146,8 @@ mod tests {
 
             #[test]
             fn any_patches_length_should_be_positive((a, b) in patches::any_pair()) {
-                match a.normalize(b) {
-                    NormalizedPatches::Merged(a) => prop_assert!(a.len() > 0, "{:?}", a),
-                    NormalizedPatches::Reordered(a, b) => prop_assert!(a.len() > 0 && b.len() > 0, "{:?}, {:?}", a, b),
-                    NormalizedPatches::Splitted(a, b, c) => prop_assert!(a.len() > 0 && b.len() > 0 && c.len() > 0, "{:?}, {:?}, {:?}", a, b, c),
+                for patch in a.normalize(b).to_vec() {
+                    prop_assert!(patch.len() > 0, "{:?}", patch)
                 }
             }
 
@@ -1175,68 +1176,47 @@ mod tests {
             /// If B is fully covered by A, A should fully rewrite B
             #[test]
             fn covered_patches_rewrite((covering, covered) in patches::covered()) {
-                let NormalizedPatches::Merged(result) = covered.normalize(covering.clone()) else {
-                    panic!("Merged() expected");
-                };
-                prop_assert_eq!(covering, result);
+                match covered.normalize(covering.clone()) {
+                    Merged(result) => prop_assert_eq!(covering, result),
+                    r @ _ => prop_assert!(false, "Merged() expected. Got: {:?}", r),
+                }
             }
 
             #[test]
             fn covered_patches_ajacency((covering, covered) in patches::adjacent()) {
                 match covering.normalize(covered.clone()) {
-                    NormalizedPatches::Merged(_) => {}
-                    NormalizedPatches::Reordered(p1, p2) => prop_assert!(p1.adjacent(&p2)),
-                    NormalizedPatches::Splitted(p1, p2, p3) => prop_assert!(false, "Merged()/Reordered() expected. Got: {:?}, {:?}, {:?}", p1, p2, p3)
+                    Merged(_) => {}
+                    Reordered(p1, p2) =>
+                        prop_assert!(p1.adjacent(&p2), "Patches must be adjacent: {:?}, {:?}", p1, p2),
+                    r @ Splitted(..) => prop_assert!(false, "Merged()/Reordered() expected. Got: {:?}", r)
                 }
             }
 
             #[test]
             fn connected_patches_are_adjacent_after_normalization((a, b) in patches::any_connected_pair()) {
-                match a.normalize(b) {
-                    NormalizedPatches::Merged(_) => {},
-                    NormalizedPatches::Reordered(a, b) => {
-                        prop_assert!(a.end() == b.addr(), "Patches are not adjacent: {:?}, {:?}", a, b);
-                    },
-                    NormalizedPatches::Splitted(a, b, c) => {
-                        prop_assert!(a.end() == b.addr(), "Patches are not adjacent: {:?}, {:?}", a, b);
-                        prop_assert!(b.end() == c.addr(), "Patches are not adjacent: {:?}, {:?}", b, c);
-                    },
+                for p in a.normalize(b).to_vec().windows(2) {
+                    prop_assert!(p[0].adjacent(p[1]), "Patches must be adjacent: {:?}, {:?}", p[0],p[1]);
                 }
             }
 
             #[test]
             fn patches_are_ordered_after_normalization((a, b) in patches::any_pair()) {
-                match a.normalize(b) {
-                    NormalizedPatches::Merged(_) => {},
-                    NormalizedPatches::Reordered(a, b) => {
-                        prop_assert!(a.end() <= b.addr(), "Patches are not adjacent: {:?}, {:?}", a, b);
-                    },
-                    NormalizedPatches::Splitted(a, b, c) => {
-                        prop_assert!(a.end() <= b.addr(), "Patches are not adjacent: {:?}, {:?}", a, b);
-                        prop_assert!(b.end() <= c.addr(), "Patches are not adjacent: {:?}, {:?}", b, c);
-                    },
+                for p in a.normalize(b).to_vec().windows(2) {
+                    prop_assert!(p[0].end() <= p[1].addr(), "Patches must be ordered: {:?}, {:?}", p[0], p[1]);
                 }
             }
 
             #[test]
             fn patches_have_positive_length((a, b) in patches::any_pair()) {
-                for patch in a.normalize(b).iter() {
+                for patch in a.normalize(b).to_vec() {
                     prop_assert!(patch.len() > 0);
                 }
             }
 
             #[test]
             fn normalized_patches_do_not_overlaps((a, b) in patches::any_pair()) {
-                match a.normalize(b) {
-                    NormalizedPatches::Merged(_) => {},
-                    NormalizedPatches::Reordered(a, b) => {
-                        prop_assert!(!a.overlaps(&b), "Patches are overlapping: {:?}, {:?}", a, b);
-                    },
-                    NormalizedPatches::Splitted(ref a, ref b, ref c) => {
-                        for (i, j) in [(a, b), (b, c), (c, a)] {
-                            prop_assert!(!i.overlaps(j), "Patches are overlapping: {:?}, {:?}", i, j);
-                        }
-                    },
+                for p in a.normalize(b).to_vec().windows(2) {
+                    prop_assert!(!p[0].overlaps(p[1]), "Patches are overlapping: {:?}, {:?}", p[0], p[1]);
                 }
             }
 
@@ -1247,7 +1227,7 @@ mod tests {
                 let expected_len = (end - start) as usize;
 
                 let patch = a.normalize(b);
-                if let NormalizedPatches::Splitted(_, _, _) = &patch {
+                if let Splitted(..) = &patch {
                     panic!("Merged()/Reordered() extected")
                 }
                 prop_assert_eq!(patch.len(), expected_len);
