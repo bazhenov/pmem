@@ -69,7 +69,7 @@ impl Transaction {
         let addr = ptr.addr;
         let bytes = self.read_static::<4>(addr);
         let len = u32::from_be_bytes(bytes) as usize;
-        let bytes = self.read_uncommited(addr + 4, len).unwrap();
+        let bytes = self.read_uncommitted(addr + 4, len).unwrap();
         let mut cursor = Cursor::new(bytes);
         let value: T = cursor.read_ne().unwrap();
 
@@ -85,21 +85,21 @@ impl Transaction {
         let addr = ptr.addr;
         let bytes = self.read_static::<4>(addr);
         let len = u32::from_be_bytes(bytes) as usize;
-        let bytes = self.read_uncommited(addr + 4, len).unwrap();
+        let bytes = self.read_uncommitted(addr + 4, len).unwrap();
         let mut cursor = Cursor::new(bytes);
         cursor.read_ne().unwrap()
     }
 
     fn read_static<const N: usize>(&self, offset: PageOffset) -> [u8; N] {
         let mut ret = [0; N];
-        let bytes = self.read_uncommited(offset, N).unwrap();
+        let bytes = self.read_uncommitted(offset, N).unwrap();
         for (to, from) in ret.iter_mut().zip(bytes.iter()) {
             *to = *from;
         }
         ret
     }
 
-    fn read_uncommited(&self, addr: PageOffset, len: usize) -> Result<Cow<[u8]>> {
+    fn read_uncommitted(&self, addr: PageOffset, len: usize) -> Result<Cow<[u8]>> {
         self.snapshot.read(addr, len)
     }
 
