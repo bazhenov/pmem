@@ -22,7 +22,7 @@ fn structs() {
 #[test]
 fn generic_structs() {
     #[derive(Record)]
-    struct A<T> {
+    struct A<T: Record> {
         _a: T,
     }
     assert_eq!(A::<u32>::SIZE, 4)

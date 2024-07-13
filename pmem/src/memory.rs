@@ -331,6 +331,28 @@ pub trait Record: Sized {
     fn write(&self, data: &mut [u8]) -> Result<()>;
 }
 
+macro_rules! impl_record_for_primitive {
+    ($($t:ty),*) => {
+        $(
+            impl Record for $t {
+                const SIZE: usize = mem::size_of::<Self>();
+
+                fn read(data: &[u8]) -> Result<Self> {
+                    Ok(<$t>::from_le_bytes(data.try_into()?))
+                }
+
+                fn write(&self, data: &mut [u8]) -> Result<()> {
+                    data[..mem::size_of::<Self>()].copy_from_slice(self.to_le_bytes().as_slice());
+                    Ok(())
+                }
+            }
+        )*
+    };
+}
+
+impl_record_for_primitive!(u8, u16, u32, u64);
+impl_record_for_primitive!(i8, i16, i32, i64);
+
 impl<T> Record for Option<Ptr<T>> {
     // const SIZE: usize = <Ptr<T> as Record>::SIZE;
     //

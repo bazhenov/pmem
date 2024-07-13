@@ -14,14 +14,6 @@ pub fn derive_record(input: TokenStream) -> TokenStream {
         _ => panic!("Record can only be derived for structs"),
     };
 
-    // Generate the sum of the sizes of all fields
-    let size_sum = fields.iter().map(|field| {
-        let ty = &field.ty;
-        quote! {
-            std::mem::size_of::<#ty>()
-        }
-    });
-
     // Finding the name of the pmem crate at the callsite
     let pmem_crate = crate_name("pmem").expect("pmem is not present in `Cargo.toml`");
     let pmem = match pmem_crate {
@@ -32,15 +24,30 @@ pub fn derive_record(input: TokenStream) -> TokenStream {
         }
     };
 
+    // Generate the sum of the sizes of all fields
+    let size_sum = fields.iter().map(|field| {
+        let ty = &field.ty;
+        quote! { std::mem::size_of::<#ty>() }
+    });
+
+    // Generate the sum of the sizes of all fields
+    let read_fields = fields.iter().map(|field| {
+        let ty = &field.ty;
+        quote! {
+            let v = <#ty as #pmem::memory::Record>::read(input)?;
+        }
+    });
+
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
 
     // Generate the impl block
     let name = input.ident;
     let expanded = quote! {
         impl #impl_generics #pmem::memory::Record for #name #ty_generics #where_clause {
-            const SIZE: usize = 0 #( + #size_sum )*;
+            const SIZE: usize = #(#size_sum )+*;
 
-            fn read(data: &[u8]) -> std::result::Result<Self, #pmem::memory::Error> {
+            fn read(input: &[u8]) -> std::result::Result<Self, #pmem::memory::Error> {
+                #(#read_fields)*
                 todo!()
             }
             fn write(&self, data: &mut [u8]) -> std::result::Result<(), #pmem::memory::Error> {
