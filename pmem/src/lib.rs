@@ -1,9 +1,9 @@
 pub mod fs;
-mod memory;
+pub mod memory;
 pub mod page;
 
 pub use memory::{
-    parse_optional_ptr, write_optional_ptr, Handle, Memory, Ptr, Storable, Transaction,
+    parse_optional_ptr, write_optional_ptr, Handle, Memory, Ptr, Record, Storable, Transaction,
 };
 pub use page::Addr;
 

@@ -2,6 +2,7 @@ use crate::page::{self, Addr, PageOffset, PagePool, Snapshot};
 use binrw::{meta::WriteEndian, BinRead, BinResult, BinWrite};
 use std::{
     any::type_name,
+    array::TryFromSliceError,
     borrow::Cow,
     fmt::{self, Debug},
     io::{Cursor, Seek, SeekFrom, Write},
@@ -29,6 +30,9 @@ pub enum Error {
 
     #[error("Binrw Error")]
     BinrwError(#[from] binrw::Error),
+
+    #[error("Out of Bounds Read")]
+    OutOfBoundsRead(#[from] TryFromSliceError),
 }
 
 impl Memory {
@@ -319,6 +323,31 @@ impl<T> Debug for SlicePtr<T> {
 /// Need to implement Copy manually, because derive(Copy) is automatically
 /// adding `T: Copy` bound in auto-generated implementation
 impl<T> Copy for SlicePtr<T> {}
+
+pub trait Record: Sized {
+    const SIZE: usize;
+
+    fn read(data: &[u8]) -> Result<Self>;
+    fn write(&self, data: &mut [u8]) -> Result<()>;
+}
+
+impl<T> Record for Option<Ptr<T>> {
+    // const SIZE: usize = <Ptr<T> as Record>::SIZE;
+    //
+    const SIZE: usize = 4;
+
+    fn read(data: &[u8]) -> Result<Self> {
+        let addr = u32::from_le_bytes(data[0..4].try_into()?);
+        let ptr = Some(addr).filter(|addr| *addr > 0).map(Ptr::from_addr);
+        Ok(ptr)
+    }
+
+    fn write(&self, data: &mut [u8]) -> Result<()> {
+        let mut c = Cursor::new(data);
+        let addr = self.map(|ptr| ptr.addr).unwrap_or(0);
+        Ok(addr.write_le(&mut c)?)
+    }
+}
 
 pub trait Storable {
     type Seed: Sized;
