@@ -1,4 +1,4 @@
-use crate::page::{Addr, Error, PageOffset, PagePool, Snapshot};
+use crate::page::{self, Addr, PageOffset, PagePool, Snapshot};
 use binrw::{meta::WriteEndian, BinRead, BinResult, BinWrite};
 use std::{
     any::type_name,
@@ -21,6 +21,15 @@ pub struct Memory {
 }
 
 type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("Page error")]
+    PageError(#[from] page::Error),
+
+    #[error("Binrw Error")]
+    BinrwError(#[from] binrw::Error),
+}
 
 impl Memory {
     pub fn commit(&mut self, tx: Transaction) {
@@ -74,11 +83,12 @@ impl Transaction {
         let bytes = self.read_uncommitted(addr + 4, len).unwrap();
         let mut cursor = Cursor::new(bytes);
         let value: T = cursor.read_ne().unwrap();
+        let size = len + 4;
 
-        Handle { addr, value }
+        Handle { addr, value, size }
     }
 
-    pub fn read<T>(&self, ptr: Ptr<T>) -> T
+    pub fn read<T>(&self, ptr: Ptr<T>) -> Result<T>
     where
         for<'a> T: BinRead<Args<'a> = ()>,
     {
@@ -89,7 +99,7 @@ impl Transaction {
         let len = u32::from_be_bytes(bytes) as usize;
         let bytes = self.read_uncommitted(addr + 4, len).unwrap();
         let mut cursor = Cursor::new(bytes);
-        cursor.read_ne().unwrap()
+        Ok(cursor.read_ne()?)
     }
 
     pub fn read_slice<T>(&self, ptr: SlicePtr<T>) -> Vec<T>
@@ -120,7 +130,7 @@ impl Transaction {
     }
 
     fn read_uncommitted(&self, addr: PageOffset, len: usize) -> Result<Cow<[u8]>> {
-        self.snapshot.read(addr, len)
+        Ok(self.snapshot.read(addr, len)?)
     }
 
     fn alloc(&mut self, size: usize) -> Addr {
@@ -134,8 +144,9 @@ impl Transaction {
     where
         for<'a> T: BinWrite<Args<'a> = ()> + WriteEndian + Debug,
     {
-        let addr = self.write_to_memory(&value, None).addr;
-        Handle { addr, value }
+        let (ptr, size) = self.write_to_memory(&value, None);
+        let addr = ptr.addr;
+        Handle { addr, value, size }
     }
 
     pub fn write_slice<T>(&mut self, value: &[T]) -> SlicePtr<T>
@@ -179,7 +190,8 @@ impl Transaction {
     }
 
     /// Writes object to a given address or allocates new memory for an object and writes to it
-    fn write_to_memory<T>(&mut self, value: &T, ptr: Option<Ptr<T>>) -> Ptr<T>
+    /// Returns the pointer and the size of the block
+    fn write_to_memory<T>(&mut self, value: &T, ptr: Option<Ptr<T>>) -> (Ptr<T>, usize)
     where
         for<'a> T: BinWrite<Args<'a> = ()> + WriteEndian + Debug,
     {
@@ -205,7 +217,7 @@ impl Transaction {
         let buffer = buffer.into_inner();
         self.write_bytes(ptr.addr, &buffer);
 
-        ptr
+        (ptr, size)
     }
 
     pub fn update<T>(&mut self, handle: &Handle<T>)
@@ -213,6 +225,14 @@ impl Transaction {
         for<'a> T: BinWrite<Args<'a> = ()> + WriteEndian + Debug,
     {
         self.write_to_memory(&handle.value, Some(handle.ptr()));
+    }
+
+    pub fn reclaim<T>(&mut self, handle: Handle<T>) -> T
+    where
+        for<'a> T: BinWrite<Args<'a> = ()> + WriteEndian + Debug,
+    {
+        self.snapshot.reclaim(handle.addr, handle.size);
+        handle.into_inner()
     }
 }
 
@@ -310,6 +330,7 @@ pub trait Storable {
 
 pub struct Handle<T> {
     addr: Addr,
+    size: usize,
     value: T,
 }
 
@@ -347,6 +368,11 @@ mod tests {
 
     const PTR_SIZE: usize = 4;
 
+    // Helper container used for testing read/writes
+    #[derive(BinRead, BinWrite, PartialEq, Debug)]
+    #[brw(little)]
+    struct Value(u32);
+
     /// This test ensures that the size of Ptr is fixed, regardless of its parameter type
     #[test]
     fn check_ptr_size() {
@@ -355,30 +381,40 @@ mod tests {
     }
 
     #[test]
-    fn read_write_ptr() {
-        #[derive(BinRead, BinWrite, PartialEq, Debug)]
-        #[brw(little)]
-        struct Value(u32);
-        let mem = Memory::default();
-        let mut tx = mem.start();
+    fn read_write_ptr() -> Result<()> {
+        let (mut tx, _) = start();
 
         let value = Value(42);
         let handle = tx.write(value);
-        let value_copy = tx.read(handle.ptr());
+        let value_copy = tx.read(handle.ptr())?;
         assert_eq!(&value_copy, &*handle);
+        Ok(())
     }
 
     #[test]
     fn read_write_slice() {
-        #[derive(BinRead, BinWrite, PartialEq, Debug)]
-        #[brw(little)]
-        struct Value(u32);
-        let mem = Memory::default();
-        let mut tx = mem.start();
+        let (mut tx, _) = start();
 
         let value: &[u8] = &[0, 1, 2, 3, 4, 5];
         let slice = tx.write_slice(value);
         let value_copy = tx.read_slice(slice);
         assert_eq!(value_copy, value);
+    }
+
+    #[test]
+    fn reclaim() -> Result<()> {
+        let (mut tx, _) = start();
+
+        let handle = tx.write(Value(42));
+        let ptr = handle.ptr();
+        tx.reclaim(handle);
+        let resulr = tx.read(ptr);
+        assert!(resulr.is_err(), "Error should be generated");
+        Ok(())
+    }
+
+    fn start() -> (Transaction, Memory) {
+        let mem = Memory::default();
+        (mem.start(), mem)
     }
 }
