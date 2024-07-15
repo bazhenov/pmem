@@ -354,8 +354,6 @@ impl_record_for_primitive!(u8, u16, u32, u64);
 impl_record_for_primitive!(i8, i16, i32, i64);
 
 impl<T> Record for Option<Ptr<T>> {
-    // const SIZE: usize = <Ptr<T> as Record>::SIZE;
-    //
     const SIZE: usize = 4;
 
     fn read(data: &[u8]) -> Result<Self> {
