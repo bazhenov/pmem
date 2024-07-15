@@ -1,15 +1,15 @@
-use pmem_derive::Record;
-
 use crate::{memory::SlicePtr, Handle, Ptr, Storable, Transaction};
+use pmem_derive::Record;
 use std::{
     ffi::OsStr,
     fmt,
     path::{Component, Path, PathBuf},
+    string::FromUtf8Error,
 };
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[derive(thiserror::Error, Debug, PartialEq)]
+#[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error("not found")]
     NotFound,
@@ -22,6 +22,12 @@ pub enum Error {
 
     #[error("already exists")]
     AlreadyExists,
+
+    #[error("pmem error")]
+    PMemError(#[from] crate::memory::Error),
+
+    #[error("Invalid utf8 encoding")]
+    Utf8(#[from] FromUtf8Error),
 }
 
 struct Filesystem {
@@ -39,7 +45,7 @@ impl Storable for Filesystem {
     type Seed = VolumeInfo;
 
     fn open(tx: Transaction, volume: Ptr<Self::Seed>) -> Self {
-        let volume = tx.lookup(volume);
+        let volume = tx.lookup(volume).unwrap();
         Self { volume, tx }
     }
 
@@ -68,7 +74,7 @@ impl Filesystem {
     }
 
     fn get_root_handle(&self) -> Handle<FileInfo> {
-        self.tx.lookup(self.volume.root)
+        self.tx.lookup(self.volume.root).unwrap()
     }
 
     pub fn lookup(&self, path: impl AsRef<Path>) -> Result<Option<FileInfo>> {
@@ -83,7 +89,10 @@ impl Filesystem {
                 return Err(Error::NotSupported);
             };
 
-            let child = cur_node.children.and_then(|c| self.find_child(c, name));
+            let Some(children) = cur_node.children else {
+                return Ok(None);
+            };
+            let child = self.find_child(children, name)?;
             let Some(child) = child else {
                 return Ok(None);
             };
@@ -110,7 +119,10 @@ impl Filesystem {
             };
 
             let current_node = target_node.node;
-            let child = current_node.children.and_then(|c| self.find_child(c, name));
+            let Some(children) = current_node.children else {
+                return Err(Error::NotFound);
+            };
+            let child = self.find_child(children, name)?;
             let Some(child) = child else {
                 return Err(Error::NotFound);
             };
@@ -165,20 +177,24 @@ impl Filesystem {
         Ok(node.into_inner())
     }
 
-    fn find_child(&self, start_node: Ptr<FileInfo>, name: &OsStr) -> Option<FileInfoReferent> {
+    fn find_child(
+        &self,
+        start_node: Ptr<FileInfo>,
+        name: &OsStr,
+    ) -> Result<Option<FileInfoReferent>> {
         let name = name.to_str().unwrap();
         let mut cur_node = Some(start_node);
         let mut referent = None;
         while let Some(node) = cur_node {
-            let node = self.tx.lookup(node);
-            let child_name = node.name(&self.tx);
+            let node = self.tx.lookup(node)?;
+            let child_name = node.name(&self.tx)?;
             if name == child_name.as_str() {
-                return Some(FileInfoReferent { referent, node });
+                return Ok(Some(FileInfoReferent { referent, node }));
             }
             cur_node = node.next;
             referent = Some(node);
         }
-        None
+        Ok(None)
     }
 
     fn find_or_insert_child(
@@ -190,8 +206,8 @@ impl Filesystem {
         let mut prev_node = start_node;
         let mut cur_node = Some(start_node);
         while let Some(node) = cur_node {
-            let value = self.tx.lookup(node);
-            let child_name = value.name(&self.tx);
+            let value = self.tx.lookup(node)?;
+            let child_name = value.name(&self.tx)?;
             if name == child_name.as_str() {
                 return Ok(value);
             }
@@ -199,7 +215,7 @@ impl Filesystem {
             cur_node = value.next;
         }
         let new_node = self.write_fsnode(name);
-        let mut prev_node = self.tx.lookup(prev_node);
+        let mut prev_node = self.tx.lookup(prev_node)?;
         prev_node.next = Some(new_node.ptr());
         self.tx.update(&prev_node);
         Ok(new_node)
@@ -238,9 +254,9 @@ struct FileInfo {
 }
 
 impl FileInfo {
-    fn name(&self, tx: &Transaction) -> String {
-        let bytes = tx.read_slice(self.name.0);
-        String::from_utf8(bytes).unwrap()
+    fn name(&self, tx: &Transaction) -> Result<String> {
+        let bytes = tx.read_slice(self.name.0)?;
+        Ok(String::from_utf8(bytes)?)
     }
 }
 
@@ -291,7 +307,7 @@ mod tests {
 
         let tx = &fs.tx;
         let root = fs.get_root();
-        assert_eq!(root.name(&tx), "/");
+        assert_eq!(root.name(&tx)?, "/");
         assert_eq!(root.node_type, NodeType::Directory.into());
 
         let node = fs.lookup("/foo")?;
@@ -309,7 +325,7 @@ mod tests {
 
         let tx = &fs.tx;
         let node = fs.lookup("/etc")?.expect("/etc should be found");
-        assert_eq!(node.name(&tx), "etc");
+        assert_eq!(node.name(&tx)?, "etc");
         assert_eq!(node.node_type, NodeType::Directory.into());
 
         Ok(())
@@ -325,7 +341,7 @@ mod tests {
 
         let tx = &fs.tx;
         let node = fs.lookup("/usr/bin")?.expect("/usr/bin should be found");
-        assert_eq!(node.name(&tx), "bin");
+        assert_eq!(node.name(&tx)?, "bin");
         assert_eq!(node.node_type, NodeType::Directory.into());
 
         Ok(())

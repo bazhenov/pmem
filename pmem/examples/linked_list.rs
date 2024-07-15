@@ -35,7 +35,7 @@ impl Storable for LinkedList {
     type Seed = LinkedListNode;
 
     fn open(tx: Transaction, ptr: Ptr<Self::Seed>) -> Self {
-        let root = tx.lookup(ptr);
+        let root = tx.lookup(ptr).unwrap();
         Self { tx, root, ptr }
     }
 
@@ -71,7 +71,7 @@ impl LinkedList {
         let mut len = 0;
         while let Some(node) = cur_node {
             len += 1;
-            cur_node = self.tx.lookup(node).next;
+            cur_node = self.tx.lookup(node).unwrap().next;
         }
         len
     }
@@ -100,7 +100,7 @@ impl<'a> Iterator for ListIterator<'a> {
         let Some(ptr) = self.ptr else {
             return None;
         };
-        let node = self.tx.lookup(ptr);
+        let node = self.tx.lookup(ptr).unwrap();
         self.ptr = node.next;
         Some(node.value)
     }

@@ -29,6 +29,9 @@ pub enum Error {
 
     #[error("Out of Bounds Read")]
     OutOfBoundsRead(#[from] TryFromSliceError),
+
+    #[error("Null pointer")]
+    NullPointer,
 }
 
 impl Memory {
@@ -71,32 +74,30 @@ impl Transaction {
         self.snapshot.write(addr, bytes)
     }
 
-    pub fn lookup<'a, T: Record>(&self, ptr: Ptr<T>) -> Handle<T> {
+    pub fn lookup<'a, T: Record>(&self, ptr: Ptr<T>) -> Result<Handle<T>> {
         let addr = ptr.addr;
         let bytes = self.read_uncommitted(addr, T::SIZE).unwrap();
-        let value = T::read(&*bytes).unwrap();
+        let value = T::read(&*bytes)?;
         let size = T::SIZE;
 
-        Handle { addr, value, size }
+        Ok(Handle { addr, value, size })
     }
 
     pub fn read<T: Record>(&self, ptr: Ptr<T>) -> Result<T> {
-        Ok(self.lookup(ptr).into_inner())
+        Ok(self.lookup(ptr)?.into_inner())
     }
 
-    pub fn read_slice<T: Record>(&self, ptr: SlicePtr<T>) -> Vec<T> {
+    pub fn read_slice<T: Record>(&self, ptr: SlicePtr<T>) -> Result<Vec<T>> {
         let addr = ptr.0.addr;
         let items = self.read_static::<SLICE_HEADER_SIZE>(addr);
 
         let items = u32::from_le_bytes(items) as usize;
-        let bytes = self
-            .read_uncommitted(addr + SLICE_HEADER_SIZE as u32, items * T::SIZE)
-            .unwrap();
+        let bytes = self.read_uncommitted(addr + SLICE_HEADER_SIZE as u32, items * T::SIZE)?;
         let mut result = Vec::with_capacity(items);
         for chunk in bytes.chunks(T::SIZE) {
-            result.push(T::read(chunk).unwrap());
+            result.push(T::read(chunk)?);
         }
-        result
+        Ok(result)
     }
 
     fn read_static<const N: usize>(&self, offset: PageOffset) -> [u8; N] {
@@ -141,7 +142,7 @@ impl Transaction {
         }
 
         let size = buffer.len();
-        let ptr = SlicePtr(Ptr::from_addr(self.alloc(size)));
+        let ptr = SlicePtr::from_addr(self.alloc(size)).unwrap();
         self.write_bytes(ptr.0.addr, &buffer);
         ptr
     }
@@ -196,12 +197,11 @@ impl<T> Debug for Ptr<T> {
 impl<T> Copy for Ptr<T> {}
 
 impl<T> Ptr<T> {
-    pub fn from_addr(addr: u32) -> Self {
-        assert!(addr > 0);
-        Self {
+    pub fn from_addr(addr: u32) -> Option<Self> {
+        (addr > 0).then(|| Self {
             addr,
             _phantom: PhantomData::<T>,
-        }
+        })
     }
 }
 
@@ -215,8 +215,8 @@ impl<T> Clone for SlicePtr<T> {
 }
 
 impl<T> SlicePtr<T> {
-    fn from_addr(addr: u32) -> Self {
-        Self(Ptr::from_addr(addr))
+    fn from_addr(addr: u32) -> Option<Self> {
+        Ptr::from_addr(addr).map(Self)
     }
 }
 
@@ -268,7 +268,7 @@ impl<T> Record for Option<Ptr<T>> {
 
     fn read(data: &[u8]) -> Result<Self> {
         let addr = u32::from_le_bytes(data[0..4].try_into()?);
-        let ptr = Some(addr).filter(|addr| *addr > 0).map(Ptr::from_addr);
+        let ptr = Some(addr).filter(|addr| *addr > 0).and_then(Ptr::from_addr);
         Ok(ptr)
     }
 
@@ -284,7 +284,7 @@ impl<T> Record for Ptr<T> {
 
     fn read(data: &[u8]) -> Result<Self> {
         let addr = u32::from_le_bytes(data[0..4].try_into()?);
-        Ok(Ptr::from_addr(addr))
+        Ptr::from_addr(addr).ok_or(Error::NullPointer)
     }
 
     fn write(&self, data: &mut [u8]) -> Result<()> {
@@ -366,13 +366,28 @@ mod tests {
     }
 
     #[test]
-    fn read_write_slice() {
+    fn read_write_slice() -> Result<()> {
         let (mut tx, _) = start();
 
         let value: &[u8] = &[0, 1, 2, 3, 4, 5];
         let slice = tx.write_slice(value);
-        let value_copy = tx.read_slice(slice);
+        let value_copy = tx.read_slice(slice)?;
         assert_eq!(value_copy, value);
+        Ok(())
+    }
+
+    #[test]
+    fn check_error() {
+        let (tx, _) = start();
+
+        #[derive(Debug, Record)]
+        struct Data {
+            ptr: Ptr<Data>,
+        }
+
+        // reading from made up address
+        let value = tx.read(Ptr::<Data>::from_addr(0xFF).unwrap());
+        assert!(value.is_err(), "Err should be generated");
     }
 
     #[test]
