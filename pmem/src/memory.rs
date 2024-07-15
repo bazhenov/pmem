@@ -1,11 +1,10 @@
 use crate::page::{self, Addr, PageOffset, PagePool, Snapshot};
-use binrw::{meta::WriteEndian, BinRead, BinResult, BinWrite};
+use pmem_derive::Record;
 use std::{
     any::type_name,
     array::TryFromSliceError,
     borrow::Cow,
     fmt::{self, Debug},
-    io::{Cursor, Seek, SeekFrom, Write},
     marker::PhantomData,
     mem,
     ops::{Deref, DerefMut},
@@ -13,7 +12,7 @@ use std::{
 const START_ADDR: PageOffset = 4;
 
 /// The size of a header of each entity written to storage
-const HEADER_SIZE: usize = mem::size_of::<u32>();
+const SLICE_HEADER_SIZE: usize = mem::size_of::<u32>();
 
 pub struct Memory {
     pool: PagePool,
@@ -27,9 +26,6 @@ type Result<T> = std::result::Result<T, Error>;
 pub enum Error {
     #[error("Page error")]
     PageError(#[from] page::Error),
-
-    #[error("Binrw Error")]
-    BinrwError(#[from] binrw::Error),
 
     #[error("Out of Bounds Read")]
     OutOfBoundsRead(#[from] TryFromSliceError),
@@ -75,51 +71,30 @@ impl Transaction {
         self.snapshot.write(addr, bytes)
     }
 
-    pub fn lookup<'a, T>(&self, ptr: Ptr<T>) -> Handle<T>
-    where
-        T: BinRead<Args<'a> = ()> + 'static,
-    {
-        use binrw::BinReaderExt;
-
+    pub fn lookup<'a, T: Record>(&self, ptr: Ptr<T>) -> Handle<T> {
         let addr = ptr.addr;
-        let bytes = self.read_static::<4>(addr);
-        let len = u32::from_be_bytes(bytes) as usize;
-        let bytes = self.read_uncommitted(addr + 4, len).unwrap();
-        let mut cursor = Cursor::new(bytes);
-        let value: T = cursor.read_ne().unwrap();
-        let size = len + 4;
+        let bytes = self.read_uncommitted(addr, T::SIZE).unwrap();
+        let value = T::read(&*bytes).unwrap();
+        let size = T::SIZE;
 
         Handle { addr, value, size }
     }
 
-    pub fn read<T>(&self, ptr: Ptr<T>) -> Result<T>
-    where
-        for<'a> T: BinRead<Args<'a> = ()>,
-    {
-        use binrw::BinReaderExt;
-
-        let addr = ptr.addr;
-        let bytes = self.read_static::<4>(addr);
-        let len = u32::from_be_bytes(bytes) as usize;
-        let bytes = self.read_uncommitted(addr + 4, len).unwrap();
-        let mut cursor = Cursor::new(bytes);
-        Ok(cursor.read_ne()?)
+    pub fn read<T: Record>(&self, ptr: Ptr<T>) -> Result<T> {
+        Ok(self.lookup(ptr).into_inner())
     }
 
-    pub fn read_slice<T>(&self, ptr: SlicePtr<T>) -> Vec<T>
-    where
-        for<'a> T: BinRead<Args<'a> = ()>,
-    {
-        use binrw::BinReaderExt;
+    pub fn read_slice<T: Record>(&self, ptr: SlicePtr<T>) -> Vec<T> {
+        let addr = ptr.0.addr;
+        let items = self.read_static::<SLICE_HEADER_SIZE>(addr);
 
-        let addr = ptr.addr;
-        let bytes = self.read_static::<4>(addr);
-        let len = u32::from_be_bytes(bytes) as usize;
-        let bytes = self.read_uncommitted(addr + 4, len).unwrap();
-        let mut result = Vec::with_capacity(len);
-        for item in bytes.chunks(mem::size_of::<T>()) {
-            let mut cursor = Cursor::new(item);
-            result.push(cursor.read_ne().unwrap());
+        let items = u32::from_le_bytes(items) as usize;
+        let bytes = self
+            .read_uncommitted(addr + SLICE_HEADER_SIZE as u32, items * T::SIZE)
+            .unwrap();
+        let mut result = Vec::with_capacity(items);
+        for chunk in bytes.chunks(T::SIZE) {
+            result.push(T::read(chunk).unwrap());
         }
         result
     }
@@ -144,119 +119,61 @@ impl Transaction {
         addr
     }
 
-    pub fn write<T>(&mut self, value: T) -> Handle<T>
-    where
-        for<'a> T: BinWrite<Args<'a> = ()> + WriteEndian + Debug,
-    {
+    pub fn write<T: Record>(&mut self, value: T) -> Handle<T> {
         let (ptr, size) = self.write_to_memory(&value, None);
         let addr = ptr.addr;
         Handle { addr, value, size }
     }
 
-    pub fn write_slice<T>(&mut self, value: &[T]) -> SlicePtr<T>
-    where
-        for<'a> T: BinWrite<Args<'a> = ()> + WriteEndian,
-    {
+    pub fn write_slice<T: Record>(&mut self, value: &[T]) -> SlicePtr<T> {
         assert!(value.len() <= PageOffset::MAX as usize);
-        let mut buffer = Cursor::new(Vec::new());
+        let mut buffer = vec![0u8; SLICE_HEADER_SIZE + T::SIZE * value.len()];
 
-        // reserving space at the beginning for the header
-        buffer.write_all(&[0; HEADER_SIZE]).unwrap();
+        (value.len() as u32)
+            .write(&mut buffer[0..SLICE_HEADER_SIZE])
+            .unwrap();
 
-        // writing body
-        for v in value {
-            let before = buffer.position();
-            v.write(&mut buffer).unwrap();
-            let after = buffer.position();
-            let size = after - before;
-            assert!(
-                size == mem::size_of::<T>() as u64,
-                "Serialized size should be the same as size in memory"
-            );
+        for (v, chunk) in value
+            .iter()
+            .zip(buffer[SLICE_HEADER_SIZE..].chunks_mut(T::SIZE))
+        {
+            v.write(chunk).unwrap();
         }
 
-        let size = buffer.position() as usize;
-        let ptr = SlicePtr {
-            addr: self.alloc(size),
-            _phantom: PhantomData::<T>,
-        };
-
-        // writing header with the entity size
-        buffer.seek(SeekFrom::Start(0)).unwrap();
-        (value.len() as PageOffset).write_be(&mut buffer).unwrap();
-        // Making sure we didn't overwrite data by the header
-        assert!(buffer.position() == HEADER_SIZE as u64);
-
-        let buffer = buffer.into_inner();
-        self.write_bytes(ptr.addr, &buffer);
-
+        let size = buffer.len();
+        let ptr = SlicePtr(Ptr::from_addr(self.alloc(size)));
+        self.write_bytes(ptr.0.addr, &buffer);
         ptr
     }
 
     /// Writes object to a given address or allocates new memory for an object and writes to it
     /// Returns the pointer and the size of the block
-    fn write_to_memory<T>(&mut self, value: &T, ptr: Option<Ptr<T>>) -> (Ptr<T>, usize)
-    where
-        for<'a> T: BinWrite<Args<'a> = ()> + WriteEndian + Debug,
-    {
-        let mut buffer = Cursor::new(Vec::new());
-
-        // reserving space at the beginning for the header
-        buffer.write_all(&[0; HEADER_SIZE]).unwrap();
+    fn write_to_memory<T: Record>(&mut self, value: &T, ptr: Option<Ptr<T>>) -> (Ptr<T>, usize) {
+        let mut buffer = vec![0u8; T::SIZE];
 
         // writing body
         value.write(&mut buffer).unwrap();
-        let size = buffer.position() as usize;
+        let size = buffer.len();
         let ptr = ptr.unwrap_or_else(|| Ptr {
             addr: self.alloc(size),
             _phantom: PhantomData::<T>,
         });
 
-        // writing header with the entity size
-        buffer.seek(SeekFrom::Start(0)).unwrap();
-        (size as PageOffset).write_be(&mut buffer).unwrap();
-        // Making sure we didn't overwrite data by the header
-        assert!(buffer.position() == HEADER_SIZE as u64);
-
-        let buffer = buffer.into_inner();
         self.write_bytes(ptr.addr, &buffer);
 
         (ptr, size)
     }
 
-    pub fn update<T>(&mut self, handle: &Handle<T>)
-    where
-        for<'a> T: BinWrite<Args<'a> = ()> + WriteEndian + Debug,
-    {
+    pub fn update<T: Record>(&mut self, handle: &Handle<T>) {
         self.write_to_memory(&handle.value, Some(handle.ptr()));
     }
 
-    pub fn reclaim<T>(&mut self, handle: Handle<T>) -> T
-    where
-        for<'a> T: BinWrite<Args<'a> = ()> + WriteEndian + Debug,
-    {
+    pub fn reclaim<T>(&mut self, handle: Handle<T>) -> T {
         self.snapshot.reclaim(handle.addr, handle.size);
         handle.into_inner()
     }
 }
 
-#[binrw::parser(reader, endian)]
-pub fn parse_optional_ptr<T>() -> BinResult<Option<Ptr<T>>> {
-    let addr = u32::read_options(reader, endian, ())?;
-    if addr == 0 {
-        Ok(None)
-    } else {
-        Ok(Some(Ptr::from_addr(addr)))
-    }
-}
-
-#[binrw::writer(writer, endian)]
-pub fn write_optional_ptr<T>(ptr: &Option<Ptr<T>>) -> BinResult<()> {
-    let addr = ptr.map(|p| p.addr).unwrap_or_default();
-    addr.write_options(writer, endian, ())
-}
-
-#[derive(BinRead, BinWrite)]
 pub struct Ptr<T> {
     addr: u32,
     _phantom: PhantomData<T>,
@@ -288,11 +205,8 @@ impl<T> Ptr<T> {
     }
 }
 
-#[derive(BinRead, BinWrite)]
-pub struct SlicePtr<T> {
-    addr: u32,
-    _phantom: PhantomData<T>,
-}
+#[derive(Record)]
+pub struct SlicePtr<T>(Ptr<T>);
 
 impl<T> Clone for SlicePtr<T> {
     fn clone(&self) -> Self {
@@ -302,11 +216,7 @@ impl<T> Clone for SlicePtr<T> {
 
 impl<T> SlicePtr<T> {
     fn from_addr(addr: u32) -> Self {
-        assert!(addr > 0);
-        Self {
-            addr,
-            _phantom: PhantomData::<T>,
-        }
+        Self(Ptr::from_addr(addr))
     }
 }
 
@@ -315,7 +225,7 @@ impl<T> Debug for SlicePtr<T> {
         f.write_fmt(format_args!(
             "SlicePtr<{}>({})",
             type_name::<T>(),
-            &self.addr
+            &self.0.addr
         ))
     }
 }
@@ -342,7 +252,7 @@ macro_rules! impl_record_for_primitive {
                 }
 
                 fn write(&self, data: &mut [u8]) -> Result<()> {
-                    data[..mem::size_of::<Self>()].copy_from_slice(self.to_le_bytes().as_slice());
+                    data.copy_from_slice(self.to_le_bytes().as_slice());
                     Ok(())
                 }
             }
@@ -363,9 +273,24 @@ impl<T> Record for Option<Ptr<T>> {
     }
 
     fn write(&self, data: &mut [u8]) -> Result<()> {
-        let mut c = Cursor::new(data);
-        let addr = self.map(|ptr| ptr.addr).unwrap_or(0);
-        Ok(addr.write_le(&mut c)?)
+        let bytes = self.map(|ptr| ptr.addr).unwrap_or(0).to_le_bytes();
+        data.copy_from_slice(bytes.as_slice());
+        Ok(())
+    }
+}
+
+impl<T> Record for Ptr<T> {
+    const SIZE: usize = 4;
+
+    fn read(data: &[u8]) -> Result<Self> {
+        let addr = u32::from_le_bytes(data[0..4].try_into()?);
+        Ok(Ptr::from_addr(addr))
+    }
+
+    fn write(&self, data: &mut [u8]) -> Result<()> {
+        let bytes = self.addr.to_le_bytes();
+        data.copy_from_slice(bytes.as_slice());
+        Ok(())
     }
 }
 
@@ -413,13 +338,13 @@ impl<T> DerefMut for Handle<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pmem_derive::Record;
     use std::mem;
 
     const PTR_SIZE: usize = 4;
 
     // Helper container used for testing read/writes
-    #[derive(BinRead, BinWrite, PartialEq, Debug)]
-    #[brw(little)]
+    #[derive(Record, PartialEq, Debug)]
     struct Value(u32);
 
     /// This test ensures that the size of Ptr is fixed, regardless of its parameter type
@@ -457,8 +382,9 @@ mod tests {
         let handle = tx.write(Value(42));
         let ptr = handle.ptr();
         tx.reclaim(handle);
-        let resulr = tx.read(ptr);
-        assert!(resulr.is_err(), "Error should be generated");
+        let result = tx.read(ptr)?;
+        // should be zero, because we use zero-fill semantics
+        assert_eq!(result, Value(0));
         Ok(())
     }
 

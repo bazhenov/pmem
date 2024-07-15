@@ -1,5 +1,5 @@
-use binrw::{BinRead, BinWrite};
-use pmem::{parse_optional_ptr, write_optional_ptr, Handle, Memory, Ptr, Storable, Transaction};
+use pmem::{memory, Handle, Memory, Ptr, Storable, Transaction};
+use pmem_derive::Record;
 
 fn main() {
     let memory = Memory::default();
@@ -26,11 +26,8 @@ struct LinkedList {
     ptr: Ptr<LinkedListNode>,
 }
 
-#[derive(BinRead, BinWrite, Debug)]
-#[brw(little)]
+#[derive(Debug, Record)]
 struct LinkedListNode {
-    #[br(parse_with = parse_optional_ptr)]
-    #[bw(write_with = write_optional_ptr)]
     first: Option<Ptr<ListNode>>,
 }
 
@@ -54,12 +51,9 @@ impl Storable for LinkedList {
     }
 }
 
-#[derive(BinRead, BinWrite, Debug)]
-#[brw(little)]
+#[derive(Debug, Record)]
 struct ListNode {
     value: i32,
-    #[br(parse_with = parse_optional_ptr)]
-    #[bw(write_with = write_optional_ptr)]
     next: Option<Ptr<ListNode>>,
 }
 

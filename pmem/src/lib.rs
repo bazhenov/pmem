@@ -2,9 +2,7 @@ pub mod fs;
 pub mod memory;
 pub mod page;
 
-pub use memory::{
-    parse_optional_ptr, write_optional_ptr, Handle, Memory, Ptr, Record, Storable, Transaction,
-};
+pub use memory::{Handle, Memory, Ptr, Record, Storable, Transaction};
 pub use page::Addr;
 
 #[macro_export]

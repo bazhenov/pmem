@@ -1,8 +1,6 @@
-use crate::{
-    memory::{parse_optional_ptr, write_optional_ptr, SlicePtr},
-    Handle, Ptr, Storable, Transaction,
-};
-use binrw::binrw;
+use pmem_derive::Record;
+
+use crate::{memory::SlicePtr, Handle, Ptr, Storable, Transaction};
 use std::{
     ffi::OsStr,
     fmt,
@@ -31,9 +29,7 @@ struct Filesystem {
     tx: Transaction,
 }
 
-#[binrw]
-#[brw(little)]
-#[derive(Debug)]
+#[derive(Debug, Record)]
 struct VolumeInfo {
     next_fid: u64,
     root: Ptr<FileInfo>,
@@ -52,7 +48,7 @@ impl Storable for Filesystem {
         let root_entry = FileInfo {
             name: Str(name),
             fid: 1,
-            node_type: NodeType::Directory,
+            node_type: NodeType::Directory.into(),
             children: None,
             next: None,
         };
@@ -216,7 +212,7 @@ impl Filesystem {
         let entry = FileInfo {
             name: Str(name),
             fid,
-            node_type: NodeType::Directory,
+            node_type: NodeType::Directory.into(),
             children: None,
             next: None,
         };
@@ -231,21 +227,13 @@ struct FileInfoReferent {
     node: Handle<FileInfo>,
 }
 
-#[binrw]
-#[brw(little)]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Record)]
 struct FileInfo {
     name: Str,
     // Unique file id on a volume
     fid: u64,
-    node_type: NodeType,
-
-    #[br(parse_with = parse_optional_ptr)]
-    #[bw(write_with = write_optional_ptr)]
+    node_type: u8,
     children: Option<Ptr<FileInfo>>,
-
-    #[br(parse_with = parse_optional_ptr)]
-    #[bw(write_with = write_optional_ptr)]
     next: Option<Ptr<FileInfo>>,
 }
 
@@ -256,16 +244,32 @@ impl FileInfo {
     }
 }
 
-#[binrw]
-#[brw(repr = u8)]
 #[derive(PartialEq, Clone, Debug)]
 enum NodeType {
     Directory,
     File,
 }
 
-#[derive(Clone)]
-#[binrw]
+impl Into<u8> for NodeType {
+    fn into(self) -> u8 {
+        match self {
+            NodeType::Directory => 0,
+            NodeType::File => 1,
+        }
+    }
+}
+
+impl From<u8> for NodeType {
+    fn from(value: u8) -> Self {
+        match value {
+            0 => NodeType::Directory,
+            1 => NodeType::File,
+            _ => panic!("Invalid value for NodeType"),
+        }
+    }
+}
+
+#[derive(Clone, Record)]
 struct Str(SlicePtr<u8>);
 
 impl fmt::Debug for Str {
@@ -288,7 +292,7 @@ mod tests {
         let tx = &fs.tx;
         let root = fs.get_root();
         assert_eq!(root.name(&tx), "/");
-        assert_eq!(root.node_type, NodeType::Directory);
+        assert_eq!(root.node_type, NodeType::Directory.into());
 
         let node = fs.lookup("/foo")?;
         assert!(node.is_none(), "Node should be missing");
@@ -306,7 +310,7 @@ mod tests {
         let tx = &fs.tx;
         let node = fs.lookup("/etc")?.expect("/etc should be found");
         assert_eq!(node.name(&tx), "etc");
-        assert_eq!(node.node_type, NodeType::Directory);
+        assert_eq!(node.node_type, NodeType::Directory.into());
 
         Ok(())
     }
@@ -322,7 +326,7 @@ mod tests {
         let tx = &fs.tx;
         let node = fs.lookup("/usr/bin")?.expect("/usr/bin should be found");
         assert_eq!(node.name(&tx), "bin");
-        assert_eq!(node.node_type, NodeType::Directory);
+        assert_eq!(node.node_type, NodeType::Directory.into());
 
         Ok(())
     }
