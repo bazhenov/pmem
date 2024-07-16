@@ -1,8 +1,10 @@
 use crate::{memory::SlicePtr, Handle, Ptr, Storable, Transaction};
 use pmem_derive::Record;
 use std::{
+    convert::Into,
     ffi::OsStr,
     fmt,
+    io::{self, Cursor, Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
     string::FromUtf8Error,
 };
@@ -26,6 +28,9 @@ pub enum Error {
     #[error("pmem error")]
     PMemError(#[from] crate::memory::Error),
 
+    #[error("IO Error")]
+    IOError(#[from] std::io::Error),
+
     #[error("Invalid utf8 encoding")]
     Utf8(#[from] FromUtf8Error),
 }
@@ -39,6 +44,20 @@ struct Filesystem {
 struct VolumeInfo {
     next_fid: u64,
     root: Ptr<FileInfo>,
+}
+
+enum FoundOrCreated<T> {
+    Found(T),
+    Created(T),
+}
+
+impl<T> FoundOrCreated<T> {
+    fn into(self) -> T {
+        match self {
+            FoundOrCreated::Found(value) => value,
+            FoundOrCreated::Created(value) => value,
+        }
+    }
 }
 
 impl Storable for Filesystem {
@@ -56,6 +75,7 @@ impl Storable for Filesystem {
             fid: 1,
             node_type: NodeType::Directory.into(),
             children: None,
+            file_content: None,
             next: None,
         };
         let root = tx.write(root_entry).ptr();
@@ -78,11 +98,14 @@ impl Filesystem {
     }
 
     pub fn lookup(&self, path: impl AsRef<Path>) -> Result<Option<FileInfo>> {
+        Ok(self.do_lookup_file(path)?.map(Handle::into_inner))
+    }
+
+    fn do_lookup_file(&self, path: impl AsRef<Path>) -> Result<Option<Handle<FileInfo>>> {
         let mut components = path.as_ref().components();
         let Some(Component::RootDir) = components.next() else {
             return Err(Error::PathMustBeAbsolute);
         };
-
         let mut cur_node = self.get_root_handle();
         for component in components {
             let Component::Normal(name) = component else {
@@ -98,12 +121,12 @@ impl Filesystem {
             };
             cur_node = child.node;
         }
-
-        Ok(Some(cur_node.into_inner()))
+        Ok(Some(cur_node))
     }
 
-    pub fn delete(&mut self, path: impl AsRef<Path>) -> Result<()> {
-        let mut components = path.as_ref().components();
+    pub fn delete(&mut self, path: impl Into<PathBuf>) -> Result<()> {
+        let path = path.into();
+        let mut components = path.components();
         let Some(Component::RootDir) = components.next() else {
             return Err(Error::PathMustBeAbsolute);
         };
@@ -119,25 +142,16 @@ impl Filesystem {
             };
 
             let current_node = target_node.node;
-            let Some(children) = current_node.children else {
-                return Err(Error::NotFound);
-            };
-            let child = self.find_child(children, name)?;
-            let Some(child) = child else {
-                return Err(Error::NotFound);
-            };
-            target_node = child;
+            let children = current_node.children.ok_or(Error::NotFound)?;
+            target_node = self.find_child(children, name)?.ok_or(Error::NotFound)?;
             parent = Some(current_node);
         }
 
         let next_ptr = target_node.node.next;
-        // TODO old node need to be removed
-        // self.tx.reclaim(target_node.node);
+        self.tx.reclaim(target_node.node);
 
-        let Some(mut parent) = parent else {
-            // Client tries to remove the root node
-            return Err(Error::NotSupported);
-        };
+        // Client tries to remove the root node
+        let mut parent = parent.ok_or(Error::NotSupported)?;
 
         if let Some(mut referent) = target_node.referent {
             // Child is not first in a list
@@ -148,6 +162,49 @@ impl Filesystem {
             self.tx.update(&parent);
         }
         Ok(())
+    }
+
+    pub fn create_file<'a>(&'a mut self, path: impl Into<PathBuf>) -> Result<File<'a>> {
+        let mut path: PathBuf = path.into();
+        let file_name = path.file_name().ok_or(Error::NotSupported)?.to_owned();
+        assert!(path.pop());
+
+        let mut parent = self.do_lookup_file(path)?.ok_or(Error::NotFound)?;
+        let file_info = if let Some(children) = parent.children {
+            let FoundOrCreated::Created(file_info) =
+                self.find_or_insert_child(children, file_name.as_os_str())?
+            else {
+                return Err(Error::AlreadyExists);
+            };
+            file_info
+        } else {
+            let new_node = self.write_fsnode(file_name.to_str().unwrap());
+            parent.children = Some(new_node.ptr());
+            self.tx.update(&parent);
+            new_node
+        };
+
+        Ok(File {
+            cursor: Cursor::new(vec![]),
+            fs: self,
+            file_info,
+        })
+    }
+
+    pub fn open_file<'a>(&'a mut self, path: impl AsRef<Path>) -> Result<File<'a>> {
+        let file_info = self.do_lookup_file(path)?.ok_or(Error::NotFound)?;
+
+        let content = if let Some(content) = file_info.file_content {
+            self.tx.read_slice(content)?
+        } else {
+            vec![]
+        };
+
+        Ok(File {
+            cursor: Cursor::new(content),
+            fs: self,
+            file_info,
+        })
     }
 
     pub fn create_dir(&mut self, name: impl Into<PathBuf>) -> Result<FileInfo> {
@@ -164,13 +221,13 @@ impl Filesystem {
                 return Err(Error::NotSupported);
             };
 
-            if node.children.is_none() {
+            node = if node.children.is_none() {
                 let new_node = self.write_fsnode(name.to_str().unwrap());
                 node.children = Some(new_node.ptr());
                 self.tx.update(&node);
-                node = new_node;
+                new_node
             } else {
-                node = self.find_or_insert_child(node.ptr(), name)?;
+                self.find_or_insert_child(node.ptr(), name)?.into()
             }
         }
 
@@ -197,11 +254,12 @@ impl Filesystem {
         Ok(None)
     }
 
+    /// Returns `Ok(child)` if it was found otherwise create new [FileInfo] and returns `Err(new_child)`
     fn find_or_insert_child(
         &mut self,
         start_node: Ptr<FileInfo>,
         name: &OsStr,
-    ) -> Result<Handle<FileInfo>> {
+    ) -> Result<FoundOrCreated<Handle<FileInfo>>> {
         let name = name.to_str().unwrap();
         let mut prev_node = start_node;
         let mut cur_node = Some(start_node);
@@ -209,7 +267,7 @@ impl Filesystem {
             let value = self.tx.lookup(node)?;
             let child_name = value.name(&self.tx)?;
             if name == child_name.as_str() {
-                return Ok(value);
+                return Ok(FoundOrCreated::Found(value));
             }
             prev_node = node;
             cur_node = value.next;
@@ -218,7 +276,7 @@ impl Filesystem {
         let mut prev_node = self.tx.lookup(prev_node)?;
         prev_node.next = Some(new_node.ptr());
         self.tx.update(&prev_node);
-        Ok(new_node)
+        Ok(FoundOrCreated::Created(new_node))
     }
 
     fn write_fsnode(&mut self, name: &str) -> Handle<FileInfo> {
@@ -229,6 +287,7 @@ impl Filesystem {
             name: Str(name),
             fid,
             node_type: NodeType::Directory.into(),
+            file_content: None,
             children: None,
             next: None,
         };
@@ -237,6 +296,41 @@ impl Filesystem {
     }
 }
 
+pub struct File<'a> {
+    cursor: Cursor<Vec<u8>>,
+    file_info: Handle<FileInfo>,
+    fs: &'a mut Filesystem,
+}
+
+impl<'a> Read for File<'a> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.cursor.read(buf)
+    }
+}
+
+impl<'a> Write for File<'a> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.cursor.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        let slice = self.fs.tx.write_slice(self.cursor.get_ref());
+        self.file_info.file_content = Some(slice);
+        self.fs.tx.update(&self.file_info);
+        Ok(())
+    }
+}
+
+impl<'a> Seek for File<'a> {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.cursor.seek(pos)
+    }
+}
+
+/// Helper structure that is used when iterating over linked list of [FileInfo] instances
+///
+/// Contains the node itself as well as the previous node. It is usefull when we need to remove the node
+/// from the list, and update the reference of the previous node.
 struct FileInfoReferent {
     // Previous FileInfo node in a linked list, if None the target node is the first one
     referent: Option<Handle<FileInfo>>,
@@ -250,6 +344,7 @@ struct FileInfo {
     fid: u64,
     node_type: u8,
     children: Option<Ptr<FileInfo>>,
+    file_content: Option<SlicePtr<u8>>,
     next: Option<Ptr<FileInfo>>,
 }
 
@@ -379,6 +474,25 @@ mod tests {
 
         assert!(usr.fid < lib.fid);
         assert!(lib.fid < bin.fid);
+
+        Ok(())
+    }
+
+    #[test]
+    fn create_file() -> Result<()> {
+        let mem = Memory::default();
+        let tx = mem.start();
+        let mut fs = Filesystem::allocate(tx);
+
+        let mut file = fs.create_file("/file.txt")?;
+        let expected_content = "Hello world";
+        file.write(expected_content.as_bytes()).unwrap();
+        file.flush()?;
+
+        let mut file = fs.open_file("/file.txt")?;
+        let mut content = String::new();
+        file.read_to_string(&mut content)?;
+        assert_eq!(content, expected_content);
 
         Ok(())
     }

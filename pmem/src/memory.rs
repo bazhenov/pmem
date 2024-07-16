@@ -75,12 +75,15 @@ impl Transaction {
     }
 
     pub fn lookup<'a, T: Record>(&self, ptr: Ptr<T>) -> Result<Handle<T>> {
-        let addr = ptr.addr;
-        let bytes = self.read_uncommitted(addr, T::SIZE).unwrap();
+        let bytes = self.read_uncommitted(ptr.addr, T::SIZE).unwrap();
         let value = T::read(&*bytes)?;
         let size = T::SIZE;
 
-        Ok(Handle { addr, value, size })
+        Ok(Handle {
+            addr: ptr.addr,
+            value,
+            size,
+        })
     }
 
     pub fn read<T: Record>(&self, ptr: Ptr<T>) -> Result<T> {
@@ -280,15 +283,34 @@ impl<T> Record for Option<Ptr<T>> {
 }
 
 impl<T> Record for Ptr<T> {
-    const SIZE: usize = 4;
+    const SIZE: usize = mem::size_of::<Addr>();
 
     fn read(data: &[u8]) -> Result<Self> {
-        let addr = u32::from_le_bytes(data[0..4].try_into()?);
+        let addr = u32::from_le_bytes(data.try_into()?);
         Ptr::from_addr(addr).ok_or(Error::NullPointer)
     }
 
     fn write(&self, data: &mut [u8]) -> Result<()> {
         let bytes = self.addr.to_le_bytes();
+        data.copy_from_slice(bytes.as_slice());
+        Ok(())
+    }
+}
+
+// TODO remove duplication
+impl<T> Record for Option<SlicePtr<T>> {
+    const SIZE: usize = <SlicePtr<T> as Record>::SIZE;
+
+    fn read(data: &[u8]) -> Result<Self> {
+        let addr = u32::from_le_bytes(data.try_into()?);
+        let ptr = Some(addr)
+            .filter(|addr| *addr > 0)
+            .and_then(SlicePtr::from_addr);
+        Ok(ptr)
+    }
+
+    fn write(&self, data: &mut [u8]) -> Result<()> {
+        let bytes = self.map(|ptr| ptr.0.addr).unwrap_or(0).to_le_bytes();
         data.copy_from_slice(bytes.as_slice());
         Ok(())
     }
