@@ -35,13 +35,13 @@ pub enum Error {
     Utf8(#[from] FromUtf8Error),
 }
 
-struct Filesystem {
+pub struct Filesystem {
     volume: Handle<VolumeInfo>,
     tx: Transaction,
 }
 
 #[derive(Debug, Record)]
-struct VolumeInfo {
+pub struct VolumeInfo {
     next_fid: u64,
     root: Ptr<FileInfo>,
 }

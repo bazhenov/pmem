@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["pmem", "pmem-derive"]
+members = ["pmem", "pmem-derive", "rfs"]
 
 [workspace.dependencies]
 pmem-derive = { path = "pmem-derive" }
