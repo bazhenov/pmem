@@ -54,7 +54,7 @@
 //! read data without any modifications.
 
 use crate::ensure;
-use std::{borrow::Cow, ops::Range, rc::Rc};
+use std::{borrow::Cow, ops::Range, sync::Arc};
 
 pub const PAGE_SIZE: usize = 1 << 24; // 16Mb
 pub type Addr = u32;
@@ -349,7 +349,7 @@ pub enum Error {
 /// can represent a state in the history of changes.
 #[derive(Default)]
 pub struct PagePool {
-    latest: Rc<CommittedSnapshot>,
+    latest: Arc<CommittedSnapshot>,
 }
 
 impl PagePool {
@@ -370,7 +370,7 @@ impl PagePool {
             lsn: 1,
         };
         Self {
-            latest: Rc::new(snapshot),
+            latest: Arc::new(snapshot),
         }
     }
 
@@ -401,7 +401,7 @@ impl PagePool {
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
             patches: vec![],
-            base: Rc::clone(&self.latest),
+            base: Arc::clone(&self.latest),
             pages: self.latest.pages,
         }
     }
@@ -421,13 +421,13 @@ impl PagePool {
     /// * `snapshot` - A snapshot containing modifications to commit to the page pool.
     pub fn commit(&mut self, snapshot: Snapshot) {
         assert!(
-            Rc::ptr_eq(&self.latest, &snapshot.base),
+            Arc::ptr_eq(&self.latest, &snapshot.base),
             "Proposed snapshot is not linear"
         );
         let lsn = self.latest.lsn + 1;
-        self.latest = Rc::new(CommittedSnapshot {
+        self.latest = Arc::new(CommittedSnapshot {
             patches: snapshot.patches,
-            base: Some(Rc::clone(&self.latest)),
+            base: Some(Arc::clone(&self.latest)),
             pages: snapshot.pages,
             lsn,
         });
@@ -457,7 +457,7 @@ pub struct CommittedSnapshot {
     /// A reference to the base snapshot from which this snapshot was derived.
     /// If present, the base snapshot represents the state of the page pool
     /// immediately before the current snapshot's patches were applied.
-    base: Option<Rc<CommittedSnapshot>>,
+    base: Option<Arc<CommittedSnapshot>>,
 
     /// The total number of pages represented by this snapshot. This is used to
     /// validate read requests and ensure they do not exceed the bounds of the snapshot.
@@ -504,7 +504,7 @@ impl CommittedSnapshot {
         let snapshots = self
             .base
             .as_ref()
-            .map(Rc::clone)
+            .map(Arc::clone)
             .map(collect_snapshots)
             .unwrap_or_default();
         patch_list.extend(snapshots.iter().map(|s| s.patches.as_slice()));
@@ -525,7 +525,7 @@ impl Drop for CommittedSnapshot {
     fn drop(&mut self) {
         let mut next_base = self.base.take();
         while let Some(base) = next_base {
-            next_base = Rc::try_unwrap(base)
+            next_base = Arc::try_unwrap(base)
                 .map(|mut base| base.base.take())
                 .unwrap_or(None);
         }
@@ -535,7 +535,7 @@ impl Drop for CommittedSnapshot {
 #[derive(Clone)]
 pub struct Snapshot {
     patches: Vec<Patch>,
-    base: Rc<CommittedSnapshot>,
+    base: Arc<CommittedSnapshot>,
     pages: PageNo,
 }
 
@@ -625,13 +625,13 @@ impl Snapshot {
     }
 }
 
-fn collect_snapshots(snapshot: Rc<CommittedSnapshot>) -> Vec<Rc<CommittedSnapshot>> {
+fn collect_snapshots(snapshot: Arc<CommittedSnapshot>) -> Vec<Arc<CommittedSnapshot>> {
     let mut snapshots = vec![];
     let mut snapshot = Some(snapshot);
     #[allow(clippy::useless_asref)]
     while let Some(s) = snapshot {
-        snapshots.push(Rc::clone(&s));
-        snapshot = s.base.as_ref().map(Rc::clone);
+        snapshots.push(Arc::clone(&s));
+        snapshot = s.base.as_ref().map(Arc::clone);
     }
     snapshots
 }
@@ -1434,14 +1434,14 @@ mod tests {
 
     impl From<&str> for PagePool {
         fn from(value: &str) -> Self {
-            let page = Rc::new(CommittedSnapshot::from(value.as_bytes()));
+            let page = Arc::new(CommittedSnapshot::from(value.as_bytes()));
             PagePool { latest: page }
         }
     }
 
     impl From<&[u8]> for PagePool {
         fn from(value: &[u8]) -> Self {
-            let page = Rc::new(CommittedSnapshot::from(value));
+            let page = Arc::new(CommittedSnapshot::from(value));
             PagePool { latest: page }
         }
     }
