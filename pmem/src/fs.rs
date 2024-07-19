@@ -205,11 +205,7 @@ impl Filesystem {
         Ok(())
     }
 
-    pub fn create_file<'a>(
-        &'a mut self,
-        dir: &FileMeta,
-        name: impl AsRef<str>,
-    ) -> Result<File<'a>> {
+    pub fn create_file<'a>(&mut self, dir: &FileMeta, name: impl AsRef<str>) -> Result<FileMeta> {
         let file_name = name.as_ref();
 
         let mut dir = self.lookup_inode(dir)?.ok_or(Error::NotFound)?;
@@ -224,11 +220,7 @@ impl Filesystem {
             new_node
         };
 
-        Ok(File {
-            cursor: Cursor::new(vec![]),
-            fs: self,
-            file_info,
-        })
+        FileMeta::from(file_info, &self.tx)
     }
 
     pub fn open_file<'a>(&'a mut self, file: &FileMeta) -> Result<File<'a>> {
@@ -563,7 +555,8 @@ mod tests {
         let (mut fs, _) = create_fs();
 
         let root = fs.get_root()?;
-        let mut file = fs.create_file(&root, "file.txt")?;
+        let file = fs.create_file(&root, "file.txt")?;
+        let mut file = fs.open_file(&file)?;
         let expected_content = "Hello world";
         file.write(expected_content.as_bytes()).unwrap();
         file.flush()?;
