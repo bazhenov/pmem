@@ -1,8 +1,4 @@
-use std::sync::Mutex;
-use std::time::SystemTime;
-
 use async_trait::async_trait;
-
 use nfsserve::{
     nfs::{
         self, fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfstime3, sattr3, specdata3,
@@ -10,7 +6,18 @@ use nfsserve::{
     tcp::*,
     vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities},
 };
-use pmem::{fs::Filesystem, page::PagePool, Storable};
+use pmem::{fs::Filesystem, memory, Memory, Storable};
+use std::sync::Mutex;
+use std::time::SystemTime;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+enum Error {
+    #[error("Memory")]
+    MemoryError(#[from] memory::Error),
+}
+
+type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, Clone)]
 enum FSContents {
@@ -77,25 +84,23 @@ fn make_dir(name: &str, id: fileid3, parent: fileid3, contents: Vec<fileid3>) ->
     }
 }
 
-#[derive(Debug)]
 pub struct DemoFS {
-    fs: Filesystem,
+    fs: Mutex<Filesystem>,
 }
 
 impl Default for DemoFS {
     fn default() -> DemoFS {
-        let mem = PagePool::default();
-        let fs = Filesystem::allocate(mem.snapshot());
+        let mem = Memory::default();
+        let fs = Mutex::new(Filesystem::allocate(mem.start()));
         DemoFS { fs }
     }
 }
 
-// For this demo file system we let the handle just be the file
-// there is only 1 file. a.txt.
 #[async_trait]
 impl NFSFileSystem for DemoFS {
     fn root_dir(&self) -> fileid3 {
-        self.rootdir
+        let fs = self.fs.lock().unwrap();
+        fs.get_root().unwrap().fid
     }
 
     fn capabilities(&self) -> VFSCapabilities {
@@ -105,7 +110,8 @@ impl NFSFileSystem for DemoFS {
     async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
         {
             let mut fs = self.fs.lock().unwrap();
-            let mut fssize = fs[id as usize].attr.size;
+            let inode = fs.lookup_by_id(id);
+            let mut fssize = todo!();
             if let FSContents::File(bytes) = &mut fs[id as usize].contents {
                 let offset = offset as usize;
                 if offset + data.len() > bytes.len() {
@@ -129,7 +135,7 @@ impl NFSFileSystem for DemoFS {
         let newid: fileid3;
         {
             let mut fs = self.fs.lock().unwrap();
-            newid = fs.len() as fileid3;
+            newid = fs.create_file(path);
             fs.push(make_file(
                 std::str::from_utf8(filename).unwrap(),
                 newid,

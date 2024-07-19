@@ -183,6 +183,12 @@ pub struct Ptr<T> {
     _phantom: PhantomData<T>,
 }
 
+impl<T> Ptr<T> {
+    pub(crate) fn unwrap_addr(&self) -> Addr {
+        self.addr
+    }
+}
+
 impl<T> Clone for Ptr<T> {
     fn clone(&self) -> Self {
         *self

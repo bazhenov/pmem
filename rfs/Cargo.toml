@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 pmem = { path = "../pmem" }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 async-trait = "0.1.81"

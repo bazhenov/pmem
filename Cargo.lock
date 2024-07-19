@@ -835,6 +835,7 @@ dependencies = [
  "async-trait",
  "nfsserve",
  "pmem",
+ "thiserror",
  "tokio",
  "tracing",
  "tracing-subscriber",
