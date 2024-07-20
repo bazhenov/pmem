@@ -256,6 +256,24 @@ impl Filesystem {
         FileMeta::from(directory_inode, &self.tx)
     }
 
+    pub fn readdir(&self, dir: &FileMeta) -> Result<Vec<FileMeta>> {
+        let parent = self.lookup_inode(dir)?.ok_or(Error::NotFound)?;
+
+        if let Some(children) = parent.children {
+            let mut result = vec![];
+
+            let mut current_node = Some(children);
+            while let Some(node) = current_node {
+                let child = self.tx.lookup(node)?;
+                current_node = child.next;
+                result.push(FileMeta::from(child, &self.tx)?);
+            }
+            Ok(result)
+        } else {
+            Ok(vec![])
+        }
+    }
+
     pub fn create_dirs(&mut self, name: impl Into<PathBuf>) -> Result<FileMeta> {
         let path = name.into();
 
@@ -382,7 +400,7 @@ struct FileInfoReferent {
     node: Handle<FNode>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct FileMeta {
     pub name: String,
     // Unique file id on a volume
@@ -568,6 +586,25 @@ mod tests {
         let mut content = String::new();
         file.read_to_string(&mut content)?;
         assert_eq!(content, expected_content);
+
+        Ok(())
+    }
+
+    #[test]
+    fn readdir() -> Result<()> {
+        let (mut fs, _) = create_fs();
+
+        let root = fs.get_root()?;
+
+        let etc = fs.create_dir(&root, "etc")?;
+        let bin = fs.create_dir(&root, "bin")?;
+        let swap = fs.create_file(&root, "swap")?;
+
+        let children = fs.readdir(&root)?;
+
+        assert!(children.contains(&etc), "Root should contains etc");
+        assert!(children.contains(&bin), "Root should contains bin");
+        assert!(children.contains(&swap), "Root should contains spaw");
 
         Ok(())
     }

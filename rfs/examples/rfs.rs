@@ -1,7 +1,8 @@
 use async_trait::async_trait;
 use nfsserve::{
     nfs::{
-        self, fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfstime3, sattr3, specdata3,
+        self, fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfsstring, nfstime3, sattr3,
+        specdata3,
     },
     tcp::*,
     vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities},
@@ -10,7 +11,10 @@ use pmem::{
     fs::{self, FileMeta, Filesystem, NodeType},
     memory, Memory, Storable,
 };
-use std::{io::Read, time::SystemTime};
+use std::{
+    io::{Read, Write},
+    time::SystemTime,
+};
 use std::{
     io::{Seek, SeekFrom},
     sync::Mutex,
@@ -112,22 +116,18 @@ impl NFSFileSystem for DemoFS {
     }
 
     async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
-        {
-            let mut fs = self.fs.lock().unwrap();
-            let inode = fs.lookup_by_id(id);
-            let mut fssize = todo!();
-            if let FSContents::File(bytes) = &mut fs[id as usize].contents {
-                let offset = offset as usize;
-                if offset + data.len() > bytes.len() {
-                    bytes.resize(offset + data.len(), 0);
-                    bytes[offset..].copy_from_slice(data);
-                    fssize = bytes.len() as u64;
-                }
-            }
-            fs[id as usize].attr.size = fssize;
-            fs[id as usize].attr.used = fssize;
-        }
-        self.getattr(id).await
+        let mut fs = self.fs.lock().unwrap();
+
+        let meta = fs
+            .lookup_by_id(id)
+            .map_err(to_nfs_error)?
+            .ok_or(nfsstat3::NFS3ERR_NOENT)?;
+        let mut file = fs.open_file(&meta).map_err(to_nfs_error)?;
+        file.seek(SeekFrom::Start(offset))
+            .ok()
+            .ok_or(nfsstat3::NFS3ERR_IO)?;
+        file.write_all(data).ok().ok_or(nfsstat3::NFS3ERR_IO)?;
+        Ok(create_fattr(&meta))
     }
 
     async fn create(
@@ -144,7 +144,7 @@ impl NFSFileSystem for DemoFS {
         let new_file = fs
             .create_file(&dir, to_string(&filename))
             .map_err(to_nfs_error)?;
-        Ok((new_file.fid, create_fattr(new_file)))
+        Ok((new_file.fid, create_fattr(&new_file)))
     }
 
     async fn create_exclusive(
@@ -173,7 +173,7 @@ impl NFSFileSystem for DemoFS {
             .lookup_by_id(id as u64)
             .map_err(to_nfs_error)?
             .ok_or(nfsstat3::NFS3ERR_NOENT)?;
-        Ok(create_fattr(entry))
+        Ok(create_fattr(&entry))
     }
 
     async fn setattr(&self, _id: fileid3, _setattr: sattr3) -> Result<fattr3, nfsstat3> {
@@ -194,9 +194,11 @@ impl NFSFileSystem for DemoFS {
             .ok_or(nfsstat3::NFS3ERR_NOENT)?;
         if entry.node_type == NodeType::Directory {
             let mut file = fs.open_file(&entry).map_err(to_nfs_error)?;
-            file.seek(SeekFrom::Start(offset));
+            file.seek(SeekFrom::Start(offset))
+                .ok()
+                .ok_or(nfsstat3::NFS3ERR_IO)?;
             let mut buf = vec![0u8; count as usize];
-            file.read_exact(&mut buf);
+            file.read_exact(&mut buf).ok().ok_or(nfsstat3::NFS3ERR_IO)?;
             Ok((buf, true))
         } else {
             Err(nfsstat3::NFS3ERR_ISDIR)
@@ -210,40 +212,26 @@ impl NFSFileSystem for DemoFS {
         max_entries: usize,
     ) -> Result<ReadDirResult, nfsstat3> {
         let fs = self.fs.lock().unwrap();
-        let entry = fs.get(dirid as usize).ok_or(nfsstat3::NFS3ERR_NOENT)?;
-        if let FSContents::File(_) = entry.contents {
-            return Err(nfsstat3::NFS3ERR_NOTDIR);
-        } else if let FSContents::Directory(dir) = &entry.contents {
-            let mut ret = ReadDirResult {
-                entries: Vec::new(),
-                end: false,
-            };
-            let mut start_index = 0;
-            if start_after > 0 {
-                if let Some(pos) = dir.iter().position(|&r| r == start_after) {
-                    start_index = pos + 1;
-                } else {
-                    return Err(nfsstat3::NFS3ERR_BAD_COOKIE);
-                }
-            }
-            let remaining_length = dir.len() - start_index;
+        let dir = fs
+            .lookup_by_id(dirid)
+            .map_err(to_nfs_error)?
+            .ok_or(nfsstat3::NFS3ERR_NOENT)?;
 
-            for i in dir[start_index..].iter() {
-                ret.entries.push(DirEntry {
-                    fileid: *i,
-                    name: fs[(*i) as usize].name.clone(),
-                    attr: fs[(*i) as usize].attr,
-                });
-                if ret.entries.len() >= max_entries {
-                    break;
-                }
-            }
-            if ret.entries.len() == remaining_length {
-                ret.end = true;
-            }
-            return Ok(ret);
+        let mut children = fs.readdir(&dir).map_err(to_nfs_error)?;
+        let start_idx = start_after as usize;
+        if start_idx >= children.len() {
+            return Ok(ReadDirResult {
+                entries: vec![],
+                end: true,
+            });
         }
-        Err(nfsstat3::NFS3ERR_NOENT)
+        let end_idx = (start_idx + max_entries).min(children.len());
+        let entries = children
+            .drain(start_idx..end_idx)
+            .map(to_dir_entry)
+            .collect();
+        let end = end_idx <= children.len();
+        Ok(ReadDirResult { entries, end })
     }
 
     /// Removes a file.
@@ -271,10 +259,20 @@ impl NFSFileSystem for DemoFS {
     #[allow(unused)]
     async fn mkdir(
         &self,
-        _dirid: fileid3,
-        _dirname: &filename3,
+        dirid: fileid3,
+        dirname: &filename3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+        let mut fs = self.fs.lock().unwrap();
+
+        let parent = fs
+            .lookup_by_id(dirid)
+            .map_err(to_nfs_error)?
+            .ok_or(nfsstat3::NFS3ERR_NOENT)?;
+        let name = String::from_utf8(dirname.0.clone())
+            .ok()
+            .ok_or(nfsstat3::NFS3ERR_INVAL)?;
+        let dir = fs.create_dir(&parent, name).map_err(to_nfs_error)?;
+        Ok((dir.fid, create_fattr(&dir)))
     }
 
     async fn symlink(
@@ -303,7 +301,14 @@ fn to_nfs_error(e: fs::Error) -> nfsstat3 {
     }
 }
 
-fn create_fattr(meta: FileMeta) -> fattr3 {
+fn to_dir_entry(meta: FileMeta) -> DirEntry {
+    let attr = create_fattr(&meta);
+    let fileid = meta.fid;
+    let name = nfsstring(meta.name.into_bytes());
+    DirEntry { fileid, name, attr }
+}
+
+fn create_fattr(meta: &FileMeta) -> fattr3 {
     let ftype = match meta.node_type {
         fs::NodeType::Directory => ftype3::NF3DIR,
         fs::NodeType::File => ftype3::NF3REG,
@@ -355,4 +360,4 @@ async fn main() {
     listener.handle_forever().await.unwrap();
 }
 // Test with
-// mount -t nfs -o nolocks,vers=3,tcp,port=12000,mountport=12000,soft 127.0.0.1:/ mnt/
+// mount -t nfs -o nolocks,vers=3,tcp,port=11111,mountport=11111,soft 127.0.0.1:/ mnt/
