@@ -2,7 +2,6 @@ use crate::{memory::SlicePtr, Handle, Ptr, Storable, Transaction};
 use pmem_derive::Record;
 use std::{
     convert::Into,
-    ffi::OsStr,
     fmt,
     io::{self, Cursor, Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
@@ -164,43 +163,26 @@ impl Filesystem {
         Ok(Some(cur_node))
     }
 
-    pub fn delete(&mut self, path: impl Into<PathBuf>) -> Result<()> {
-        let path = path.into();
-        let mut components = path.components();
-        let Some(Component::RootDir) = components.next() else {
-            return Err(Error::PathMustBeAbsolute);
+    pub fn delete(&mut self, dir: &FileMeta, name: impl AsRef<str>) -> Result<()> {
+        let mut dir = self.lookup_inode(dir)?.ok_or(Error::NotFound)?;
+
+        let Some(children) = dir.children else {
+            return Err(Error::NotFound);
         };
+        let file = self
+            .find_child(children, name.as_ref())?
+            .ok_or(Error::NotFound)?;
 
-        let mut target_node = FileInfoReferent {
-            referent: None,
-            node: self.get_root_handle(),
-        };
-        let mut parent = None;
-        for component in components {
-            let Component::Normal(name) = component else {
-                return Err(Error::NotSupported);
-            };
-            let name = name.to_str().unwrap();
+        let next_ptr = file.node.next;
+        self.tx.reclaim(file.node);
 
-            let current_node = target_node.node;
-            let children = current_node.children.ok_or(Error::NotFound)?;
-            target_node = self.find_child(children, name)?.ok_or(Error::NotFound)?;
-            parent = Some(current_node);
-        }
-
-        let next_ptr = target_node.node.next;
-        self.tx.reclaim(target_node.node);
-
-        // Client tries to remove the root node
-        let mut parent = parent.ok_or(Error::NotSupported)?;
-
-        if let Some(mut referent) = target_node.referent {
+        if let Some(mut referent) = file.referent {
             // Child is not first in a list
             referent.next = next_ptr;
             self.tx.update(&referent);
         } else {
-            parent.children = next_ptr;
-            self.tx.update(&parent);
+            dir.children = next_ptr;
+            self.tx.update(&dir);
         }
         Ok(())
     }
@@ -377,6 +359,9 @@ impl<'a> Write for File<'a> {
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        if let Some(_old_content) = self.file_info.file_content.take() {
+            // Remove old content
+        }
         let slice = self.fs.tx.write_slice(self.cursor.get_ref());
         self.file_info.file_content = Some(slice);
         self.fs.tx.update(&self.file_info);
@@ -537,10 +522,24 @@ mod tests {
     fn can_delete_directory() -> Result<()> {
         let (mut fs, _) = create_fs();
 
-        fs.create_dirs("/usr")?;
-        fs.delete("/usr")?;
+        let root = fs.get_root()?;
+        fs.create_dir(&root, "usr")?;
+        fs.delete(&root, "usr")?;
 
         assert!(fs.find("/usr")?.is_none(), "/usr should be missing");
+
+        Ok(())
+    }
+
+    #[test]
+    fn can_delete_file() -> Result<()> {
+        let (mut fs, _) = create_fs();
+
+        let root = fs.get_root()?;
+        fs.create_file(&root, "swap")?;
+        fs.delete(&root, "swap")?;
+
+        assert!(fs.find("/swap")?.is_none(), "/swap should be missing");
 
         Ok(())
     }
@@ -586,6 +585,29 @@ mod tests {
         let mut content = String::new();
         file.read_to_string(&mut content)?;
         assert_eq!(content, expected_content);
+
+        Ok(())
+    }
+
+    #[test]
+    fn write_file_partially() -> Result<()> {
+        let (mut fs, _) = create_fs();
+
+        let root = fs.get_root()?;
+        let file_meta = fs.create_file(&root, "file.txt")?;
+        let mut file = fs.open_file(&file_meta)?;
+        file.write("Hello world".as_bytes())?;
+        file.flush()?;
+
+        let mut file = fs.open_file(&file_meta)?;
+        file.seek(SeekFrom::Start(6))?;
+        file.write("Rust!".as_bytes())?;
+        file.flush()?;
+
+        let mut file = fs.open_file(&file_meta)?;
+        let mut content = String::new();
+        file.read_to_string(&mut content)?;
+        assert_eq!(content, "Hello Rust!");
 
         Ok(())
     }

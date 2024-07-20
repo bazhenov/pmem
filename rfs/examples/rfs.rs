@@ -176,8 +176,15 @@ impl NFSFileSystem for DemoFS {
         Ok(create_fattr(&entry))
     }
 
-    async fn setattr(&self, _id: fileid3, _setattr: sattr3) -> Result<fattr3, nfsstat3> {
-        Err(nfsstat3::NFS3ERR_NOTSUPP)
+    async fn setattr(&self, id: fileid3, _setattr: sattr3) -> Result<fattr3, nfsstat3> {
+        let fs = self.fs.lock().unwrap();
+
+        let file = fs
+            .lookup_by_id(id)
+            .map_err(to_nfs_error)?
+            .ok_or(nfsstat3::NFS3ERR_NOENT)?;
+
+        Ok(create_fattr(&file))
     }
 
     async fn read(
@@ -239,7 +246,13 @@ impl NFSFileSystem for DemoFS {
     /// this should return Err(nfsstat3::NFS3ERR_ROFS)
     #[allow(unused)]
     async fn remove(&self, dirid: fileid3, filename: &filename3) -> Result<(), nfsstat3> {
-        return Err(nfsstat3::NFS3ERR_NOTSUPP);
+        let mut fs = self.fs.lock().unwrap();
+        let dir_meta = fs
+            .lookup_by_id(dirid)
+            .map_err(to_nfs_error)?
+            .ok_or(nfsstat3::NFS3ERR_NOENT)?;
+        fs.delete(&dir_meta, to_string(filename))
+            .map_err(to_nfs_error)
     }
 
     /// Removes a file.
