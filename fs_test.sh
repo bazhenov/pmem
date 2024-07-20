@@ -5,7 +5,6 @@ set -e
 mount -t nfs -o nolocks,vers=3,tcp,port=11111,mountport=11111,soft 127.0.0.1:/ mnt/
 trap 'echo Unmounting; umount mnt' EXIT
 
-sleep 1
 echo "Creating directory..."
 mkdir mnt/dir
 

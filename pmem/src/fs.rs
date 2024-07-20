@@ -112,11 +112,11 @@ impl Filesystem {
     }
 
     pub fn lookup(&self, dir: &FileMeta, name: impl AsRef<str>) -> Result<Option<FileMeta>> {
-        let Some(inode) = self.lookup_inode(dir)? else {
+        let Some(children) = self.lookup_inode(dir)?.and_then(|dir| dir.children) else {
             return Ok(None);
         };
 
-        self.find_child(inode.ptr(), name.as_ref())?
+        self.find_child(children, name.as_ref())?
             .map(|child| FileMeta::from(child.node, &self.tx))
             .transpose()
     }
@@ -487,7 +487,7 @@ mod tests {
         fs.create_dirs("/etc")?;
         let root = fs.get_root()?;
         let node = fs.lookup(&root, "etc")?;
-        assert!(node.is_none(), "Node should be missing");
+        assert!(node.is_some(), "Node should be present");
         Ok(())
     }
 
@@ -497,6 +497,7 @@ mod tests {
 
         let root = fs.get_root()?;
         fs.create_dir(&root, "etc")?;
+        assert!(fs.lookup(&root, "etc")?.is_some(), "Dir should be present");
 
         let node = fs.find("/etc")?.expect("/etc should be found");
         assert_eq!(node.name, "etc");
@@ -545,6 +546,27 @@ mod tests {
     }
 
     #[test]
+    fn can_remove_several_items() -> Result<()> {
+        let (mut fs, _) = create_fs();
+
+        let root = fs.get_root()?;
+        let etc = fs.create_dir(&root, "etc")?;
+        let swap = fs.create_file(&root, "swap")?;
+
+        fs.delete(&root, "etc")?;
+        assert!(fs.find("/etc")?.is_none(), "/etc should be missing");
+
+        assert!(
+            fs.lookup(&root, "swap")?.is_some(),
+            "/swap should be present"
+        );
+        fs.delete(&root, "swap")?;
+        assert!(fs.find("/swap")?.is_none(), "/swap should be missing");
+
+        Ok(())
+    }
+
+    #[test]
     fn check_each_fs_entry_has_its_own_id() -> Result<()> {
         let (mut fs, _) = create_fs();
 
@@ -573,6 +595,10 @@ mod tests {
 
         let root = fs.get_root()?;
         let file = fs.create_file(&root, "file.txt")?;
+        assert!(
+            fs.lookup(&root, "file.txt")?.is_some(),
+            "File should be present"
+        );
         let mut file = fs.open_file(&file)?;
         let expected_content = "Hello world";
         file.write(expected_content.as_bytes()).unwrap();
