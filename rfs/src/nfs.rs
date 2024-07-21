@@ -1,47 +1,37 @@
+//! Implementation of RFS filesystem adapater for a NFS protocol.
+//!
+//! To test use following command:
+//! ```
+//! $ mkdir mnt
+//! $ mount -t nfs -o nolocks,vers=3,tcp,port=11111,mountport=11111,soft 127.0.0.1:/ mnt/
+//! ```
+use crate::{Error, FileMeta, Filesystem, NodeType};
 use async_trait::async_trait;
-use core::fmt;
 use nfsserve::{
     nfs::{
         fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfsstring, nfstime3, sattr3,
         specdata3,
     },
-    tcp::{NFSTcp, NFSTcpListener},
     vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities},
 };
-use pmem::{
-    fs::{self, FileMeta, Filesystem, NodeType},
-    memory, Memory, Storable,
-};
-use std::io::{self, Read, Write};
 use std::{
-    io::{Seek, SeekFrom},
+    io::{self, Read, Seek, SeekFrom, Write},
     sync::Mutex,
 };
-use thiserror::Error;
 use tracing::instrument;
-use tracing_subscriber::{
-    fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter,
-};
-
-#[derive(Debug, Error)]
-enum Error {
-    #[error("Memory")]
-    MemoryError(#[from] memory::Error),
-}
 
 pub struct RFS {
     fs: Mutex<Filesystem>,
 }
 
-impl Default for RFS {
-    fn default() -> RFS {
-        let mem = Memory::default();
-        let fs = Mutex::new(Filesystem::allocate(mem.start()));
-        RFS { fs }
+impl RFS {
+    pub fn new(fs: Filesystem) -> RFS {
+        RFS { fs: Mutex::new(fs) }
     }
 }
 
 #[async_trait]
+#[allow(clippy::blocks_in_conditions)]
 impl NFSFileSystem for RFS {
     #[instrument(level = "trace", skip(self), ret)]
     fn root_dir(&self) -> fileid3 {
@@ -79,7 +69,7 @@ impl NFSFileSystem for RFS {
         let mut fs = self.fs.lock().unwrap();
         let dir = fs.lookup_by_id(dirid).map_err(pmem_to_nfs_error)?;
         let new_file = fs
-            .create_file(&dir, to_string(&filename))
+            .create_file(&dir, to_string(filename))
             .map_err(pmem_to_nfs_error)?;
         Ok((new_file.fid, create_fattr(&new_file)))
     }
@@ -87,17 +77,22 @@ impl NFSFileSystem for RFS {
     #[instrument(level = "trace", skip(self), err(Debug, level = "warn"))]
     async fn create_exclusive(
         &self,
-        _dirid: fileid3,
-        _filename: &filename3,
+        dirid: fileid3,
+        filename: &filename3,
     ) -> Result<fileid3, nfsstat3> {
-        Err(nfsstat3::NFS3ERR_NOTSUPP)
+        let mut fs = self.fs.lock().unwrap();
+        let dir = fs.lookup_by_id(dirid).map_err(pmem_to_nfs_error)?;
+        let new_file = fs
+            .create_file(&dir, to_string(filename))
+            .map_err(pmem_to_nfs_error)?;
+        Ok(new_file.fid)
     }
 
     #[instrument(level = "trace", skip(self))]
     async fn lookup(&self, dirid: fileid3, filename: &filename3) -> Result<fileid3, nfsstat3> {
         let fs = self.fs.lock().unwrap();
         let filename = to_string(filename);
-        let dir = fs.lookup_by_id(dirid as u64).map_err(pmem_to_nfs_error)?;
+        let dir = fs.lookup_by_id(dirid).map_err(pmem_to_nfs_error)?;
         let result = fs.lookup(&dir, filename).map_err(pmem_to_nfs_error)?;
         Ok(result.fid)
     }
@@ -105,7 +100,7 @@ impl NFSFileSystem for RFS {
     #[instrument(level = "trace", skip(self))]
     async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3> {
         let fs = self.fs.lock().unwrap();
-        let entry = fs.lookup_by_id(id as u64).map_err(pmem_to_nfs_error)?;
+        let entry = fs.lookup_by_id(id).map_err(pmem_to_nfs_error)?;
         Ok(create_fattr(&entry))
     }
 
@@ -224,15 +219,15 @@ impl NFSFileSystem for RFS {
     }
 }
 
-fn pmem_to_nfs_error(e: fs::Error) -> nfsstat3 {
+fn pmem_to_nfs_error(e: Error) -> nfsstat3 {
     match e {
-        fs::Error::NotFound => nfsstat3::NFS3ERR_NOENT,
-        fs::Error::NotSupported => nfsstat3::NFS3ERR_NOTSUPP,
-        fs::Error::PathMustBeAbsolute => nfsstat3::NFS3ERR_INVAL,
-        fs::Error::AlreadyExists => nfsstat3::NFS3ERR_EXIST,
-        fs::Error::PMemError(_) => nfsstat3::NFS3ERR_IO,
-        fs::Error::IOError(_) => nfsstat3::NFS3ERR_IO,
-        fs::Error::Utf8(_) => nfsstat3::NFS3ERR_INVAL,
+        Error::NotFound => nfsstat3::NFS3ERR_NOENT,
+        Error::NotSupported => nfsstat3::NFS3ERR_NOTSUPP,
+        Error::PathMustBeAbsolute => nfsstat3::NFS3ERR_INVAL,
+        Error::AlreadyExists => nfsstat3::NFS3ERR_EXIST,
+        Error::PMemError(_) => nfsstat3::NFS3ERR_IO,
+        Error::IOError(_) => nfsstat3::NFS3ERR_IO,
+        Error::Utf8(_) => nfsstat3::NFS3ERR_INVAL,
     }
 }
 
@@ -266,8 +261,8 @@ fn to_dir_entry(meta: FileMeta) -> DirEntry {
 
 fn create_fattr(meta: &FileMeta) -> fattr3 {
     let ftype = match meta.node_type {
-        fs::NodeType::Directory => ftype3::NF3DIR,
-        fs::NodeType::File => ftype3::NF3REG,
+        NodeType::Directory => ftype3::NF3DIR,
+        NodeType::File => ftype3::NF3REG,
     };
     fattr3 {
         ftype,
@@ -276,7 +271,7 @@ fn create_fattr(meta: &FileMeta) -> fattr3 {
         uid: 1000,
         gid: 1000,
         size: meta.size,
-        used: 0,
+        used: meta.size,
         rdev: specdata3 {
             specdata1: 0,
             specdata2: 0,
@@ -301,23 +296,3 @@ fn create_fattr(meta: &FileMeta) -> fattr3 {
 fn to_string(filename: &filename3) -> String {
     String::from_utf8(filename.0.clone()).unwrap()
 }
-
-const HOSTPORT: u32 = 11111;
-
-#[tokio::main]
-async fn main() {
-    let fmt_layer = tracing_subscriber::fmt::layer().with_writer(io::stderr);
-    let filter_layer = EnvFilter::from_default_env();
-
-    tracing_subscriber::registry()
-        .with(fmt_layer)
-        .with(filter_layer)
-        .init();
-
-    let listener = NFSTcpListener::bind(&format!("127.0.0.1:{HOSTPORT}"), RFS::default())
-        .await
-        .unwrap();
-    listener.handle_forever().await.unwrap();
-}
-// Test with
-// mount -t nfs -o nolocks,vers=3,tcp,port=11111,mountport=11111,soft 127.0.0.1:/ mnt/

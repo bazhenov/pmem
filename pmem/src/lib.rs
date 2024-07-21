@@ -1,4 +1,3 @@
-pub mod fs;
 pub mod memory;
 pub mod page;
 

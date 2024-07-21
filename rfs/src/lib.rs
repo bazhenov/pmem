@@ -1,4 +1,4 @@
-use crate::{memory::SlicePtr, Handle, Ptr, Storable, Transaction};
+use pmem::{memory::SlicePtr, Handle, Ptr, Storable, Transaction};
 use pmem_derive::Record;
 use std::{
     convert::Into,
@@ -10,6 +10,8 @@ use std::{
 
 type Result<T> = std::result::Result<T, Error>;
 type CreateResult = std::result::Result<Handle<FNode>, Handle<FNode>>;
+
+pub mod nfs;
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -26,7 +28,7 @@ pub enum Error {
     AlreadyExists,
 
     #[error("pmem error")]
-    PMemError(#[from] crate::memory::Error),
+    PMemError(#[from] pmem::memory::Error),
 
     #[error("IO Error")]
     IOError(#[from] std::io::Error),
@@ -427,7 +429,7 @@ impl fmt::Debug for Str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{fs::NodeType, Memory, Storable};
+    use pmem::{Memory, Storable};
 
     macro_rules! assert_missing {
         ($result:expr) => {

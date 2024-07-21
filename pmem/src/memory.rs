@@ -201,7 +201,7 @@ impl<T> Record for Ptr<T> {
 impl<T> NonZeroRecord for Ptr<T> {}
 
 impl<T> Ptr<T> {
-    pub(crate) fn unwrap_addr(&self) -> Addr {
+    pub fn unwrap_addr(&self) -> Addr {
         self.addr
     }
 }
