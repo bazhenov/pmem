@@ -2,26 +2,22 @@ use async_trait::async_trait;
 use core::fmt;
 use nfsserve::{
     nfs::{
-        self, fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfsstring, nfstime3, sattr3,
+        fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfsstring, nfstime3, sattr3,
         specdata3,
     },
-    tcp::*,
+    tcp::{NFSTcp, NFSTcpListener},
     vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities},
 };
 use pmem::{
     fs::{self, FileMeta, Filesystem, NodeType},
     memory, Memory, Storable,
 };
-use std::{
-    io::{Read, Write},
-    time::SystemTime,
-};
+use std::io::{Read, Write};
 use std::{
     io::{Seek, SeekFrom},
     sync::Mutex,
 };
 use thiserror::Error;
-use tracing::trace;
 
 #[derive(Debug, Error)]
 enum Error {
@@ -29,91 +25,26 @@ enum Error {
     MemoryError(#[from] memory::Error),
 }
 
-#[derive(Debug, Clone)]
-enum FSContents {
-    File(Vec<u8>),
-    Directory(Vec<fileid3>),
-}
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-struct FSEntry {
-    id: fileid3,
-    attr: fattr3,
-    name: filename3,
-    parent: fileid3,
-    contents: FSContents,
-}
-
-fn make_file(name: &str, id: fileid3, parent: fileid3, contents: &[u8]) -> FSEntry {
-    let attr = fattr3 {
-        ftype: ftype3::NF3REG,
-        mode: 0o755,
-        nlink: 1,
-        uid: 507,
-        gid: 507,
-        size: contents.len() as u64,
-        used: contents.len() as u64,
-        rdev: specdata3::default(),
-        fsid: 0,
-        fileid: id,
-        atime: nfstime3::default(),
-        mtime: nfstime3::default(),
-        ctime: nfstime3::default(),
-    };
-    FSEntry {
-        id,
-        attr,
-        name: name.as_bytes().into(),
-        parent,
-        contents: FSContents::File(contents.to_vec()),
-    }
-}
-
-fn make_dir(name: &str, id: fileid3, parent: fileid3, contents: Vec<fileid3>) -> FSEntry {
-    let attr = fattr3 {
-        ftype: ftype3::NF3DIR,
-        mode: 0o777,
-        nlink: 1,
-        uid: 507,
-        gid: 507,
-        size: 0,
-        used: 0,
-        rdev: specdata3::default(),
-        fsid: 0,
-        fileid: id,
-        atime: nfstime3::default(),
-        mtime: nfstime3::default(),
-        ctime: nfstime3::default(),
-    };
-    FSEntry {
-        id,
-        attr,
-        name: name.as_bytes().into(),
-        parent,
-        contents: FSContents::Directory(contents),
-    }
-}
-
-pub struct DemoFS {
+pub struct RFS {
     fs: Mutex<Filesystem>,
 }
 
-impl fmt::Debug for DemoFS {
+impl fmt::Debug for RFS {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "FS")
     }
 }
 
-impl Default for DemoFS {
-    fn default() -> DemoFS {
+impl Default for RFS {
+    fn default() -> RFS {
         let mem = Memory::default();
         let fs = Mutex::new(Filesystem::allocate(mem.start()));
-        DemoFS { fs }
+        RFS { fs }
     }
 }
 
 #[async_trait]
-impl NFSFileSystem for DemoFS {
+impl NFSFileSystem for RFS {
     #[tracing::instrument(level = "info")]
     fn root_dir(&self) -> fileid3 {
         tracing::info!("root_dir");
@@ -130,10 +61,7 @@ impl NFSFileSystem for DemoFS {
         tracing::info!("write");
         let mut fs = self.fs.lock().unwrap();
 
-        let meta = fs
-            .lookup_by_id(id)
-            .map_err(to_nfs_error)?
-            .ok_or(nfsstat3::NFS3ERR_NOENT)?;
+        let meta = fs.lookup_by_id(id).map_err(to_nfs_error)?;
         let mut file = fs.open_file(&meta).map_err(to_nfs_error)?;
         file.seek(SeekFrom::Start(offset))
             .ok()
@@ -151,10 +79,7 @@ impl NFSFileSystem for DemoFS {
     ) -> Result<(fileid3, fattr3), nfsstat3> {
         tracing::info!("create");
         let mut fs = self.fs.lock().unwrap();
-        let dir = fs
-            .lookup_by_id(dirid)
-            .map_err(to_nfs_error)?
-            .ok_or(nfsstat3::NFS3ERR_NOENT)?;
+        let dir = fs.lookup_by_id(dirid).map_err(to_nfs_error)?;
         let new_file = fs
             .create_file(&dir, to_string(&filename))
             .map_err(to_nfs_error)?;
@@ -175,10 +100,7 @@ impl NFSFileSystem for DemoFS {
         tracing::info!("lookup");
         let fs = self.fs.lock().unwrap();
         let filename = to_string(filename);
-        let dir = fs
-            .lookup_by_id(dirid as u64)
-            .map_err(to_nfs_error)?
-            .ok_or(nfsstat3::NFS3ERR_NOENT)?;
+        let dir = fs.lookup_by_id(dirid as u64).map_err(to_nfs_error)?;
         let result = fs
             .lookup(&dir, filename)
             .map_err(to_nfs_error)?
@@ -192,10 +114,7 @@ impl NFSFileSystem for DemoFS {
     async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3> {
         tracing::info!("getattr");
         let fs = self.fs.lock().unwrap();
-        let entry = fs
-            .lookup_by_id(id as u64)
-            .map_err(to_nfs_error)?
-            .ok_or(nfsstat3::NFS3ERR_NOENT)?;
+        let entry = fs.lookup_by_id(id as u64).map_err(to_nfs_error)?;
         Ok(create_fattr(&entry))
     }
 
@@ -204,10 +123,7 @@ impl NFSFileSystem for DemoFS {
         tracing::info!("setattr");
         let fs = self.fs.lock().unwrap();
 
-        let file = fs
-            .lookup_by_id(id)
-            .map_err(to_nfs_error)?
-            .ok_or(nfsstat3::NFS3ERR_NOENT)?;
+        let file = fs.lookup_by_id(id).map_err(to_nfs_error)?;
 
         Ok(create_fattr(&file))
     }
@@ -222,10 +138,7 @@ impl NFSFileSystem for DemoFS {
         tracing::info!("read");
         let mut fs = self.fs.lock().unwrap();
 
-        let entry = fs
-            .lookup_by_id(id)
-            .map_err(to_nfs_error)?
-            .ok_or(nfsstat3::NFS3ERR_NOENT)?;
+        let entry = fs.lookup_by_id(id).map_err(to_nfs_error)?;
         if entry.node_type == NodeType::Directory {
             let mut file = fs.open_file(&entry).map_err(to_nfs_error)?;
             file.seek(SeekFrom::Start(offset))
@@ -249,10 +162,7 @@ impl NFSFileSystem for DemoFS {
         tracing::info!("readdir");
         let fs = self.fs.lock().unwrap();
 
-        let dir = fs
-            .lookup_by_id(dirid)
-            .map_err(to_nfs_error)?
-            .ok_or(nfsstat3::NFS3ERR_NOENT)?;
+        let dir = fs.lookup_by_id(dirid).map_err(to_nfs_error)?;
 
         tracing::info!("readdir({}, {}, {})", &dir.name, start_after, max_entries);
 
@@ -283,10 +193,7 @@ impl NFSFileSystem for DemoFS {
     async fn remove(&self, dirid: fileid3, filename: &filename3) -> Result<(), nfsstat3> {
         tracing::info!("remove");
         let mut fs = self.fs.lock().unwrap();
-        let dir_meta = fs
-            .lookup_by_id(dirid)
-            .map_err(to_nfs_error)?
-            .ok_or(nfsstat3::NFS3ERR_NOENT)?;
+        let dir_meta = fs.lookup_by_id(dirid).map_err(to_nfs_error)?;
         tracing::info!("remove({}, {})", &dir_meta.name, filename);
         fs.delete(&dir_meta, to_string(filename))
             .map_err(to_nfs_error)
@@ -317,10 +224,7 @@ impl NFSFileSystem for DemoFS {
         tracing::info!("mkdir");
         let mut fs = self.fs.lock().unwrap();
 
-        let parent = fs
-            .lookup_by_id(dirid)
-            .map_err(to_nfs_error)?
-            .ok_or(nfsstat3::NFS3ERR_NOENT)?;
+        let parent = fs.lookup_by_id(dirid).map_err(to_nfs_error)?;
         let name = String::from_utf8(dirname.0.clone())
             .ok()
             .ok_or(nfsstat3::NFS3ERR_INVAL)?;
@@ -410,7 +314,7 @@ async fn main() {
         .with_max_level(tracing::Level::INFO)
         .with_writer(std::io::stderr)
         .init();
-    let listener = NFSTcpListener::bind(&format!("127.0.0.1:{HOSTPORT}"), DemoFS::default())
+    let listener = NFSTcpListener::bind(&format!("127.0.0.1:{HOSTPORT}"), RFS::default())
         .await
         .unwrap();
     listener.handle_forever().await.unwrap();

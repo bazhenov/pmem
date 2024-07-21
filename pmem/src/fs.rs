@@ -130,13 +130,11 @@ impl Filesystem {
             .map_err(|e| e.into())
     }
 
-    pub fn lookup_by_id(&self, id: u64) -> Result<Option<FileMeta>> {
+    pub fn lookup_by_id(&self, id: u64) -> Result<FileMeta> {
         assert!(id <= u32::MAX as u64);
-        let Some(ptr) = Ptr::<FNode>::from_addr(id as u32) else {
-            return Ok(None);
-        };
+        let ptr = Ptr::<FNode>::from_addr(id as u32).ok_or(Error::NotFound)?;
         let handle = self.tx.lookup(ptr)?;
-        FileMeta::from(handle, &self.tx).map(Some)
+        FileMeta::from(handle, &self.tx)
     }
 
     fn do_lookup_file(&self, path: impl AsRef<Path>) -> Result<Option<Handle<FNode>>> {
@@ -187,7 +185,7 @@ impl Filesystem {
         Ok(())
     }
 
-    pub fn create_file<'a>(&mut self, dir: &FileMeta, name: impl AsRef<str>) -> Result<FileMeta> {
+    pub fn create_file(&mut self, dir: &FileMeta, name: impl AsRef<str>) -> Result<FileMeta> {
         let file_name = name.as_ref();
 
         let mut dir = self.lookup_inode(dir)?.ok_or(Error::NotFound)?;
@@ -377,7 +375,7 @@ impl<'a> Seek for File<'a> {
 
 /// Helper structure that is used when iterating over linked list of [FileInfo] instances
 ///
-/// Contains the node itself as well as the previous node. It is usefull when we need to remove the node
+/// Contains the node itself as well as the previous node. It is useful when we need to remove the node
 /// from the list, and update the reference of the previous node.
 struct FileInfoReferent {
     // Previous FileInfo node in a linked list, if None the target node is the first one
@@ -428,9 +426,9 @@ pub enum NodeType {
     File,
 }
 
-impl Into<u8> for NodeType {
-    fn into(self) -> u8 {
-        match self {
+impl From<NodeType> for u8 {
+    fn from(node_type: NodeType) -> Self {
+        match node_type {
             NodeType::Directory => 0,
             NodeType::File => 1,
         }
@@ -550,8 +548,8 @@ mod tests {
         let (mut fs, _) = create_fs();
 
         let root = fs.get_root()?;
-        let etc = fs.create_dir(&root, "etc")?;
-        let swap = fs.create_file(&root, "swap")?;
+        fs.create_dir(&root, "etc")?;
+        fs.create_file(&root, "swap")?;
 
         fs.delete(&root, "etc")?;
         assert!(fs.find("/etc")?.is_none(), "/etc should be missing");
@@ -560,6 +558,7 @@ mod tests {
             fs.lookup(&root, "swap")?.is_some(),
             "/swap should be present"
         );
+
         fs.delete(&root, "swap")?;
         assert!(fs.find("/swap")?.is_none(), "/swap should be missing");
 
@@ -583,7 +582,7 @@ mod tests {
         assert!(usr.fid < lib.fid);
         assert!(lib.fid < bin.fid);
 
-        let bin_ref = fs.lookup_by_id(bin.fid)?.ok_or(Error::NotFound)?;
+        let bin_ref = fs.lookup_by_id(bin.fid)?;
         assert_eq!(bin.name, bin_ref.name);
 
         Ok(())
@@ -652,7 +651,7 @@ mod tests {
 
         assert!(children.contains(&etc), "Root should contains etc");
         assert!(children.contains(&bin), "Root should contains bin");
-        assert!(children.contains(&swap), "Root should contains spaw");
+        assert!(children.contains(&swap), "Root should contains spawn");
 
         Ok(())
     }

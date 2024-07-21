@@ -74,9 +74,9 @@ impl Transaction {
         self.snapshot.write(addr, bytes)
     }
 
-    pub fn lookup<'a, T: Record>(&self, ptr: Ptr<T>) -> Result<Handle<T>> {
+    pub fn lookup<T: Record>(&self, ptr: Ptr<T>) -> Result<Handle<T>> {
         let bytes = self.read_uncommitted(ptr.addr, T::SIZE).unwrap();
-        let value = T::read(&*bytes)?;
+        let value = T::read(&bytes)?;
         let size = T::SIZE;
 
         Ok(Handle {
@@ -207,7 +207,7 @@ impl<T> Copy for Ptr<T> {}
 
 impl<T> Ptr<T> {
     pub fn from_addr(addr: u32) -> Option<Self> {
-        (addr > 0).then(|| Self {
+        (addr > 0).then_some(Self {
             addr,
             _phantom: PhantomData::<T>,
         })
