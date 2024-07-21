@@ -101,13 +101,9 @@ impl NFSFileSystem for RFS {
         let fs = self.fs.lock().unwrap();
         let filename = to_string(filename);
         let dir = fs.lookup_by_id(dirid as u64).map_err(to_nfs_error)?;
-        let result = fs
-            .lookup(&dir, filename)
-            .map_err(to_nfs_error)?
-            .ok_or(nfsstat3::NFS3ERR_NOENT)
-            .map(|f| f.fid);
+        let result = fs.lookup(&dir, filename).map_err(to_nfs_error)?;
         tracing::info!("result = {:?}", result);
-        result
+        Ok(result.fid)
     }
 
     #[tracing::instrument(level = "info")]

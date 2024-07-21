@@ -30,6 +30,7 @@ pub enum Error {
     #[error("IO Error")]
     IOError(#[from] std::io::Error),
 
+    // TODO can be replaced with Utf8Error
     #[error("Invalid utf8 encoding")]
     Utf8(#[from] FromUtf8Error),
 }
@@ -103,31 +104,21 @@ impl Filesystem {
         self.tx.lookup(self.volume.root).unwrap()
     }
 
-    pub fn find(&self, path: impl AsRef<Path>) -> Result<Option<FileMeta>> {
-        if let Some(info) = self.do_lookup_file(path)? {
-            FileMeta::from(info, &self.tx).map(Some)
-        } else {
-            Ok(None)
-        }
+    pub fn find(&self, path: impl AsRef<Path>) -> Result<FileMeta> {
+        FileMeta::from(self.do_lookup_file(path)?, &self.tx)
     }
 
-    pub fn lookup(&self, dir: &FileMeta, name: impl AsRef<str>) -> Result<Option<FileMeta>> {
-        let Some(children) = self.lookup_inode(dir)?.and_then(|dir| dir.children) else {
-            return Ok(None);
-        };
-
-        self.find_child(children, name.as_ref())?
-            .map(|child| FileMeta::from(child.node, &self.tx))
-            .transpose()
+    pub fn lookup(&self, dir: &FileMeta, name: impl AsRef<str>) -> Result<FileMeta> {
+        let children = self.lookup_inode(dir)?.children.ok_or(Error::NotFound)?;
+        let child = self.find_child(children, name.as_ref())?;
+        FileMeta::from(child.node, &self.tx)
     }
 
-    fn lookup_inode(&self, meta: &FileMeta) -> Result<Option<Handle<FNode>>> {
+    fn lookup_inode(&self, meta: &FileMeta) -> Result<Handle<FNode>> {
         assert!(meta.fid <= u32::MAX as u64);
 
-        Ptr::from_addr(meta.fid as u32)
-            .map(|p| self.tx.lookup(p))
-            .transpose()
-            .map_err(|e| e.into())
+        let ptr = Ptr::from_addr(meta.fid as u32).ok_or(Error::NotFound)?;
+        self.tx.lookup(ptr).map_err(|e| e.into())
     }
 
     pub fn lookup_by_id(&self, id: u64) -> Result<FileMeta> {
@@ -137,7 +128,7 @@ impl Filesystem {
         FileMeta::from(handle, &self.tx)
     }
 
-    fn do_lookup_file(&self, path: impl AsRef<Path>) -> Result<Option<Handle<FNode>>> {
+    fn do_lookup_file(&self, path: impl AsRef<Path>) -> Result<Handle<FNode>> {
         let mut components = path.as_ref().components();
         let Some(Component::RootDir) = components.next() else {
             return Err(Error::PathMustBeAbsolute);
@@ -149,27 +140,20 @@ impl Filesystem {
             };
             let name = name.to_str().unwrap();
 
-            let Some(children) = cur_node.children else {
-                return Ok(None);
-            };
+            let children = cur_node.children.ok_or(Error::NotFound)?;
             let child = self.find_child(children, name)?;
-            let Some(child) = child else {
-                return Ok(None);
-            };
             cur_node = child.node;
         }
-        Ok(Some(cur_node))
+        Ok(cur_node)
     }
 
     pub fn delete(&mut self, dir: &FileMeta, name: impl AsRef<str>) -> Result<()> {
-        let mut dir = self.lookup_inode(dir)?.ok_or(Error::NotFound)?;
+        let mut dir = self.lookup_inode(dir)?;
 
         let Some(children) = dir.children else {
             return Err(Error::NotFound);
         };
-        let file = self
-            .find_child(children, name.as_ref())?
-            .ok_or(Error::NotFound)?;
+        let file = self.find_child(children, name.as_ref())?;
 
         let next_ptr = file.node.next;
         self.tx.reclaim(file.node);
@@ -188,7 +172,7 @@ impl Filesystem {
     pub fn create_file(&mut self, dir: &FileMeta, name: impl AsRef<str>) -> Result<FileMeta> {
         let file_name = name.as_ref();
 
-        let mut dir = self.lookup_inode(dir)?.ok_or(Error::NotFound)?;
+        let mut dir = self.lookup_inode(dir)?;
         let file_info = if let Some(children) = dir.children {
             self.find_or_create_child(children, file_name, NodeType::File)?
                 .take_if_created()
@@ -204,7 +188,7 @@ impl Filesystem {
     }
 
     pub fn open_file<'a>(&'a mut self, file: &FileMeta) -> Result<File<'a>> {
-        let file_info = self.lookup_inode(file)?.ok_or(Error::NotFound)?;
+        let file_info = self.lookup_inode(file)?;
 
         let content = if let Some(content) = file_info.file_content {
             self.tx.read_slice(content)?
@@ -220,7 +204,7 @@ impl Filesystem {
     }
 
     pub fn create_dir(&mut self, parent: &FileMeta, name: impl AsRef<str>) -> Result<FileMeta> {
-        let mut parent = self.lookup_inode(parent)?.ok_or(Error::NotFound)?;
+        let mut parent = self.lookup_inode(parent)?;
 
         let directory_inode = if let Some(first_child) = parent.children {
             self.find_or_create_child(first_child, name.as_ref(), NodeType::Directory)?
@@ -237,7 +221,7 @@ impl Filesystem {
     }
 
     pub fn readdir(&self, dir: &FileMeta) -> Result<Vec<FileMeta>> {
-        let parent = self.lookup_inode(dir)?.ok_or(Error::NotFound)?;
+        let parent = self.lookup_inode(dir)?;
 
         if let Some(children) = parent.children {
             let mut result = vec![];
@@ -282,19 +266,19 @@ impl Filesystem {
         FileMeta::from(node, &self.tx)
     }
 
-    fn find_child(&self, start_node: Ptr<FNode>, name: &str) -> Result<Option<FileInfoReferent>> {
+    fn find_child(&self, start_node: Ptr<FNode>, name: &str) -> Result<FileInfoReferent> {
         let mut cur_node = Some(start_node);
         let mut referent = None;
         while let Some(node) = cur_node {
             let node = self.tx.lookup(node)?;
             let child_name = node.name(&self.tx)?;
             if name == child_name.as_str() {
-                return Ok(Some(FileInfoReferent { referent, node }));
+                return Ok(FileInfoReferent { referent, node });
             }
             cur_node = node.next;
             referent = Some(node);
         }
-        Ok(None)
+        Err(Error::NotFound)
     }
 
     /// Returns `Ok(child)` if it was found otherwise create new [FileInfo] and returns `Err(new_child)`
@@ -459,6 +443,17 @@ mod tests {
     use super::*;
     use crate::{fs::NodeType, Memory, Storable};
 
+    macro_rules! assert_missing {
+        ($result:expr) => {
+            assert_missing!($result, "Expected item to be missing");
+        };
+        ($result:expr, $msg:expr) => {
+            let Some(Error::NotFound) = $result.err() else {
+                panic!($msg);
+            };
+        };
+    }
+
     #[test]
     fn check_root() -> Result<()> {
         let (fs, _) = create_fs();
@@ -473,8 +468,10 @@ mod tests {
     fn check_find_should_return_none_if_dir_is_missing() -> Result<()> {
         let (fs, _) = create_fs();
 
-        let node = fs.find("/foo")?;
-        assert!(node.is_none(), "Node should be missing");
+        let node = fs.find("/foo");
+        let Some(Error::NotFound) = node.err() else {
+            panic!("Node should be missing");
+        };
         Ok(())
     }
 
@@ -484,8 +481,7 @@ mod tests {
 
         fs.create_dirs("/etc")?;
         let root = fs.get_root()?;
-        let node = fs.lookup(&root, "etc")?;
-        assert!(node.is_some(), "Node should be present");
+        let _ = fs.lookup(&root, "etc")?;
         Ok(())
     }
 
@@ -495,9 +491,9 @@ mod tests {
 
         let root = fs.get_root()?;
         fs.create_dir(&root, "etc")?;
-        assert!(fs.lookup(&root, "etc")?.is_some(), "Dir should be present");
+        let _ = fs.lookup(&root, "etc")?;
 
-        let node = fs.find("/etc")?.expect("/etc should be found");
+        let node = fs.find("/etc")?;
         assert_eq!(node.name, "etc");
         assert_eq!(node.node_type, NodeType::Directory);
 
@@ -510,7 +506,7 @@ mod tests {
 
         fs.create_dirs("/usr/bin")?;
 
-        let node = fs.find("/usr/bin")?.expect("/usr/bin should be found");
+        let node = fs.find("/usr/bin")?;
         assert_eq!(node.name, "bin");
         assert_eq!(node.node_type, NodeType::Directory);
 
@@ -525,8 +521,7 @@ mod tests {
         fs.create_dir(&root, "usr")?;
         fs.delete(&root, "usr")?;
 
-        assert!(fs.find("/usr")?.is_none(), "/usr should be missing");
-
+        assert_missing!(fs.find("/usr"), "/usr should be missing");
         Ok(())
     }
 
@@ -538,7 +533,7 @@ mod tests {
         fs.create_file(&root, "swap")?;
         fs.delete(&root, "swap")?;
 
-        assert!(fs.find("/swap")?.is_none(), "/swap should be missing");
+        assert_missing!(fs.find("/swap"), "/swap should be missing");
 
         Ok(())
     }
@@ -552,15 +547,12 @@ mod tests {
         fs.create_file(&root, "swap")?;
 
         fs.delete(&root, "etc")?;
-        assert!(fs.find("/etc")?.is_none(), "/etc should be missing");
+        assert_missing!(fs.find("/etc"), "/etc should be missing");
 
-        assert!(
-            fs.lookup(&root, "swap")?.is_some(),
-            "/swap should be present"
-        );
+        let _ = fs.lookup(&root, "swap")?;
 
         fs.delete(&root, "swap")?;
-        assert!(fs.find("/swap")?.is_none(), "/swap should be missing");
+        assert_missing!(fs.find("/swap"), "/swap should be missing");
 
         Ok(())
     }
@@ -571,9 +563,9 @@ mod tests {
 
         fs.create_dirs("/usr/lib/bin")?;
 
-        let usr = fs.find("/usr")?.ok_or(Error::NotFound)?;
-        let lib = fs.find("/usr/lib")?.ok_or(Error::NotFound)?;
-        let bin = fs.find("/usr/lib/bin")?.ok_or(Error::NotFound)?;
+        let usr = fs.find("/usr")?;
+        let lib = fs.find("/usr/lib")?;
+        let bin = fs.find("/usr/lib/bin")?;
 
         assert!(usr.fid > 0);
         assert!(lib.fid > 0);
@@ -594,16 +586,14 @@ mod tests {
 
         let root = fs.get_root()?;
         let file = fs.create_file(&root, "file.txt")?;
-        assert!(
-            fs.lookup(&root, "file.txt")?.is_some(),
-            "File should be present"
-        );
+        let _ = fs.lookup(&root, "file.txt")?;
+
         let mut file = fs.open_file(&file)?;
         let expected_content = "Hello world";
         file.write(expected_content.as_bytes()).unwrap();
         file.flush()?;
 
-        let file_meta = fs.find("/file.txt")?.expect("File should be found");
+        let file_meta = fs.find("/file.txt")?;
         assert_eq!(file_meta.node_type, NodeType::File);
 
         let mut file = fs.open_file(&file_meta)?;
