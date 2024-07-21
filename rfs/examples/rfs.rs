@@ -18,6 +18,10 @@ use std::{
     sync::Mutex,
 };
 use thiserror::Error;
+use tracing::instrument;
+use tracing_subscriber::{
+    fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter,
+};
 
 #[derive(Debug, Error)]
 enum Error {
@@ -27,12 +31,6 @@ enum Error {
 
 pub struct RFS {
     fs: Mutex<Filesystem>,
-}
-
-impl fmt::Debug for RFS {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "FS")
-    }
 }
 
 impl Default for RFS {
@@ -45,9 +43,8 @@ impl Default for RFS {
 
 #[async_trait]
 impl NFSFileSystem for RFS {
-    #[tracing::instrument(level = "info")]
+    #[instrument(level = "trace", skip(self), ret)]
     fn root_dir(&self) -> fileid3 {
-        tracing::info!("root_dir");
         let fs = self.fs.lock().unwrap();
         fs.get_root().unwrap().fid
     }
@@ -56,7 +53,7 @@ impl NFSFileSystem for RFS {
         VFSCapabilities::ReadWrite
     }
 
-    #[tracing::instrument(level = "info")]
+    #[instrument(level = "trace", skip(self, data), fields(data.len = data.len()), err(Debug, level = "warn"))]
     async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
         let mut fs = self.fs.lock().unwrap();
 
@@ -68,19 +65,17 @@ impl NFSFileSystem for RFS {
         }
         file.write_all(data).map_err(io_to_nfs_error)?;
         file.flush().map_err(io_to_nfs_error)?;
-        tracing::info!("write buf");
         let new_meta = fs.lookup_by_id(id).map_err(pmem_to_nfs_error)?;
         Ok(create_fattr(&new_meta))
     }
 
-    #[tracing::instrument(level = "info")]
+    #[instrument(level = "trace", skip(self, _attr), ret, err(Debug, level = "warn"))]
     async fn create(
         &self,
         dirid: fileid3,
         filename: &filename3,
         _attr: sattr3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
-        tracing::info!("create");
         let mut fs = self.fs.lock().unwrap();
         let dir = fs.lookup_by_id(dirid).map_err(pmem_to_nfs_error)?;
         let new_file = fs
@@ -89,7 +84,7 @@ impl NFSFileSystem for RFS {
         Ok((new_file.fid, create_fattr(&new_file)))
     }
 
-    #[tracing::instrument(level = "info")]
+    #[instrument(level = "trace", skip(self), err(Debug, level = "warn"))]
     async fn create_exclusive(
         &self,
         _dirid: fileid3,
@@ -98,28 +93,24 @@ impl NFSFileSystem for RFS {
         Err(nfsstat3::NFS3ERR_NOTSUPP)
     }
 
-    #[tracing::instrument(level = "info")]
+    #[instrument(level = "trace", skip(self))]
     async fn lookup(&self, dirid: fileid3, filename: &filename3) -> Result<fileid3, nfsstat3> {
-        tracing::info!("lookup");
         let fs = self.fs.lock().unwrap();
         let filename = to_string(filename);
         let dir = fs.lookup_by_id(dirid as u64).map_err(pmem_to_nfs_error)?;
         let result = fs.lookup(&dir, filename).map_err(pmem_to_nfs_error)?;
-        tracing::info!("result = {:?}", result);
         Ok(result.fid)
     }
 
-    #[tracing::instrument(level = "info")]
+    #[instrument(level = "trace", skip(self))]
     async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3> {
-        tracing::info!("getattr");
         let fs = self.fs.lock().unwrap();
         let entry = fs.lookup_by_id(id as u64).map_err(pmem_to_nfs_error)?;
         Ok(create_fattr(&entry))
     }
 
-    #[tracing::instrument(level = "info")]
+    #[instrument(level = "trace", skip(self), err(Debug, level = "warn"))]
     async fn setattr(&self, id: fileid3, _setattr: sattr3) -> Result<fattr3, nfsstat3> {
-        tracing::info!("setattr");
         let fs = self.fs.lock().unwrap();
 
         let file = fs.lookup_by_id(id).map_err(pmem_to_nfs_error)?;
@@ -127,7 +118,7 @@ impl NFSFileSystem for RFS {
         Ok(create_fattr(&file))
     }
 
-    #[tracing::instrument(level = "info")]
+    #[instrument(level = "trace", skip(self), err(Debug, level = "warn"))]
     async fn read(
         &self,
         id: fileid3,
@@ -147,28 +138,23 @@ impl NFSFileSystem for RFS {
         }
         let mut buf = Vec::with_capacity(count as usize);
         let bytes_read = file.read_to_end(&mut buf).map_err(io_to_nfs_error)?;
-        tracing::info!("read following bytes: {:?}", buf);
         Ok((buf, bytes_read < count as usize))
     }
 
-    #[tracing::instrument(level = "info")]
+    #[instrument(level = "trace", skip(self), err(Debug, level = "warn"))]
     async fn readdir(
         &self,
         dirid: fileid3,
         start_after: fileid3,
         max_entries: usize,
     ) -> Result<ReadDirResult, nfsstat3> {
-        tracing::info!("readdir");
         let fs = self.fs.lock().unwrap();
 
         let dir = fs.lookup_by_id(dirid).map_err(pmem_to_nfs_error)?;
 
-        tracing::info!("readdir({}, {}, {})", &dir.name, start_after, max_entries);
-
         let mut children = fs.readdir(&dir).map_err(pmem_to_nfs_error)?;
         let start_idx = start_after as usize;
         if start_idx >= children.len() {
-            tracing::info!("not found");
             return Ok(ReadDirResult {
                 entries: vec![],
                 end: true,
@@ -180,28 +166,19 @@ impl NFSFileSystem for RFS {
             .map(to_dir_entry)
             .collect::<Vec<_>>();
         let end = end_idx <= children.len();
-        tracing::info!("{} entries found ({})", entries.len(), end);
         Ok(ReadDirResult { entries, end })
     }
 
-    /// Removes a file.
-    /// If not supported dur to readonly file system
-    /// this should return Err(nfsstat3::NFS3ERR_ROFS)
-    #[tracing::instrument(level = "info")]
+    #[instrument(level = "trace", skip(self), err(Debug, level = "warn"))]
     #[allow(unused)]
     async fn remove(&self, dirid: fileid3, filename: &filename3) -> Result<(), nfsstat3> {
-        tracing::info!("remove");
         let mut fs = self.fs.lock().unwrap();
         let dir_meta = fs.lookup_by_id(dirid).map_err(pmem_to_nfs_error)?;
-        tracing::info!("remove({}, {})", &dir_meta.name, filename);
         fs.delete(&dir_meta, to_string(filename))
             .map_err(pmem_to_nfs_error)
     }
 
-    /// Removes a file.
-    /// If not supported dur to readonly file system
-    /// this should return Err(nfsstat3::NFS3ERR_ROFS)
-    #[tracing::instrument(level = "info")]
+    #[instrument(level = "trace", skip(self), err(Debug, level = "warn"))]
     #[allow(unused)]
     async fn rename(
         &self,
@@ -213,14 +190,13 @@ impl NFSFileSystem for RFS {
         return Err(nfsstat3::NFS3ERR_NOTSUPP);
     }
 
-    #[tracing::instrument(level = "info")]
+    #[instrument(level = "trace", skip(self), ret, err(Debug, level = "warn"))]
     #[allow(unused)]
     async fn mkdir(
         &self,
         dirid: fileid3,
         dirname: &filename3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
-        tracing::info!("mkdir");
         let mut fs = self.fs.lock().unwrap();
 
         let parent = fs.lookup_by_id(dirid).map_err(pmem_to_nfs_error)?;
@@ -231,7 +207,7 @@ impl NFSFileSystem for RFS {
         Ok((dir.fid, create_fattr(&dir)))
     }
 
-    #[tracing::instrument(level = "info")]
+    #[instrument(level = "trace", skip(self), err(Debug, level = "warn"))]
     async fn symlink(
         &self,
         _dirid: fileid3,
@@ -242,7 +218,7 @@ impl NFSFileSystem for RFS {
         Err(nfsstat3::NFS3ERR_ROFS)
     }
 
-    #[tracing::instrument(level = "info")]
+    #[instrument(level = "trace", skip(self), err(Debug, level = "warn"))]
     async fn readlink(&self, _id: fileid3) -> Result<nfspath3, nfsstat3> {
         return Err(nfsstat3::NFS3ERR_NOTSUPP);
     }
@@ -330,10 +306,14 @@ const HOSTPORT: u32 = 11111;
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .with_writer(io::stderr)
+    let fmt_layer = tracing_subscriber::fmt::layer().with_writer(io::stderr);
+    let filter_layer = EnvFilter::from_default_env();
+
+    tracing_subscriber::registry()
+        .with(fmt_layer)
+        .with(filter_layer)
         .init();
+
     let listener = NFSTcpListener::bind(&format!("127.0.0.1:{HOSTPORT}"), RFS::default())
         .await
         .unwrap();
