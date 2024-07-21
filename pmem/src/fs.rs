@@ -59,6 +59,7 @@ impl Storable for Filesystem {
         let root_entry = FNode {
             name: Str(name),
             fid: 1,
+            size: 0,
             node_type: NodeType::Directory.into(),
             children: None,
             file_content: None,
@@ -292,6 +293,7 @@ impl Filesystem {
             name: Str(name),
             fid,
             node_type: node_type.into(),
+            size: 0,
             file_content: None,
             children: None,
             next: None,
@@ -320,10 +322,13 @@ impl<'a> Write for File<'a> {
 
     fn flush(&mut self) -> io::Result<()> {
         if let Some(_old_content) = self.file_info.file_content.take() {
-            // Remove old content
+            // TODO Remove old content
         }
-        let slice = self.fs.tx.write_slice(self.cursor.get_ref());
+        let value = self.cursor.get_ref();
+        let size = value.len();
+        let slice = self.fs.tx.write_slice(value);
         self.file_info.file_content = Some(slice);
+        self.file_info.size = size as u64;
         self.fs.tx.update(&self.file_info);
         Ok(())
     }
@@ -351,6 +356,7 @@ pub struct FileMeta {
     // Unique file id on a volume
     pub fid: u64,
     pub node_type: NodeType,
+    pub size: u64,
 }
 
 impl FileMeta {
@@ -359,6 +365,7 @@ impl FileMeta {
         Ok(FileMeta {
             name,
             fid: u64::from(file_info.ptr().unwrap_addr()),
+            size: file_info.size,
             node_type: NodeType::from(file_info.node_type),
         })
     }
@@ -370,6 +377,7 @@ struct FNode {
     // Unique file id on a volume
     fid: u64,
     node_type: u8,
+    size: u64,
     children: Option<Ptr<FNode>>,
     file_content: Option<SlicePtr<u8>>,
     next: Option<Ptr<FNode>>,
@@ -563,18 +571,19 @@ mod tests {
         let (mut fs, _) = create_fs();
 
         let root = fs.get_root()?;
-        let file = fs.create_file(&root, "file.txt")?;
+        let meta = fs.create_file(&root, "file.txt")?;
         let _ = fs.lookup(&root, "file.txt")?;
 
-        let mut file = fs.open_file(&file)?;
+        let mut file = fs.open_file(&meta)?;
         let expected_content = "Hello world";
-        file.write(expected_content.as_bytes()).unwrap();
+        file.write_all(expected_content.as_bytes())?;
         file.flush()?;
 
-        let file_meta = fs.find("/file.txt")?;
-        assert_eq!(file_meta.node_type, NodeType::File);
+        let meta = fs.lookup_by_id(meta.fid)?;
+        assert_eq!(meta.node_type, NodeType::File);
+        assert_eq!(meta.size, 11);
 
-        let mut file = fs.open_file(&file_meta)?;
+        let mut file = fs.open_file(&meta)?;
         let mut content = String::new();
         file.read_to_string(&mut content)?;
         assert_eq!(content, expected_content);
@@ -589,12 +598,12 @@ mod tests {
         let root = fs.get_root()?;
         let file_meta = fs.create_file(&root, "file.txt")?;
         let mut file = fs.open_file(&file_meta)?;
-        file.write("Hello world".as_bytes())?;
+        file.write_all("Hello world".as_bytes())?;
         file.flush()?;
 
         let mut file = fs.open_file(&file_meta)?;
         file.seek(SeekFrom::Start(6))?;
-        file.write("Rust!".as_bytes())?;
+        file.write_all("Rust!".as_bytes())?;
         file.flush()?;
 
         let mut file = fs.open_file(&file_meta)?;
