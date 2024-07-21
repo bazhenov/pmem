@@ -183,6 +183,23 @@ pub struct Ptr<T> {
     _phantom: PhantomData<T>,
 }
 
+impl<T> Record for Ptr<T> {
+    const SIZE: usize = mem::size_of::<Addr>();
+
+    fn read(data: &[u8]) -> Result<Self> {
+        let addr = u32::from_le_bytes(data.try_into()?);
+        Ptr::from_addr(addr).ok_or(Error::NullPointer)
+    }
+
+    fn write(&self, data: &mut [u8]) -> Result<()> {
+        let bytes = self.addr.to_le_bytes();
+        data.copy_from_slice(bytes.as_slice());
+        Ok(())
+    }
+}
+
+impl<T> NonZeroRecord for Ptr<T> {}
+
 impl<T> Ptr<T> {
     pub(crate) fn unwrap_addr(&self) -> Addr {
         self.addr
@@ -213,6 +230,7 @@ impl<T> Ptr<T> {
         })
     }
 }
+impl<T> NonZeroRecord for SlicePtr<T> {}
 
 #[derive(Record)]
 pub struct SlicePtr<T>(Ptr<T>);
@@ -272,53 +290,29 @@ macro_rules! impl_record_for_primitive {
 impl_record_for_primitive!(u8, u16, u32, u64);
 impl_record_for_primitive!(i8, i16, i32, i64);
 
-impl<T> Record for Option<Ptr<T>> {
-    const SIZE: usize = 4;
+/// Indicates that all zero bytes is not valid state for a record and it is represented
+/// as an `Option<T>` in type system.
+trait NonZeroRecord: Record {}
+
+impl<T: NonZeroRecord> Record for Option<T> {
+    const SIZE: usize = T::SIZE;
 
     fn read(data: &[u8]) -> Result<Self> {
-        let addr = u32::from_le_bytes(data[0..4].try_into()?);
-        let ptr = Some(addr).filter(|addr| *addr > 0).and_then(Ptr::from_addr);
-        Ok(ptr)
+        if data.iter().any(|v| *v != 0) {
+            T::read(data).map(Some)
+        } else {
+            Ok(None)
+        }
     }
 
     fn write(&self, data: &mut [u8]) -> Result<()> {
-        let bytes = self.map(|ptr| ptr.addr).unwrap_or(0).to_le_bytes();
-        data.copy_from_slice(bytes.as_slice());
-        Ok(())
-    }
-}
-
-impl<T> Record for Ptr<T> {
-    const SIZE: usize = mem::size_of::<Addr>();
-
-    fn read(data: &[u8]) -> Result<Self> {
-        let addr = u32::from_le_bytes(data.try_into()?);
-        Ptr::from_addr(addr).ok_or(Error::NullPointer)
-    }
-
-    fn write(&self, data: &mut [u8]) -> Result<()> {
-        let bytes = self.addr.to_le_bytes();
-        data.copy_from_slice(bytes.as_slice());
-        Ok(())
-    }
-}
-
-// TODO remove duplication
-impl<T> Record for Option<SlicePtr<T>> {
-    const SIZE: usize = <SlicePtr<T> as Record>::SIZE;
-
-    fn read(data: &[u8]) -> Result<Self> {
-        let addr = u32::from_le_bytes(data.try_into()?);
-        let ptr = Some(addr)
-            .filter(|addr| *addr > 0)
-            .and_then(SlicePtr::from_addr);
-        Ok(ptr)
-    }
-
-    fn write(&self, data: &mut [u8]) -> Result<()> {
-        let bytes = self.map(|ptr| ptr.0.addr).unwrap_or(0).to_le_bytes();
-        data.copy_from_slice(bytes.as_slice());
-        Ok(())
+        match self {
+            Some(value) => value.write(data),
+            None => {
+                data.fill(0);
+                Ok(())
+            }
+        }
     }
 }
 

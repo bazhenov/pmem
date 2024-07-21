@@ -5,10 +5,11 @@ use std::{
     fmt,
     io::{self, Cursor, Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
-    string::FromUtf8Error,
+    str::Utf8Error,
 };
 
-pub type Result<T> = std::result::Result<T, Error>;
+type Result<T> = std::result::Result<T, Error>;
+type CreateResult = std::result::Result<Handle<FNode>, Handle<FNode>>;
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -30,9 +31,8 @@ pub enum Error {
     #[error("IO Error")]
     IOError(#[from] std::io::Error),
 
-    // TODO can be replaced with Utf8Error
     #[error("Invalid utf8 encoding")]
-    Utf8(#[from] FromUtf8Error),
+    Utf8(#[from] Utf8Error),
 }
 
 pub struct Filesystem {
@@ -44,27 +44,6 @@ pub struct Filesystem {
 pub struct VolumeInfo {
     next_fid: u64,
     root: Ptr<FNode>,
-}
-
-enum FoundOrCreated<T> {
-    Found(T),
-    Created(T),
-}
-
-impl<T> FoundOrCreated<T> {
-    fn into(self) -> T {
-        match self {
-            FoundOrCreated::Found(value) => value,
-            FoundOrCreated::Created(value) => value,
-        }
-    }
-
-    fn take_if_created(self) -> Option<T> {
-        match self {
-            FoundOrCreated::Created(value) => Some(value),
-            FoundOrCreated::Found(_) => None,
-        }
-    }
 }
 
 impl Storable for Filesystem {
@@ -91,7 +70,7 @@ impl Storable for Filesystem {
     }
 
     fn finish(self) -> Transaction {
-        todo!()
+        self.tx
     }
 }
 
@@ -174,8 +153,8 @@ impl Filesystem {
 
         let mut dir = self.lookup_inode(dir)?;
         let file_info = if let Some(children) = dir.children {
-            self.find_or_create_child(children, file_name, NodeType::File)?
-                .take_if_created()
+            self.create_child(children, file_name, NodeType::File)?
+                .ok()
                 .ok_or(Error::AlreadyExists)?
         } else {
             let new_node = self.write_fsnode(file_name, NodeType::File);
@@ -207,8 +186,8 @@ impl Filesystem {
         let mut parent = self.lookup_inode(parent)?;
 
         let directory_inode = if let Some(first_child) = parent.children {
-            self.find_or_create_child(first_child, name.as_ref(), NodeType::Directory)?
-                .take_if_created()
+            self.create_child(first_child, name.as_ref(), NodeType::Directory)?
+                .ok()
                 .ok_or(Error::AlreadyExists)?
         } else {
             let dir_inode = self.write_fsnode(name.as_ref(), NodeType::Directory);
@@ -240,13 +219,12 @@ impl Filesystem {
 
     pub fn create_dirs(&mut self, name: impl Into<PathBuf>) -> Result<FileMeta> {
         let path = name.into();
-
         let mut components = path.components();
         let Some(Component::RootDir) = components.next() else {
             return Err(Error::PathMustBeAbsolute);
         };
 
-        let mut node: Handle<FNode> = self.get_root_handle();
+        let mut node = self.get_root_handle();
         for component in components {
             let Component::Normal(name) = component else {
                 return Err(Error::NotSupported);
@@ -258,8 +236,8 @@ impl Filesystem {
                 self.tx.update(&node);
                 new_node
             } else {
-                self.find_or_create_child(node.ptr(), name.to_str().unwrap(), NodeType::Directory)?
-                    .into()
+                self.create_child(node.ptr(), name.to_str().unwrap(), NodeType::Directory)?
+                    .unwrap_or_else(|found_dir| found_dir)
             }
         }
 
@@ -282,19 +260,19 @@ impl Filesystem {
     }
 
     /// Returns `Ok(child)` if it was found otherwise create new [FileInfo] and returns `Err(new_child)`
-    fn find_or_create_child(
+    fn create_child(
         &mut self,
         start_node: Ptr<FNode>,
         name: &str,
         node_type: NodeType,
-    ) -> Result<FoundOrCreated<Handle<FNode>>> {
+    ) -> Result<CreateResult> {
         let mut prev_node = start_node;
         let mut cur_node = Some(start_node);
         while let Some(node) = cur_node {
             let value = self.tx.lookup(node)?;
             let child_name = value.name(&self.tx)?;
             if name == child_name.as_str() {
-                return Ok(FoundOrCreated::Found(value));
+                return Ok(CreateResult::Err(value));
             }
             prev_node = node;
             cur_node = value.next;
@@ -303,7 +281,7 @@ impl Filesystem {
         let mut prev_node = self.tx.lookup(prev_node)?;
         prev_node.next = Some(new_node.ptr());
         self.tx.update(&prev_node);
-        Ok(FoundOrCreated::Created(new_node))
+        Ok(CreateResult::Ok(new_node))
     }
 
     fn write_fsnode(&mut self, name: &str, node_type: NodeType) -> Handle<FNode> {
@@ -400,7 +378,7 @@ struct FNode {
 impl FNode {
     fn name(&self, tx: &Transaction) -> Result<String> {
         let bytes = tx.read_slice(self.name.0)?;
-        Ok(String::from_utf8(bytes)?)
+        Ok(String::from_utf8(bytes).map_err(|e| e.utf8_error())?)
     }
 }
 
