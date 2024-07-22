@@ -53,7 +53,6 @@
 //! overhead, making it perfectly valid and cost-effective to create a snapshot even when the intention is only to
 //! read data without any modifications.
 
-use crate::ensure;
 use std::{borrow::Cow, ops::Range, sync::Arc};
 
 pub const PAGE_SIZE: usize = 1 << 24; // 16Mb
@@ -61,8 +60,6 @@ pub type Addr = u32;
 pub type PageOffset = u32;
 pub type PageNo = u32;
 pub type LSN = u64;
-
-type Result<T> = std::result::Result<T, Error>;
 
 /// Represents a modification recorded in a snapshot.
 ///
@@ -434,8 +431,10 @@ impl PagePool {
     }
 
     #[cfg(test)]
-    fn read(&self, addr: PageOffset, len: usize) -> Result<Cow<[u8]>> {
-        self.latest.read(addr, len)
+    fn read(&self, addr: PageOffset, len: usize) -> Cow<[u8]> {
+        let mut buffer = vec![0; len];
+        self.latest.read_to_buf(addr, &mut buffer);
+        Cow::Owned(buffer)
     }
 }
 
@@ -480,22 +479,8 @@ impl Default for CommittedSnapshot {
 }
 
 impl CommittedSnapshot {
-    pub fn read(&self, addr: PageOffset, len: usize) -> Result<Cow<'_, [u8]>> {
-        assert!(len <= PAGE_SIZE, "Out of bounds read");
-
-        let (page_no, _) = split_ptr(addr);
-        ensure!(page_no < self.pages, Error::OutOfBounds);
-
-        let mut buffer = vec![0; len];
-        self.read_to_buf(addr, &mut buffer)?;
-        Ok(Cow::Owned(buffer))
-    }
-
-    pub fn read_to_buf(&self, addr: PageOffset, buf: &mut [u8]) -> Result<()> {
-        assert!(buf.len() <= PAGE_SIZE, "Out of bounds read");
-
-        let (page_no, _) = split_ptr(addr);
-        ensure!(page_no < self.pages, Error::OutOfBounds);
+    fn read_to_buf(&self, addr: PageOffset, buf: &mut [u8]) {
+        check_and_split_ptr(addr, buf.len(), self.pages);
 
         let range = (addr as usize)..addr as usize + buf.len();
 
@@ -510,7 +495,6 @@ impl CommittedSnapshot {
         patch_list.extend(snapshots.iter().map(|s| s.patches.as_slice()));
 
         apply_patches(&patch_list, buf, &range);
-        Ok(())
     }
 }
 
@@ -541,6 +525,8 @@ pub struct Snapshot {
 
 impl Snapshot {
     pub fn write(&mut self, addr: Addr, bytes: &[u8]) {
+        check_and_split_ptr(addr, bytes.len(), self.pages);
+
         if !bytes.is_empty() {
             self.push_patch(Patch::Write(addr, bytes.to_vec()))
         }
@@ -606,17 +592,16 @@ impl Snapshot {
         debug_assert_sorted_and_has_no_overlaps(&self.patches);
     }
 
-    pub fn read(&self, addr: PageOffset, len: usize) -> Result<Cow<'_, [u8]>> {
-        let (page_no, _) = split_ptr(addr);
-        ensure!(page_no < self.pages, Error::OutOfBounds);
+    pub fn read(&self, addr: PageOffset, len: usize) -> Cow<'_, [u8]> {
+        check_and_split_ptr(addr, len, self.pages);
 
         let mut buf = vec![0; len];
-        self.base.read_to_buf(addr, &mut buf)?;
+        self.base.read_to_buf(addr, &mut buf);
 
         let addr = addr as usize;
         let range = addr..addr + len;
         apply_patches(&[self.patches.as_slice()], &mut buf, &range);
-        Ok(Cow::Owned(buf))
+        Cow::Owned(buf)
     }
 
     #[cfg(test)]
@@ -724,6 +709,17 @@ fn debug_assert_sorted_and_has_no_overlaps<T: MemRange>(ranges: &[T]) {
     )
 }
 
+fn check_and_split_ptr(addr: Addr, len: usize, pages: u32) -> (PageNo, PageOffset) {
+    let (page_no, offset) = split_ptr(addr);
+    // we need to subtract 1 byte, becase end address exclusive
+    let (end_page_no, _) = split_ptr(addr + (len as Addr) - 1);
+
+    assert!(page_no < pages, "Start address is out of bounds");
+    assert!(end_page_no < pages, "End address is out of bounds");
+
+    (page_no, offset)
+}
+
 fn split_ptr(addr: Addr) -> (PageNo, PageOffset) {
     const PAGE_SIZE_BITS: u32 = PAGE_SIZE.trailing_zeros();
     let page_no = addr >> PAGE_SIZE_BITS;
@@ -740,61 +736,49 @@ fn intersects(patch: &Patch, range: &Range<usize>) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use std::{panic, thread};
 
-    use super::*;
-
     #[test]
-    fn create_new_page() -> Result<()> {
-        let snapshot = CommittedSnapshot::from("foo".as_bytes());
-        assert_str_eq(snapshot.read(0, 3)?, "foo");
-        assert_str_eq(snapshot.read(3, 1)?, [0]);
-        Ok(())
-    }
-
-    #[test]
-    fn committed_changes_should_be_visible_on_a_page() -> Result<()> {
+    fn committed_changes_should_be_visible_on_a_page() {
         let mut mem = PagePool::from("Jekyll");
 
         let mut snapshot = mem.snapshot();
         snapshot.write(0, b"Hide");
         mem.commit(snapshot);
 
-        assert_str_eq(mem.read(0, 4)?, b"Hide");
-        Ok(())
+        assert_str_eq(mem.read(0, 4), b"Hide");
     }
 
     #[test]
-    fn uncommitted_changes_should_be_visible_only_on_the_snapshot() -> Result<()> {
+    fn uncommitted_changes_should_be_visible_only_on_the_snapshot() {
         let mem = PagePool::from("Jekyll");
 
         let mut snapshot = mem.snapshot();
         snapshot.write(0, b"Hide");
 
-        assert_str_eq(snapshot.read(0, 4)?, "Hide");
-        assert_str_eq(mem.read(0, 6)?, "Jekyll");
-        Ok(())
+        assert_str_eq(snapshot.read(0, 4), "Hide");
+        assert_str_eq(mem.read(0, 6), "Jekyll");
     }
 
     #[test]
-    fn patch_page() -> Result<()> {
+    fn patch_page() {
         let mut mem = PagePool::from("Hello panic!");
 
         let mut snapshot = mem.snapshot();
         snapshot.write(6, b"world");
         mem.commit(snapshot);
 
-        assert_str_eq(mem.read(0, 12)?, "Hello world!");
-        assert_str_eq(mem.read(0, 8)?, "Hello wo");
-        assert_str_eq(mem.read(3, 9)?, "lo world!");
-        assert_str_eq(mem.read(6, 5)?, "world");
-        assert_str_eq(mem.read(8, 4)?, "rld!");
-        assert_str_eq(mem.read(7, 3)?, "orl");
-        Ok(())
+        assert_str_eq(mem.read(0, 12), "Hello world!");
+        assert_str_eq(mem.read(0, 8), "Hello wo");
+        assert_str_eq(mem.read(3, 9), "lo world!");
+        assert_str_eq(mem.read(6, 5), "world");
+        assert_str_eq(mem.read(8, 4), "rld!");
+        assert_str_eq(mem.read(7, 3), "orl");
     }
 
     #[test]
-    fn data_across_multiple_pages_can_be_written() -> Result<()> {
+    fn data_across_multiple_pages_can_be_written() {
         let mut mem = PagePool::new(3);
 
         let alice = b"Alice";
@@ -812,45 +796,55 @@ mod tests {
         snapshot.write(page_c, charlie);
 
         // Checking that data is visible in snapshot
-        assert_str_eq(snapshot.read(page_a, alice.len())?, alice);
-        assert_str_eq(snapshot.read(page_b, bob.len())?, bob);
-        assert_str_eq(snapshot.read(page_c, charlie.len())?, charlie);
+        assert_str_eq(snapshot.read(page_a, alice.len()), alice);
+        assert_str_eq(snapshot.read(page_b, bob.len()), bob);
+        assert_str_eq(snapshot.read(page_c, charlie.len()), charlie);
 
         mem.commit(snapshot);
 
         // Checking that data is visible after commit to page pool
-        assert_str_eq(mem.read(page_a, alice.len())?, alice);
-        assert_str_eq(mem.read(page_b, bob.len())?, bob);
-        assert_str_eq(mem.read(page_c, charlie.len())?, charlie);
-
-        Ok(())
+        assert_str_eq(mem.read(page_a, alice.len()), alice);
+        assert_str_eq(mem.read(page_b, bob.len()), bob);
+        assert_str_eq(mem.read(page_c, charlie.len()), charlie);
     }
 
     #[test]
-    fn data_can_be_removed_on_snapshot() -> Result<()> {
+    fn data_can_be_removed_on_snapshot() {
         let data = [1, 2, 3, 4, 5];
         let mem = PagePool::from(data.as_slice());
 
         let mut snapshot = mem.snapshot();
         snapshot.reclaim(1, 3);
 
-        assert_eq!(snapshot.read(0, 5)?, [1u8, 0, 0, 0, 5].as_slice());
-        Ok(())
+        assert_eq!(snapshot.read(0, 5), [1u8, 0, 0, 0, 5].as_slice());
     }
 
     #[test]
-    fn page_pool_should_return_error_of_ptr_out_of_bounds() -> Result<()> {
+    #[should_panic(expected = "address is out of bounds")]
+    fn page_pool_should_return_error_on_oob_read() {
+        let mem = PagePool::default();
+        let snapshot = mem.snapshot();
+
+        // reading in a such a way that start address is still valid, but end address is not
+        let start = PAGE_SIZE as u32 - 10;
+        let len = 20;
+        let _ = snapshot.read(start, len);
+    }
+
+    #[test]
+    #[should_panic(expected = "address is out of bounds")]
+    fn page_pool_should_return_error_on_oob_write() {
         let mem = PagePool::default();
 
-        let Err(Error::OutOfBounds) = mem.read(PAGE_SIZE as u32, 1) else {
-            panic!("OutOfBounds should be geberated");
-        };
-        Ok(())
+        let mut snapshot = mem.snapshot();
+        let bytes = [0; 20];
+        let addr = PAGE_SIZE as u32 - 10;
+        let _ = snapshot.write(addr, &bytes);
     }
 
     #[test]
-    fn change_number_of_pages_on_commit() -> Result<()> {
-        let mut mem = PagePool::new(2); // Initially 2 pages
+    fn change_number_of_pages_on_commit() {
+        let mut mem = PagePool::new(1); // Initially 1 page
 
         let page_a = 0;
         let page_b = 1 * PAGE_SIZE as Addr;
@@ -860,23 +854,9 @@ mod tests {
 
         let mut snapshot = mem.snapshot();
         snapshot.write(page_a, alice);
+        snapshot.resize(2); // adding second page
         snapshot.write(page_b, bob);
         mem.commit(snapshot);
-
-        let mut snapshot = mem.snapshot();
-        snapshot.resize(1); // removing second page
-        let Err(Error::OutOfBounds) = snapshot.read(page_b, bob.len()) else {
-            // changes should be visible immediateley on snapshot
-            panic!("{} should be generated", Error::OutOfBounds);
-        };
-        mem.commit(snapshot);
-
-        // changes also should be visible after commit
-        let Err(Error::OutOfBounds) = mem.read(page_b, bob.len()) else {
-            panic!("{} should be generated", Error::OutOfBounds);
-        };
-
-        Ok(())
     }
 
     /// When dropping PagePool all related snapshots will be removed. It may lead
@@ -1141,7 +1121,7 @@ mod tests {
                     mem.commit(snapshot);
                 }
 
-                assert_buffers_eq(&*mem.read(0, DB_SIZE).unwrap(), shadow_buffer.as_slice())?;
+                assert_buffers_eq(&*mem.read(0, DB_SIZE), shadow_buffer.as_slice())?;
             }
 
             #[test]

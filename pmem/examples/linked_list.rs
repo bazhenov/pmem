@@ -40,13 +40,13 @@ impl Storable for LinkedList {
     }
 
     fn allocate(mut tx: Transaction) -> Self {
-        let root = tx.write(LinkedListNode { first: None });
+        let root = tx.write(LinkedListNode { first: None }).unwrap();
         let ptr = root.ptr();
         Self { tx, root, ptr }
     }
 
     fn finish(mut self) -> Transaction {
-        self.tx.update(&self.root);
+        self.tx.update(&self.root).unwrap();
         self.tx
     }
 }
@@ -59,10 +59,13 @@ struct ListNode {
 
 impl LinkedList {
     fn push_front(&mut self, value: i32) {
-        let handle = self.tx.write(ListNode {
-            value,
-            next: self.root.first,
-        });
+        let handle = self
+            .tx
+            .write(ListNode {
+                value,
+                next: self.root.first,
+            })
+            .unwrap();
         self.root.first = Some(handle.ptr());
     }
 

@@ -75,7 +75,7 @@ impl Transaction {
     }
 
     pub fn lookup<T: Record>(&self, ptr: Ptr<T>) -> Result<Handle<T>> {
-        let bytes = self.read_uncommitted(ptr.addr, T::SIZE).unwrap();
+        let bytes = self.read_uncommitted(ptr.addr, T::SIZE);
         let value = T::read(&bytes)?;
         let size = T::SIZE;
 
@@ -95,7 +95,7 @@ impl Transaction {
         let items = self.read_static::<SLICE_HEADER_SIZE>(addr);
 
         let items = u32::from_le_bytes(items) as usize;
-        let bytes = self.read_uncommitted(addr + SLICE_HEADER_SIZE as u32, items * T::SIZE)?;
+        let bytes = self.read_uncommitted(addr + SLICE_HEADER_SIZE as u32, items * T::SIZE);
         let mut result = Vec::with_capacity(items);
         for chunk in bytes.chunks(T::SIZE) {
             result.push(T::read(chunk)?);
@@ -105,15 +105,15 @@ impl Transaction {
 
     fn read_static<const N: usize>(&self, offset: PageOffset) -> [u8; N] {
         let mut ret = [0; N];
-        let bytes = self.read_uncommitted(offset, N).unwrap();
+        let bytes = self.read_uncommitted(offset, N);
         for (to, from) in ret.iter_mut().zip(bytes.iter()) {
             *to = *from;
         }
         ret
     }
 
-    fn read_uncommitted(&self, addr: PageOffset, len: usize) -> Result<Cow<[u8]>> {
-        Ok(self.snapshot.read(addr, len)?)
+    fn read_uncommitted(&self, addr: PageOffset, len: usize) -> Cow<[u8]> {
+        self.snapshot.read(addr, len)
     }
 
     fn alloc(&mut self, size: usize) -> Addr {
@@ -123,13 +123,13 @@ impl Transaction {
         addr
     }
 
-    pub fn write<T: Record>(&mut self, value: T) -> Handle<T> {
-        let (ptr, size) = self.write_to_memory(&value, None);
+    pub fn write<T: Record>(&mut self, value: T) -> Result<Handle<T>> {
+        let (ptr, size) = self.write_to_memory(&value, None)?;
         let addr = ptr.addr;
-        Handle { addr, value, size }
+        Ok(Handle { addr, value, size })
     }
 
-    pub fn write_slice<T: Record>(&mut self, value: &[T]) -> SlicePtr<T> {
+    pub fn write_slice<T: Record>(&mut self, value: &[T]) -> Result<SlicePtr<T>> {
         assert!(value.len() <= PageOffset::MAX as usize);
         let mut buffer = vec![0u8; SLICE_HEADER_SIZE + T::SIZE * value.len()];
 
@@ -147,12 +147,16 @@ impl Transaction {
         let size = buffer.len();
         let ptr = SlicePtr::from_addr(self.alloc(size)).unwrap();
         self.write_bytes(ptr.0.addr, &buffer);
-        ptr
+        Ok(ptr)
     }
 
     /// Writes object to a given address or allocates new memory for an object and writes to it
     /// Returns the pointer and the size of the block
-    fn write_to_memory<T: Record>(&mut self, value: &T, ptr: Option<Ptr<T>>) -> (Ptr<T>, usize) {
+    fn write_to_memory<T: Record>(
+        &mut self,
+        value: &T,
+        ptr: Option<Ptr<T>>,
+    ) -> Result<(Ptr<T>, usize)> {
         let mut buffer = vec![0u8; T::SIZE];
 
         // writing body
@@ -164,12 +168,12 @@ impl Transaction {
         });
 
         self.write_bytes(ptr.addr, &buffer);
-
-        (ptr, size)
+        Ok((ptr, size))
     }
 
-    pub fn update<T: Record>(&mut self, handle: &Handle<T>) {
-        self.write_to_memory(&handle.value, Some(handle.ptr()));
+    pub fn update<T: Record>(&mut self, handle: &Handle<T>) -> Result<()> {
+        self.write_to_memory(&handle.value, Some(handle.ptr()))?;
+        Ok(())
     }
 
     pub fn reclaim<T>(&mut self, handle: Handle<T>) -> T {
@@ -381,7 +385,7 @@ mod tests {
         let (mut tx, _) = start();
 
         let value = Value(42);
-        let handle = tx.write(value);
+        let handle = tx.write(value)?;
         let value_copy = tx.read(handle.ptr())?;
         assert_eq!(&value_copy, &*handle);
         Ok(())
@@ -392,7 +396,7 @@ mod tests {
         let (mut tx, _) = start();
 
         let value: &[u8] = &[0, 1, 2, 3, 4, 5];
-        let slice = tx.write_slice(value);
+        let slice = tx.write_slice(value)?;
         let value_copy = tx.read_slice(slice)?;
         assert_eq!(value_copy, value);
         Ok(())
@@ -416,7 +420,7 @@ mod tests {
     fn reclaim() -> Result<()> {
         let (mut tx, _) = start();
 
-        let handle = tx.write(Value(42));
+        let handle = tx.write(Value(42))?;
         let ptr = handle.ptr();
         tx.reclaim(handle);
         let result = tx.read(ptr)?;

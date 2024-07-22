@@ -24,7 +24,7 @@ fn bench_arbitrary_read(b: Bencher) -> Box<dyn Sampler> {
     b.iter(move || {
         let (addr, len) = random_segment(&mut rng, 0..DB_SIZE);
         let snapshot = mem.snapshot();
-        let _ = black_box(snapshot.read(addr as Addr, len)).unwrap();
+        let _ = black_box(snapshot.read(addr as Addr, len));
     })
 }
 

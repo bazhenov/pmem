@@ -1,7 +1,7 @@
-//! Implementation of RFS filesystem adapater for a NFS protocol.
+//! Implementation of RFS filesystem adapter for a NFS protocol.
 //!
 //! To test use following command:
-//! ```
+//! ```ignore
 //! $ mkdir mnt
 //! $ mount -t nfs -o nolocks,vers=3,tcp,port=11111,mountport=11111,soft 127.0.0.1:/ mnt/
 //! ```

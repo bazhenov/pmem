@@ -57,7 +57,7 @@ impl Storable for Filesystem {
     }
 
     fn allocate(mut tx: Transaction) -> Self {
-        let name = tx.write_slice("/".as_bytes());
+        let name = tx.write_slice("/".as_bytes()).unwrap();
         let root_entry = FNode {
             name: Str(name),
             fid: 1,
@@ -67,8 +67,8 @@ impl Storable for Filesystem {
             file_content: None,
             next: None,
         };
-        let root = tx.write(root_entry).ptr();
-        let volume = tx.write(VolumeInfo { root, next_fid: 2 });
+        let root = tx.write(root_entry).unwrap().ptr();
+        let volume = tx.write(VolumeInfo { root, next_fid: 2 }).unwrap();
         Self { volume, tx }
     }
 
@@ -143,10 +143,10 @@ impl Filesystem {
         if let Some(mut referent) = file.referent {
             // Child is not first in a list
             referent.next = next_ptr;
-            self.tx.update(&referent);
+            self.tx.update(&referent)?;
         } else {
             dir.children = next_ptr;
-            self.tx.update(&dir);
+            self.tx.update(&dir)?;
         }
         Ok(())
     }
@@ -160,9 +160,9 @@ impl Filesystem {
                 .ok()
                 .ok_or(Error::AlreadyExists)?
         } else {
-            let new_node = self.write_fsnode(file_name, NodeType::File);
+            let new_node = self.write_fsnode(file_name, NodeType::File)?;
             dir.children = Some(new_node.ptr());
-            self.tx.update(&dir);
+            self.tx.update(&dir)?;
             new_node
         };
 
@@ -193,9 +193,9 @@ impl Filesystem {
                 .ok()
                 .ok_or(Error::AlreadyExists)?
         } else {
-            let dir_inode = self.write_fsnode(name.as_ref(), NodeType::Directory);
+            let dir_inode = self.write_fsnode(name.as_ref(), NodeType::Directory)?;
             parent.children = Some(dir_inode.ptr());
-            self.tx.update(&parent);
+            self.tx.update(&parent)?;
             dir_inode
         };
 
@@ -234,9 +234,9 @@ impl Filesystem {
             };
 
             node = if node.children.is_none() {
-                let new_node = self.write_fsnode(name.to_str().unwrap(), NodeType::Directory);
+                let new_node = self.write_fsnode(name.to_str().unwrap(), NodeType::Directory)?;
                 node.children = Some(new_node.ptr());
-                self.tx.update(&node);
+                self.tx.update(&node)?;
                 new_node
             } else {
                 self.create_child(node.ptr(), name.to_str().unwrap(), NodeType::Directory)?
@@ -280,17 +280,17 @@ impl Filesystem {
             prev_node = node;
             cur_node = value.next;
         }
-        let new_node = self.write_fsnode(name, node_type);
+        let new_node = self.write_fsnode(name, node_type)?;
         let mut prev_node = self.tx.lookup(prev_node)?;
         prev_node.next = Some(new_node.ptr());
-        self.tx.update(&prev_node);
+        self.tx.update(&prev_node)?;
         Ok(CreateResult::Ok(new_node))
     }
 
-    fn write_fsnode(&mut self, name: &str, node_type: NodeType) -> Handle<FNode> {
+    fn write_fsnode(&mut self, name: &str, node_type: NodeType) -> Result<Handle<FNode>> {
         let fid = self.volume.next_fid;
         self.volume.next_fid += 1;
-        let name = self.tx.write_slice(name.as_bytes());
+        let name = self.tx.write_slice(name.as_bytes())?;
         let entry = FNode {
             name: Str(name),
             fid,
@@ -300,8 +300,8 @@ impl Filesystem {
             children: None,
             next: None,
         };
-        self.tx.update(&self.volume);
-        self.tx.write(entry)
+        self.tx.update(&self.volume)?;
+        Ok(self.tx.write(entry)?)
     }
 }
 
@@ -328,10 +328,10 @@ impl<'a> Write for File<'a> {
         }
         let value = self.cursor.get_ref();
         let size = value.len();
-        let slice = self.fs.tx.write_slice(value);
+        let slice = self.fs.tx.write_slice(value).unwrap();
         self.file_info.file_content = Some(slice);
         self.file_info.size = size as u64;
-        self.fs.tx.update(&self.file_info);
+        self.fs.tx.update(&self.file_info).unwrap();
         Ok(())
     }
 }
@@ -428,6 +428,7 @@ impl fmt::Debug for Str {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use pmem::{Memory, Storable};
 
@@ -633,6 +634,20 @@ mod tests {
         assert!(children.contains(&swap), "Root should contains spawn");
 
         Ok(())
+    }
+
+    #[test]
+    #[should_panic]
+    fn no_space_left() {
+        let (mut fs, _) = create_fs();
+
+        let root = fs.get_root().unwrap();
+        let f = fs.create_file(&root, "swap").unwrap();
+        let mut file = fs.open_file(&f).unwrap();
+        let data = [0; 20 * 1024];
+        for _ in 0..1024 {
+            file.write_all(&data).unwrap();
+        }
     }
 
     fn create_fs() -> (Filesystem, Memory) {

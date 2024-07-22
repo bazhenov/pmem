@@ -94,7 +94,7 @@ impl Seek for &mut FsLayer {
 
 impl Read for &mut FsLayer {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let result = self.snapshot.read(self.addr as Addr, buf.len()).unwrap();
+        let result = self.snapshot.read(self.addr as Addr, buf.len());
         buf.copy_from_slice(result.as_ref());
 
         self.addr += buf.len() as u64;
