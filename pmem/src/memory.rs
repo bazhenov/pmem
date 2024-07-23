@@ -85,7 +85,7 @@ pub struct Transaction {
 }
 
 impl Transaction {
-    pub fn write_bytes(&mut self, addr: Addr, bytes: impl Into<Vec<u8>>) {
+    fn do_write_bytes(&mut self, addr: Addr, bytes: impl Into<Vec<u8>>) {
         self.snapshot.write(addr, bytes)
     }
 
@@ -116,6 +116,14 @@ impl Transaction {
             result.push(T::read(chunk)?);
         }
         Ok(result)
+    }
+
+    pub fn read_bytes(&self, ptr: SlicePtr<u8>) -> Result<Cow<[u8]>> {
+        let addr = ptr.0.addr;
+        let items = self.read_static::<SLICE_HEADER_SIZE>(addr);
+
+        let bytes = u32::from_le_bytes(items) as usize;
+        Ok(self.read_uncommitted(addr + SLICE_HEADER_SIZE as u32, bytes))
     }
 
     fn read_static<const N: usize>(&self, offset: PageOffset) -> [u8; N] {
@@ -166,7 +174,25 @@ impl Transaction {
             value.write(byte_chunk).unwrap();
         }
 
-        self.write_bytes(ptr.0.addr, buffer);
+        self.do_write_bytes(ptr.0.addr, buffer);
+        Ok(ptr)
+    }
+
+    pub fn write_bytes(&mut self, bytes: &[u8]) -> Result<SlicePtr<u8>> {
+        assert!(bytes.len() <= PageOffset::MAX as usize);
+
+        let size = SLICE_HEADER_SIZE + bytes.len();
+        let ptr = SlicePtr::from_addr(self.alloc(size)?).expect("Alloc failed");
+
+        let mut buffer = vec![0u8; size];
+
+        (bytes.len() as u32)
+            .write(&mut buffer[0..SLICE_HEADER_SIZE])
+            .unwrap();
+
+        buffer[SLICE_HEADER_SIZE..].copy_from_slice(bytes);
+
+        self.do_write_bytes(ptr.0.addr, buffer);
         Ok(ptr)
     }
 
@@ -187,7 +213,7 @@ impl Transaction {
         };
 
         value.write(&mut buffer).unwrap();
-        self.write_bytes(ptr.addr, buffer);
+        self.do_write_bytes(ptr.addr, buffer);
         Ok((ptr, size))
     }
 

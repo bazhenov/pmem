@@ -173,7 +173,7 @@ impl Filesystem {
         let file_info = self.lookup_inode(file)?;
 
         let content = if let Some(content) = file_info.file_content {
-            self.tx.read_slice(content)?
+            self.tx.read_bytes(content)?.to_vec()
         } else {
             vec![]
         };
@@ -328,7 +328,7 @@ impl<'a> Write for File<'a> {
         }
         let value = self.cursor.get_ref();
         let size = value.len();
-        let slice = self.fs.tx.write_slice(value)?;
+        let slice = self.fs.tx.write_bytes(value)?;
         self.file_info.file_content = Some(slice);
         self.file_info.size = size as u64;
         self.fs.tx.update(&self.file_info)?;
@@ -402,8 +402,8 @@ struct FNode {
 
 impl FNode {
     fn name(&self, tx: &Transaction) -> Result<String> {
-        let bytes = tx.read_slice(self.name.0)?;
-        Ok(String::from_utf8(bytes).map_err(|e| e.utf8_error())?)
+        let bytes = tx.read_bytes(self.name.0)?;
+        Ok(String::from_utf8(bytes.to_vec()).map_err(|e| e.utf8_error())?)
     }
 }
 
