@@ -328,10 +328,10 @@ impl<'a> Write for File<'a> {
         }
         let value = self.cursor.get_ref();
         let size = value.len();
-        let slice = self.fs.tx.write_slice(value).unwrap();
+        let slice = self.fs.tx.write_slice(value)?;
         self.file_info.file_content = Some(slice);
         self.file_info.size = size as u64;
-        self.fs.tx.update(&self.file_info).unwrap();
+        self.fs.tx.update(&self.file_info)?;
         Ok(())
     }
 }
@@ -339,6 +339,21 @@ impl<'a> Write for File<'a> {
 impl<'a> Seek for File<'a> {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         self.cursor.seek(pos)
+    }
+}
+
+impl From<Error> for io::Error {
+    fn from(e: Error) -> Self {
+        let kind = match e {
+            Error::NotFound => io::ErrorKind::NotFound,
+            Error::NotSupported => io::ErrorKind::Unsupported,
+            Error::PathMustBeAbsolute => io::ErrorKind::Other,
+            Error::AlreadyExists => io::ErrorKind::AlreadyExists,
+            Error::PMemError(_) => io::ErrorKind::Other,
+            Error::Utf8(_) => io::ErrorKind::InvalidInput,
+            Error::IOError(e) => return e,
+        };
+        io::Error::new(kind, e)
     }
 }
 
@@ -637,7 +652,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
     fn no_space_left() {
         let (mut fs, _) = create_fs();
 
@@ -648,6 +662,10 @@ mod tests {
         for _ in 0..1024 {
             file.write_all(&data).unwrap();
         }
+
+        let result = file.flush();
+        eprintln!("{:?}", result);
+        assert!(result.is_err(), "Err should be generated");
     }
 
     fn create_fs() -> (Filesystem, Memory) {

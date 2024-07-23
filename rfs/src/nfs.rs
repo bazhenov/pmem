@@ -225,8 +225,12 @@ fn pmem_to_nfs_error(e: Error) -> nfsstat3 {
         Error::NotSupported => nfsstat3::NFS3ERR_NOTSUPP,
         Error::PathMustBeAbsolute => nfsstat3::NFS3ERR_INVAL,
         Error::AlreadyExists => nfsstat3::NFS3ERR_EXIST,
-        Error::PMemError(_) => nfsstat3::NFS3ERR_IO,
-        Error::IOError(_) => nfsstat3::NFS3ERR_IO,
+        Error::PMemError(e) => match e {
+            pmem::memory::Error::DataIntegrity(_) => nfsstat3::NFS3ERR_SERVERFAULT,
+            pmem::memory::Error::NoSpaceLeft => nfsstat3::NFS3ERR_NOSPC,
+            pmem::memory::Error::NullPointer => nfsstat3::NFS3ERR_SERVERFAULT,
+        },
+        Error::IOError(e) => io_to_nfs_error(e),
         Error::Utf8(_) => nfsstat3::NFS3ERR_INVAL,
     }
 }
@@ -239,6 +243,8 @@ fn io_to_nfs_error(e: io::Error) -> nfsstat3 {
         io::ErrorKind::InvalidInput => nfsstat3::NFS3ERR_INVAL,
         io::ErrorKind::InvalidData => nfsstat3::NFS3ERR_INVAL,
         io::ErrorKind::Unsupported => nfsstat3::NFS3ERR_NOTSUPP,
+        io::ErrorKind::OutOfMemory => nfsstat3::NFS3ERR_NOSPC,
+        _ => nfsstat3::NFS3ERR_SERVERFAULT,
         // Unsupported in stable yet
         // io::ErrorKind::NotADirectory => nfsstat3::NFS3ERR_NOTDIR,
         // io::ErrorKind::IsADirectory => nfsstat3::NFS3ERR_ISDIR,
@@ -248,7 +254,6 @@ fn io_to_nfs_error(e: io::Error) -> nfsstat3 {
         // io::ErrorKind::CrossesDevices => nfsstat3::NFS3ERR_XDEV,
         // io::ErrorKind::TooManyLinks => nfsstat3::NFS3ERR_MLINK,
         // io::ErrorKind::InvalidFilename => nfsstat3::NFS3ERR_INVAL,
-        _ => nfsstat3::NFS3ERR_SERVERFAULT,
     }
 }
 

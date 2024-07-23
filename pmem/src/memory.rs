@@ -1,10 +1,11 @@
-use crate::page::{self, Addr, PageOffset, PagePool, Snapshot};
+use crate::page::{Addr, PageOffset, PagePool, Snapshot};
 use pmem_derive::Record;
 use std::{
     any::type_name,
     array::TryFromSliceError,
     borrow::Cow,
     fmt::{self, Debug},
+    io,
     marker::PhantomData,
     mem,
     ops::{Deref, DerefMut},
@@ -24,14 +25,25 @@ type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("Page error")]
-    PageError(#[from] page::Error),
+    #[error("Data integrity")]
+    DataIntegrity(#[from] TryFromSliceError),
 
-    #[error("Out of Bounds Read")]
-    OutOfBoundsRead(#[from] TryFromSliceError),
+    #[error("No space left")]
+    NoSpaceLeft,
 
     #[error("Null pointer")]
     NullPointer,
+}
+
+impl From<Error> for io::Error {
+    fn from(error: Error) -> Self {
+        let kind = match error {
+            Error::DataIntegrity(..) => io::ErrorKind::InvalidData,
+            Error::NoSpaceLeft => io::ErrorKind::OutOfMemory,
+            Error::NullPointer => io::ErrorKind::InvalidInput,
+        };
+        io::Error::new(kind, error)
+    }
 }
 
 impl Memory {
@@ -116,11 +128,14 @@ impl Transaction {
         self.snapshot.read(addr, len)
     }
 
-    fn alloc(&mut self, size: usize) -> Addr {
+    fn alloc(&mut self, size: usize) -> Result<Addr> {
         assert!(size > 0);
+        if !self.snapshot.valid_range(self.next_addr, size) {
+            return Err(Error::NoSpaceLeft);
+        }
         let addr = self.next_addr;
         self.next_addr += size as u32;
-        addr
+        Ok(addr)
     }
 
     pub fn write<T: Record>(&mut self, value: T) -> Result<Handle<T>> {
@@ -129,23 +144,25 @@ impl Transaction {
         Ok(Handle { addr, value, size })
     }
 
-    pub fn write_slice<T: Record>(&mut self, value: &[T]) -> Result<SlicePtr<T>> {
-        assert!(value.len() <= PageOffset::MAX as usize);
-        let mut buffer = vec![0u8; SLICE_HEADER_SIZE + T::SIZE * value.len()];
+    pub fn write_slice<T: Record>(&mut self, values: &[T]) -> Result<SlicePtr<T>> {
+        assert!(values.len() <= PageOffset::MAX as usize);
 
-        (value.len() as u32)
+        let size = SLICE_HEADER_SIZE + T::SIZE * values.len();
+        let ptr = SlicePtr::from_addr(self.alloc(size)?).expect("Alloc failed");
+
+        let mut buffer = vec![0u8; size];
+
+        (values.len() as u32)
             .write(&mut buffer[0..SLICE_HEADER_SIZE])
             .unwrap();
 
-        for (v, chunk) in value
+        let chunks = values
             .iter()
-            .zip(buffer[SLICE_HEADER_SIZE..].chunks_mut(T::SIZE))
-        {
-            v.write(chunk).unwrap();
+            .zip(buffer[SLICE_HEADER_SIZE..].chunks_mut(T::SIZE));
+        for (value, byte_chunk) in chunks {
+            value.write(byte_chunk).unwrap();
         }
 
-        let size = buffer.len();
-        let ptr = SlicePtr::from_addr(self.alloc(size)).unwrap();
         self.write_bytes(ptr.0.addr, &buffer);
         Ok(ptr)
     }
@@ -159,14 +176,14 @@ impl Transaction {
     ) -> Result<(Ptr<T>, usize)> {
         let mut buffer = vec![0u8; T::SIZE];
 
-        // writing body
-        value.write(&mut buffer).unwrap();
         let size = buffer.len();
-        let ptr = ptr.unwrap_or_else(|| Ptr {
-            addr: self.alloc(size),
-            _phantom: PhantomData::<T>,
-        });
+        let ptr = if let Some(ptr) = ptr {
+            ptr
+        } else {
+            Ptr::from_addr(self.alloc(size)?).expect("Alloc failed")
+        };
 
+        value.write(&mut buffer).unwrap();
         self.write_bytes(ptr.addr, &buffer);
         Ok((ptr, size))
     }

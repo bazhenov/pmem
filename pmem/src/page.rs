@@ -480,7 +480,7 @@ impl Default for CommittedSnapshot {
 
 impl CommittedSnapshot {
     fn read_to_buf(&self, addr: PageOffset, buf: &mut [u8]) {
-        check_and_split_ptr(addr, buf.len(), self.pages);
+        split_ptr_checked(addr, buf.len(), self.pages);
 
         let range = (addr as usize)..addr as usize + buf.len();
 
@@ -525,7 +525,7 @@ pub struct Snapshot {
 
 impl Snapshot {
     pub fn write(&mut self, addr: Addr, bytes: &[u8]) {
-        check_and_split_ptr(addr, bytes.len(), self.pages);
+        split_ptr_checked(addr, bytes.len(), self.pages);
 
         if !bytes.is_empty() {
             self.push_patch(Patch::Write(addr, bytes.to_vec()))
@@ -539,7 +539,7 @@ impl Snapshot {
     ///
     /// The main purpose of reclaim is to mark memory as not used, so it can be freed from persistent storage
     /// after snapshot compaction.
-    pub fn reclaim(&mut self, addr: PageOffset, len: usize) {
+    pub fn reclaim(&mut self, addr: Addr, len: usize) {
         if len > 0 {
             self.push_patch(Patch::Reclaim(addr, len))
         }
@@ -592,8 +592,8 @@ impl Snapshot {
         debug_assert_sorted_and_has_no_overlaps(&self.patches);
     }
 
-    pub fn read(&self, addr: PageOffset, len: usize) -> Cow<'_, [u8]> {
-        check_and_split_ptr(addr, len, self.pages);
+    pub fn read(&self, addr: Addr, len: usize) -> Cow<[u8]> {
+        split_ptr_checked(addr, len, self.pages);
 
         let mut buf = vec![0; len];
         self.base.read_to_buf(addr, &mut buf);
@@ -602,6 +602,10 @@ impl Snapshot {
         let range = addr..addr + len;
         apply_patches(&[self.patches.as_slice()], &mut buf, &range);
         Cow::Owned(buf)
+    }
+
+    pub fn valid_range(&self, addr: Addr, len: usize) -> bool {
+        is_valid_ptr(addr, len, self.pages)
     }
 
     #[cfg(test)]
@@ -709,15 +713,21 @@ fn debug_assert_sorted_and_has_no_overlaps<T: MemRange>(ranges: &[T]) {
     )
 }
 
-fn check_and_split_ptr(addr: Addr, len: usize, pages: u32) -> (PageNo, PageOffset) {
-    let (page_no, offset) = split_ptr(addr);
-    // we need to subtract 1 byte, becase end address exclusive
+fn split_ptr_checked(addr: Addr, len: usize, pages: u32) -> (PageNo, PageOffset) {
+    assert!(
+        is_valid_ptr(addr, len, pages),
+        "Ptr address is out of bounds"
+    );
+
+    split_ptr(addr)
+}
+
+fn is_valid_ptr(addr: Addr, len: usize, pages: u32) -> bool {
+    let (page_no, _) = split_ptr(addr);
+    // we need to subtract 1 byte, because end address exclusive
     let (end_page_no, _) = split_ptr(addr + (len as Addr) - 1);
 
-    assert!(page_no < pages, "Start address is out of bounds");
-    assert!(end_page_no < pages, "End address is out of bounds");
-
-    (page_no, offset)
+    page_no < pages && end_page_no < pages
 }
 
 fn split_ptr(addr: Addr) -> (PageNo, PageOffset) {
@@ -854,6 +864,7 @@ mod tests {
 
         let mut snapshot = mem.snapshot();
         snapshot.write(page_a, alice);
+        assert!(!snapshot.valid_range(page_b, bob.len()));
         snapshot.resize(2); // adding second page
         snapshot.write(page_b, bob);
         mem.commit(snapshot);
