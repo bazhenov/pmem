@@ -47,6 +47,13 @@ impl From<Error> for io::Error {
 }
 
 impl Memory {
+    pub fn new(pool: PagePool) -> Self {
+        Self {
+            pool,
+            next_addr: START_ADDR,
+            seq: 0,
+        }
+    }
     pub fn commit(&mut self, tx: Transaction) {
         assert!(tx.next_addr >= self.next_addr);
         assert!(tx.seq == self.seq);
@@ -67,11 +74,7 @@ impl Memory {
 
 impl Default for Memory {
     fn default() -> Self {
-        Self {
-            pool: PagePool::default(),
-            next_addr: START_ADDR,
-            seq: 0,
-        }
+        Self::new(PagePool::default())
     }
 }
 
@@ -82,7 +85,7 @@ pub struct Transaction {
 }
 
 impl Transaction {
-    pub fn write_bytes(&mut self, addr: Addr, bytes: &[u8]) {
+    pub fn write_bytes(&mut self, addr: Addr, bytes: impl Into<Vec<u8>>) {
         self.snapshot.write(addr, bytes)
     }
 
@@ -163,7 +166,7 @@ impl Transaction {
             value.write(byte_chunk).unwrap();
         }
 
-        self.write_bytes(ptr.0.addr, &buffer);
+        self.write_bytes(ptr.0.addr, buffer);
         Ok(ptr)
     }
 
@@ -184,7 +187,7 @@ impl Transaction {
         };
 
         value.write(&mut buffer).unwrap();
-        self.write_bytes(ptr.addr, &buffer);
+        self.write_bytes(ptr.addr, buffer);
         Ok((ptr, size))
     }
 

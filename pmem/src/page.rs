@@ -524,11 +524,12 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    pub fn write(&mut self, addr: Addr, bytes: &[u8]) {
+    pub fn write(&mut self, addr: Addr, bytes: impl Into<Vec<u8>>) {
+        let bytes = bytes.into();
         split_ptr_checked(addr, bytes.len(), self.pages);
 
         if !bytes.is_empty() {
-            self.push_patch(Patch::Write(addr, bytes.to_vec()))
+            self.push_patch(Patch::Write(addr, bytes))
         }
     }
 
@@ -1119,12 +1120,12 @@ mod tests {
                         let range = offset..offset + patch.len();
                         match patch {
                             Patch::Write(offset, bytes) => {
-                                snapshot.write(offset, &bytes);
                                 shadow_buffer[range].copy_from_slice(bytes.as_slice());
+                                snapshot.write(offset, bytes);
                             },
                             Patch::Reclaim(offset, len) => {
-                                snapshot.reclaim(offset, len);
                                 shadow_buffer[range].fill(0);
+                                snapshot.reclaim(offset, len);
 
                             }
                         }
