@@ -44,3 +44,30 @@ fn serialization_of_structs() {
 
     assert_eq!(a, a_copy);
 }
+
+#[test]
+fn serialization_of_struct_with_array() {
+    #[derive(Record, PartialEq, Debug)]
+    struct A {
+        a: [u8; 4],
+    }
+
+    let a = A { a: [0, 1, 2, 3] };
+    let mut buffer = [0; 4];
+    a.write(buffer.as_mut()).unwrap();
+
+    let a_copy = A::read(buffer.as_slice()).unwrap();
+
+    assert_eq!(a, a_copy);
+}
+
+// #[test]
+// fn serialization_of_enum() {
+//     #[derive(Record, PartialEq, Debug)]
+//     #[repr(u8)]
+//     enum A {
+//         U16(u16) = 1,
+//         U32(u32) = 2,
+//     }
+//     assert_eq!(A::SIZE, 5);
+// }

@@ -248,6 +248,29 @@ impl<T> Record for Ptr<T> {
     }
 }
 
+impl<const N: usize, T: Record + Default + Copy> Record for [T; N] {
+    const SIZE: usize = T::SIZE * N;
+
+    fn read(data: &[u8]) -> Result<Self> {
+        assert!(data.len() == T::SIZE * N);
+
+        let mut result = [T::default(); N];
+        for (item, chunk) in result.iter_mut().zip(data.chunks(T::SIZE)) {
+            *item = T::read(chunk)?;
+        }
+        Ok(result)
+    }
+
+    fn write(&self, data: &mut [u8]) -> Result<()> {
+        assert!(data.len() == T::SIZE * N);
+
+        for (value, bytes) in self.iter().zip(data.chunks_mut(T::SIZE)) {
+            value.write(bytes)?
+        }
+        Ok(())
+    }
+}
+
 impl<T> NonZeroRecord for Ptr<T> {}
 
 impl<T> Ptr<T> {
@@ -341,7 +364,7 @@ impl_record_for_primitive!(u8, u16, u32, u64);
 impl_record_for_primitive!(i8, i16, i32, i64);
 
 /// Indicates that all zero bytes is not valid state for a record and it is represented
-/// as an `Option<T>` in type system.
+/// as an `Option<T>::None` in type system.
 trait NonZeroRecord: Record {}
 
 impl<T: NonZeroRecord> Record for Option<T> {

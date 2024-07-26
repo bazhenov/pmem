@@ -18,11 +18,8 @@ pub fn derive_record(input: TokenStream) -> TokenStream {
 
     // Finding the name of the pmem crate at the callsite
     let krate = match crate_name("pmem").expect("pmem is not present in `Cargo.toml`") {
-        FoundCrate::Itself => quote!(crate),
-        FoundCrate::Name(name) => {
-            let ident = Ident::new(&name, Span::call_site());
-            quote!(#ident)
-        }
+        FoundCrate::Itself => Ident::new("crate", Span::call_site()),
+        FoundCrate::Name(name) => Ident::new(&name, Span::call_site()),
     };
 
     // Generate the sum of the sizes of all fields
@@ -51,15 +48,17 @@ pub fn derive_record(input: TokenStream) -> TokenStream {
     TokenStream::from(expanded)
 }
 
-fn read_method(krate: &TokenStream2, fields: &Fields) -> TokenStream2 {
-    let var_names = fields
+fn read_method(krate: &Ident, fields: &Fields) -> TokenStream2 {
+    // giving all struct members individual names in a form of v0, v1, etc.
+    // so that we can work with tuple and named structs in the same way
+    let fields_vars = fields
         .iter()
         .enumerate()
         .map(|(idx, field)| (field, var_name_for_field(idx, field)))
         .map(|(field, var_name)| Ident::new(&var_name, field.ident.span()))
         .collect::<Vec<_>>();
 
-    let read_instructions = var_names
+    let read_instructions = fields_vars
         .iter()
         .zip(fields.iter())
         .map(|(var_name, field)| {
@@ -73,14 +72,14 @@ fn read_method(krate: &TokenStream2, fields: &Fields) -> TokenStream2 {
 
     let struct_constructor = match fields {
         Fields::Named(fields) => {
-            let field_init = var_names
+            let field_init = fields_vars
                 .iter()
                 .zip(fields.named.iter())
                 .map(|(var_name, field)| (var_name, field.ident.as_ref().unwrap()))
                 .map(|(var_name, field)| quote! { #field: #var_name });
             quote! { Self { #(#field_init),* } }
         }
-        Fields::Unnamed(_) => quote! { Self ( #(#var_names),* ) },
+        Fields::Unnamed(_) => quote! { Self ( #(#fields_vars),* ) },
         Fields::Unit => unimplemented!("Unit structs are not supported"),
     };
 
@@ -102,7 +101,7 @@ fn var_name_for_field(idx: usize, field: &Field) -> String {
         .map_or_else(|| format!("v{}", idx), |ident| format!("v{}", ident))
 }
 
-fn write_method(krate: &TokenStream2, fields: &Fields) -> TokenStream2 {
+fn write_method(krate: &Ident, fields: &Fields) -> TokenStream2 {
     let write_fields = fields.iter().enumerate().map(|(idx, field)| {
         let ty = &field.ty;
         let access = match &field.ident {
