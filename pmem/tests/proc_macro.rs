@@ -1,10 +1,10 @@
 use pmem::Record;
 use pmem_derive::Record;
+use std::{fmt::Debug, usize};
 
 #[test]
 fn size_of_tuples() {
     #[derive(Record)]
-    #[allow(dead_code)]
     struct A(u8, u64);
     assert_eq!(A::SIZE, 9)
 }
@@ -36,13 +36,7 @@ fn serialization_of_structs() {
         b: u64,
     }
 
-    let a = A { a: 1, b: 2 };
-    let mut buffer = [0; 12];
-    a.write(buffer.as_mut()).unwrap();
-
-    let a_copy = A::read(buffer.as_slice()).unwrap();
-
-    assert_eq!(a, a_copy);
+    assert_read_write_eq(A { a: 1, b: 2 });
 }
 
 #[test]
@@ -52,22 +46,53 @@ fn serialization_of_struct_with_array() {
         a: [u8; 4],
     }
 
-    let a = A { a: [0, 1, 2, 3] };
-    let mut buffer = [0; 4];
-    a.write(buffer.as_mut()).unwrap();
+    assert_read_write_eq(A { a: [0, 1, 2, 3] });
+}
 
-    let a_copy = A::read(buffer.as_slice()).unwrap();
+#[test]
+fn size_of_enum() {
+    #[derive(Record, PartialEq, Debug)]
+    #[repr(u8)]
+    enum A {
+        U16(u16) = 1,
+        U32(u32) = 2,
+    }
+
+    assert_eq!(A::SIZE, 5);
+}
+
+#[test]
+fn serialization_of_enum() {
+    #[derive(Record, PartialEq, Debug)]
+    #[repr(u8)]
+    enum A {
+        U16(u16) = 1,
+        U32(u32) = 2,
+        U64(u64) = 3,
+    }
+
+    assert_read_write_eq(A::U16(42));
+    assert_read_write_eq(A::U32(42));
+    assert_read_write_eq(A::U64(42));
+}
+
+#[test]
+fn serialization_of_enum_with_generics() {
+    #[derive(Record, PartialEq, Debug)]
+    #[repr(u8)]
+    enum Opt<T: Record> {
+        Some(T) = 1,
+        None = 2,
+    }
+
+    assert_eq!(Opt::<u32>::SIZE, 5);
+    assert_read_write_eq(Opt::Some(42u32));
+}
+
+fn assert_read_write_eq<T: Record + Debug + PartialEq>(a: T) {
+    let mut buffer = vec![0; T::SIZE];
+    a.write(buffer.as_mut()).unwrap();
+    let a_copy = T::read(buffer.as_slice()).unwrap();
 
     assert_eq!(a, a_copy);
 }
-
-// #[test]
-// fn serialization_of_enum() {
-//     #[derive(Record, PartialEq, Debug)]
-//     #[repr(u8)]
-//     enum A {
-//         U16(u16) = 1,
-//         U32(u32) = 2,
-//     }
-//     assert_eq!(A::SIZE, 5);
-// }

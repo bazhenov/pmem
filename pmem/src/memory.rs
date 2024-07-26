@@ -33,6 +33,9 @@ pub enum Error {
 
     #[error("Null pointer")]
     NullPointer,
+
+    #[error("Unexpected variant code: {0}")]
+    UnexpectedVariantCode(u64),
 }
 
 impl From<Error> for io::Error {
@@ -41,6 +44,7 @@ impl From<Error> for io::Error {
             Error::DataIntegrity(..) => io::ErrorKind::InvalidData,
             Error::NoSpaceLeft => io::ErrorKind::OutOfMemory,
             Error::NullPointer => io::ErrorKind::InvalidInput,
+            Error::UnexpectedVariantCode(..) => io::ErrorKind::InvalidInput,
         };
         io::Error::new(kind, error)
     }
@@ -428,6 +432,19 @@ impl<T> DerefMut for Handle<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.value
     }
+}
+
+/// Stable Rust at the moment doesn't support compile time max(). Used by proc_macro
+pub const fn max<const N: usize>(array: [usize; N]) -> usize {
+    let mut max = 0;
+    let mut i = 0;
+    while i < array.len() {
+        if array[i] > max {
+            max = array[i];
+        }
+        i += 1;
+    }
+    return max;
 }
 
 #[cfg(test)]

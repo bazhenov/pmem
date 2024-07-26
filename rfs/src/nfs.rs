@@ -231,6 +231,7 @@ fn pmem_to_nfs_error(e: Error) -> nfsstat3 {
             pmem::memory::Error::DataIntegrity(_) => nfsstat3::NFS3ERR_SERVERFAULT,
             pmem::memory::Error::NoSpaceLeft => nfsstat3::NFS3ERR_NOSPC,
             pmem::memory::Error::NullPointer => nfsstat3::NFS3ERR_SERVERFAULT,
+            pmem::memory::Error::UnexpectedVariantCode(_) => nfsstat3::NFS3ERR_SERVERFAULT,
         },
         Error::IOError(e) => io_to_nfs_error(e),
         Error::Utf8(_) => nfsstat3::NFS3ERR_INVAL,
