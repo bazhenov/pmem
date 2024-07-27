@@ -237,6 +237,15 @@ pub struct Ptr<T> {
     _phantom: PhantomData<T>,
 }
 
+impl<T> Ptr<T> {
+    pub fn from_addr(addr: u32) -> Option<Self> {
+        (addr > 0).then_some(Self {
+            addr,
+            _phantom: PhantomData::<T>,
+        })
+    }
+}
+
 impl<T> Record for Ptr<T> {
     const SIZE: usize = mem::size_of::<Addr>();
 
@@ -248,29 +257,6 @@ impl<T> Record for Ptr<T> {
     fn write(&self, data: &mut [u8]) -> Result<()> {
         let bytes = self.addr.to_le_bytes();
         data.copy_from_slice(bytes.as_slice());
-        Ok(())
-    }
-}
-
-impl<const N: usize, T: Record + Default + Copy> Record for [T; N] {
-    const SIZE: usize = T::SIZE * N;
-
-    fn read(data: &[u8]) -> Result<Self> {
-        assert!(data.len() == T::SIZE * N);
-
-        let mut result = [T::default(); N];
-        for (item, chunk) in result.iter_mut().zip(data.chunks(T::SIZE)) {
-            *item = T::read(chunk)?;
-        }
-        Ok(result)
-    }
-
-    fn write(&self, data: &mut [u8]) -> Result<()> {
-        assert!(data.len() == T::SIZE * N);
-
-        for (value, bytes) in self.iter().zip(data.chunks_mut(T::SIZE)) {
-            value.write(bytes)?
-        }
         Ok(())
     }
 }
@@ -299,14 +285,6 @@ impl<T> Debug for Ptr<T> {
 /// adding `T: Copy` bound in auto-generated implementation
 impl<T> Copy for Ptr<T> {}
 
-impl<T> Ptr<T> {
-    pub fn from_addr(addr: u32) -> Option<Self> {
-        (addr > 0).then_some(Self {
-            addr,
-            _phantom: PhantomData::<T>,
-        })
-    }
-}
 impl<T> NonZeroRecord for SlicePtr<T> {}
 
 #[derive(Record)]
@@ -337,6 +315,29 @@ impl<T> Debug for SlicePtr<T> {
 /// Need to implement Copy manually, because derive(Copy) is automatically
 /// adding `T: Copy` bound in auto-generated implementation
 impl<T> Copy for SlicePtr<T> {}
+
+impl<const N: usize, T: Record + Default + Copy> Record for [T; N] {
+    const SIZE: usize = T::SIZE * N;
+
+    fn read(data: &[u8]) -> Result<Self> {
+        assert!(data.len() == T::SIZE * N);
+
+        let mut result = [T::default(); N];
+        for (item, chunk) in result.iter_mut().zip(data.chunks(T::SIZE)) {
+            *item = T::read(chunk)?;
+        }
+        Ok(result)
+    }
+
+    fn write(&self, data: &mut [u8]) -> Result<()> {
+        assert!(data.len() == T::SIZE * N);
+
+        for (value, bytes) in self.iter().zip(data.chunks_mut(T::SIZE)) {
+            value.write(bytes)?
+        }
+        Ok(())
+    }
+}
 
 /// The Record trait is used to serialize and deserialize data structures.
 ///
