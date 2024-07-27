@@ -4,7 +4,7 @@ use std::{
     convert::Into,
     fmt,
     io::{self, Cursor, Read, Seek, SeekFrom, Write},
-    path::{Component, Path, PathBuf},
+    path::{self, Component, Path, PathBuf},
     str::Utf8Error,
 };
 
@@ -82,51 +82,28 @@ impl Filesystem {
         FileMeta::from(self.get_root_handle(), &self.tx)
     }
 
-    fn get_root_handle(&self) -> Handle<FNode> {
-        self.tx.lookup(self.volume.root).unwrap()
-    }
-
-    pub fn find(&self, path: impl AsRef<Path>) -> Result<FileMeta> {
+    /// Finds the file/directory at the given path
+    ///
+    /// Return [Error::NotFound] if the file/directory does not exist
+    pub fn find(&self, path: impl AsRef<str>) -> Result<FileMeta> {
         FileMeta::from(self.do_lookup_file(path)?, &self.tx)
     }
 
+    /// Finds the given child in the given directory
+    ///
+    /// Return [Error::NotFound] if the child does not exist
     pub fn lookup(&self, dir: &FileMeta, name: impl AsRef<str>) -> Result<FileMeta> {
         let children = self.lookup_inode(dir)?.children.ok_or(Error::NotFound)?;
         let child = self.find_child(children, name.as_ref())?;
         FileMeta::from(child.node, &self.tx)
     }
 
-    fn lookup_inode(&self, meta: &FileMeta) -> Result<Handle<FNode>> {
-        assert!(meta.fid <= u32::MAX as u64);
-
-        let ptr = Ptr::from_addr(meta.fid as u32).ok_or(Error::NotFound)?;
-        self.tx.lookup(ptr).map_err(|e| e.into())
-    }
-
+    /// Returns the file/directory with a given inode ([FileMeta::fid])
     pub fn lookup_by_id(&self, id: u64) -> Result<FileMeta> {
         assert!(id <= u32::MAX as u64);
         let ptr = Ptr::<FNode>::from_addr(id as u32).ok_or(Error::NotFound)?;
         let handle = self.tx.lookup(ptr)?;
         FileMeta::from(handle, &self.tx)
-    }
-
-    fn do_lookup_file(&self, path: impl AsRef<Path>) -> Result<Handle<FNode>> {
-        let mut components = path.as_ref().components();
-        let Some(Component::RootDir) = components.next() else {
-            return Err(Error::PathMustBeAbsolute);
-        };
-        let mut cur_node = self.get_root_handle();
-        for component in components {
-            let Component::Normal(name) = component else {
-                return Err(Error::NotSupported);
-            };
-            let name = name.to_str().unwrap();
-
-            let children = cur_node.children.ok_or(Error::NotFound)?;
-            let child = self.find_child(children, name)?;
-            cur_node = child.node;
-        }
-        Ok(cur_node)
     }
 
     pub fn delete(&mut self, dir: &FileMeta, name: impl AsRef<str>) -> Result<()> {
@@ -169,6 +146,7 @@ impl Filesystem {
         FileMeta::from(file_info, &self.tx)
     }
 
+    /// Opens a file for reading and writing
     pub fn open_file<'a>(&'a mut self, file: &FileMeta) -> Result<File<'a>> {
         let file_info = self.lookup_inode(file)?;
 
@@ -185,6 +163,11 @@ impl Filesystem {
         })
     }
 
+    /// Creates a new directory in the given parent directory
+    ///
+    /// Returns:
+    /// - [Error::AlreadyExists] if the directory already exists;
+    /// - [Error::NotFound] if the parent directory does not exist;
     pub fn create_dir(&mut self, parent: &FileMeta, name: impl AsRef<str>) -> Result<FileMeta> {
         let mut parent = self.lookup_inode(parent)?;
 
@@ -202,6 +185,10 @@ impl Filesystem {
         FileMeta::from(directory_inode, &self.tx)
     }
 
+    /// Reads the contents of a directory
+    ///
+    /// Returns:
+    /// - [Error::NotFound] if the directory does not exist
     pub fn readdir(&self, dir: &FileMeta) -> Result<Vec<FileMeta>> {
         let parent = self.lookup_inode(dir)?;
 
@@ -220,15 +207,11 @@ impl Filesystem {
         }
     }
 
-    pub fn create_dirs(&mut self, name: impl Into<PathBuf>) -> Result<FileMeta> {
-        let path = name.into();
-        let mut components = path.components();
-        let Some(Component::RootDir) = components.next() else {
-            return Err(Error::PathMustBeAbsolute);
-        };
-
+    /// Creates a directory and all its parents
+    pub fn create_dirs(&mut self, name: impl AsRef<str>) -> Result<FileMeta> {
+        let path = PathBuf::from(name.as_ref());
         let mut node = self.get_root_handle();
-        for component in components {
+        for component in components(&path)? {
             let Component::Normal(name) = component else {
                 return Err(Error::NotSupported);
             };
@@ -245,6 +228,32 @@ impl Filesystem {
         }
 
         FileMeta::from(node, &self.tx)
+    }
+
+    fn get_root_handle(&self) -> Handle<FNode> {
+        self.tx.lookup(self.volume.root).unwrap()
+    }
+    fn lookup_inode(&self, meta: &FileMeta) -> Result<Handle<FNode>> {
+        assert!(meta.fid <= u32::MAX as u64);
+
+        let ptr = Ptr::from_addr(meta.fid as u32).ok_or(Error::NotFound)?;
+        self.tx.lookup(ptr).map_err(|e| e.into())
+    }
+    fn do_lookup_file(&self, path: impl AsRef<str>) -> Result<Handle<FNode>> {
+        let path = PathBuf::from(path.as_ref());
+        let components = components(&path)?;
+        let mut cur_node = self.get_root_handle();
+        for component in components {
+            let Component::Normal(name) = component else {
+                return Err(Error::NotSupported);
+            };
+            let name = name.to_str().unwrap();
+
+            let children = cur_node.children.ok_or(Error::NotFound)?;
+            let child = self.find_child(children, name)?;
+            cur_node = child.node;
+        }
+        Ok(cur_node)
     }
 
     fn find_child(&self, start_node: Ptr<FNode>, name: &str) -> Result<FileInfoReferent> {
@@ -303,6 +312,15 @@ impl Filesystem {
         self.tx.update(&self.volume)?;
         Ok(self.tx.write(entry)?)
     }
+}
+
+/// Makes sure that the path is absolute and returns its components skipping the root
+fn components(path: &Path) -> Result<path::Components> {
+    let mut components = path.components();
+    let Some(Component::RootDir) = components.next() else {
+        return Err(Error::PathMustBeAbsolute);
+    };
+    Ok(components)
 }
 
 pub struct File<'a> {
