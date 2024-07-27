@@ -5,3 +5,5 @@ members = ["pmem", "pmem-derive", "rfs"]
 [workspace.dependencies]
 pmem-derive = { path = "pmem-derive" }
 thiserror = "1.0.61"
+proptest = "1.0.0"
+tempfile = "3.10.1"

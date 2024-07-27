@@ -401,7 +401,7 @@ impl FileMeta {
             name,
             fid: u64::from(file_info.ptr().unwrap_addr()),
             size: file_info.size,
-            node_type: NodeType::from(file_info.node_type),
+            node_type: file_info.node_type,
         })
     }
 }
@@ -411,7 +411,7 @@ struct FNode {
     name: Str,
     // Unique file id on a volume
     fid: u64,
-    node_type: u8,
+    node_type: NodeType,
     size: u64,
     children: Option<Ptr<FNode>>,
     file_content: Option<SlicePtr<u8>>,
@@ -425,29 +425,11 @@ impl FNode {
     }
 }
 
-#[derive(PartialEq, Clone, Debug)]
+#[derive(PartialEq, Clone, Debug, Copy, Record)]
+#[repr(u8)]
 pub enum NodeType {
-    Directory,
-    File,
-}
-
-impl From<NodeType> for u8 {
-    fn from(node_type: NodeType) -> Self {
-        match node_type {
-            NodeType::Directory => 0,
-            NodeType::File => 1,
-        }
-    }
-}
-
-impl From<u8> for NodeType {
-    fn from(value: u8) -> Self {
-        match value {
-            0 => NodeType::Directory,
-            1 => NodeType::File,
-            _ => panic!("Invalid value for NodeType"),
-        }
-    }
+    Directory = 1,
+    File = 2,
 }
 
 #[derive(Clone, Record)]
@@ -690,5 +672,121 @@ mod tests {
         let mem = Memory::default();
         let tx = mem.start();
         (Filesystem::allocate(tx), mem)
+    }
+
+    mod proptests {
+        use std::fs;
+
+        use super::*;
+        use proptest::{collection::vec, prelude::*, prop_oneof, proptest, strategy::Strategy};
+        use tempfile::TempDir;
+
+        #[derive(Debug)]
+        enum WriteOperation {
+            Write(Vec<u8>),
+            Seek(SeekFrom),
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig {
+                cases: 1000,
+                ..ProptestConfig::default()
+            })]
+
+            #[test]
+            fn can_write_file(ops in vec(any_write_operation(), 0..10)) {
+                let (mut fs, _) = create_fs();
+                let tmp_dir = TempDir::new().unwrap();
+                let root = fs.get_root().unwrap();
+                let file = fs.create_file(&root, "file.txt").unwrap();
+                let shadow_file_path = tmp_dir.path().join("file.txt");
+
+                // File pair just mirrors the write and seek operations to a shadow file
+                let mut target = FilePair(
+                    fs.open_file(&file).unwrap(),
+                    fs::File::create_new(shadow_file_path).unwrap(),
+                );
+
+                for op in ops {
+                    match op {
+                        WriteOperation::Write(data) => {
+                            target.write_all(&data).unwrap();
+                        }
+                        WriteOperation::Seek(seek) => {
+                            target.seek(seek).unwrap();
+                        }
+                    }
+                }
+                target.flush().unwrap();
+                target.seek(SeekFrom::Start(0)).unwrap();
+
+                let (mut file, mut shadow_file) = target.into();
+
+                let mut file_buf = vec![];
+                file.read_to_end(&mut file_buf).unwrap();
+
+                let mut shadow_file_buf = vec![];
+                shadow_file.read_to_end(&mut shadow_file_buf).unwrap();
+
+                assert_eq!(file_buf, shadow_file_buf);
+            }
+        }
+
+        fn any_write_operation() -> impl Strategy<Value = WriteOperation> {
+            prop_oneof![any_write(), any_seek(),]
+        }
+
+        fn any_write() -> impl Strategy<Value = WriteOperation> {
+            vec(any::<u8>(), 0..100).prop_map(WriteOperation::Write)
+        }
+
+        fn any_seek() -> impl Strategy<Value = WriteOperation> {
+            let from_end = (0i64..100).prop_map(|x| SeekFrom::End(x));
+            let from_start = (0u64..100).prop_map(|x| SeekFrom::Start(x));
+            let from_current = (0i64..100).prop_map(|x| SeekFrom::Current(x));
+            prop_oneof![from_end, from_start, from_current].prop_map(WriteOperation::Seek)
+        }
+    }
+
+    // A simple wrapper around two files that mirrors write and seek operations
+    struct FilePair<A, B>(A, B);
+
+    impl<A, B> Into<(A, B)> for FilePair<A, B> {
+        fn into(self) -> (A, B) {
+            (self.0, self.1)
+        }
+    }
+
+    impl<A: Write + Seek, B: Write + Seek> Write for FilePair<A, B> {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let size_a = self.0.write(buf)?;
+            let size_b = self.1.write(buf)?;
+            if size_a == size_b {
+                Ok(size_a)
+            } else {
+                Err(io::Error::new(io::ErrorKind::Other, "Write sizes differ"))
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.0.flush()?;
+            self.1.flush()?;
+            Ok(())
+        }
+    }
+
+    impl<A: Seek, B: Seek> Seek for FilePair<A, B> {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+            let pos_a = self.0.seek(pos)?;
+            let pos_b = self.1.seek(pos)?;
+            if pos_a == pos_b {
+                Ok(pos_a)
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "Seek positions differ",
+                ))
+            }
+        }
     }
 }

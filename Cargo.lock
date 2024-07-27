@@ -892,6 +892,8 @@ dependencies = [
  "nfsserve",
  "pmem",
  "pmem-derive",
+ "proptest",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",

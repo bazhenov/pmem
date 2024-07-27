@@ -12,3 +12,7 @@ tokio = { version = "1.38.1", features = ["macros", "rt-multi-thread"] }
 nfsserve = "0.10.2"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 tracing = "0.1.40"
+
+[dev-dependencies]
+proptest = { workspace = true }
+tempfile = { workspace = true }
