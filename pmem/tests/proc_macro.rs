@@ -66,9 +66,11 @@ fn serialization_of_enum() {
     #[derive(Record, PartialEq, Debug)]
     #[repr(u8)]
     enum A {
+        Void = 0,
         U16(u16) = 1,
         U32(u32) = 2,
         U64(u64) = 3,
+        None = 10,
     }
 
     assert_read_write_eq(A::U16(42));

@@ -131,6 +131,7 @@ mod enum_record {
                 const SIZE: usize = std::mem::size_of::<#discriminant_ty>() + #pmem::memory::max([#(#variants_sizes),*]);
 
                 fn read(input: &[u8]) -> std::result::Result<Self, #pmem::memory::Error> {
+                    use #pmem::memory::Record;
                     let mut offset = 0;
                     #discriminant_read_expr
                     match (#discriminant_var) {
@@ -140,6 +141,7 @@ mod enum_record {
                 }
 
                 fn write(&self, data: &mut [u8]) -> std::result::Result<(), #pmem::memory::Error> {
+                    use #pmem::memory::Record;
                     match self {
                         #(#write_expr)*
                     }
@@ -236,11 +238,19 @@ mod enum_record {
 
     /// Builds the expression of the sum of all variant fields' sizes
     fn read_variant_size(variant: &syn::Variant) -> TokenStream2 {
-        let field_sizes = variant.fields.iter().map(|field| {
-            let ty = &field.ty;
-            quote! { std::mem::size_of::<#ty>() }
-        });
-        quote! { #(#field_sizes)+* }
+        let field_sizes = variant
+            .fields
+            .iter()
+            .map(|field| {
+                let ty = &field.ty;
+                quote! { std::mem::size_of::<#ty>() }
+            })
+            .collect::<Vec<_>>();
+        if field_sizes.is_empty() {
+            quote! { 0 }
+        } else {
+            quote! { #(#field_sizes)+* }
+        }
     }
 }
 
