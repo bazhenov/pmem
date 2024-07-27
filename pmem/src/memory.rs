@@ -338,6 +338,33 @@ impl<T> Debug for SlicePtr<T> {
 /// adding `T: Copy` bound in auto-generated implementation
 impl<T> Copy for SlicePtr<T> {}
 
+/// The Record trait is used to serialize and deserialize data structures.
+///
+/// It requires the implementor to provide the size of the data structure and methods to read and write
+/// the data structure from a byte slice.
+///
+/// The users supposed to use the derive macro to implement this trait. It provides a default implementation
+/// for the Record trait for the data structure using simple algorithm to tight pack the fields suing little endian
+/// binary format. Enums are serialized using the discriminant value followed by the fields.
+///
+/// Example:
+/// ```
+/// use record::Record;
+///
+/// #[derive(Record)]
+/// struct MyRecord {
+///    field1: u32,
+///    field2: u64,
+/// }
+///
+/// fn read_my_struct(&input: [u8]) {
+///    let my_record = MyRecord::read(&input).unwrap();
+/// }
+///
+/// fn write_my_struct(&mut output: [u8], my_record: &MyRecord) {
+///    my_record.write(&mut output).unwrap();
+/// }
+/// ```
 pub trait Record: Sized {
     const SIZE: usize;
 

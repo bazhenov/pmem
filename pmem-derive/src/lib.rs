@@ -9,6 +9,7 @@ use syn::{
     DataEnum, DataStruct, DeriveInput, Field, Fields, Ident, Index, Type, Variant,
 };
 
+/// Implements the [Record] trait for structs and enums
 #[proc_macro_derive(Record)]
 pub fn derive_record(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
