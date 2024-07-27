@@ -89,6 +89,19 @@ fn serialization_of_enum_with_generics() {
     assert_read_write_eq(Opt::Some(42u32));
 }
 
+#[test]
+fn serialization_of_enum_with_named_fields() {
+    #[derive(Record, PartialEq, Debug)]
+    #[repr(u8)]
+    enum Path {
+        Windows { drive: u8, inode: u64 } = 1,
+        Unix(u64) = 2,
+    }
+
+    assert_read_write_eq(Path::Windows { drive: 1, inode: 2 });
+    assert_read_write_eq(Path::Unix(42));
+}
+
 fn assert_read_write_eq<T: Record + Debug + PartialEq>(a: T) {
     let mut buffer = vec![0; T::SIZE];
     a.write(buffer.as_mut()).unwrap();

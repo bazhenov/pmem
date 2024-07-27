@@ -348,21 +348,22 @@ impl<T> Copy for SlicePtr<T> {}
 /// binary format. Enums are serialized using the discriminant value followed by the fields.
 ///
 /// Example:
-/// ```
-/// use record::Record;
+/// ```ignore
+/// use pmem::memory::Record;
+/// use pmem_derive::Record;
 ///
 /// #[derive(Record)]
 /// struct MyRecord {
-///    field1: u32,
-///    field2: u64,
+///     field1: u32,
+///     field2: u64,
 /// }
 ///
-/// fn read_my_struct(&input: [u8]) {
-///    let my_record = MyRecord::read(&input).unwrap();
+/// fn read_my_struct(input: &[u8]) {
+///     let my_record = MyRecord::read(&input).unwrap();
 /// }
 ///
-/// fn write_my_struct(&mut output: [u8], my_record: &MyRecord) {
-///    my_record.write(&mut output).unwrap();
+/// fn write_my_struct(output: &mut [u8], my_record: &MyRecord) {
+///     my_record.write(output).unwrap();
 /// }
 /// ```
 pub trait Record: Sized {
@@ -393,6 +394,21 @@ macro_rules! impl_record_for_primitive {
 
 impl_record_for_primitive!(u8, u16, u32, u64);
 impl_record_for_primitive!(i8, i16, i32, i64);
+
+impl Record for bool {
+    const SIZE: usize = mem::size_of::<Self>();
+
+    fn read(data: &[u8]) -> Result<Self> {
+        assert!(data.len() == Self::SIZE);
+        Ok(data[0] != 0)
+    }
+
+    fn write(&self, data: &mut [u8]) -> Result<()> {
+        assert!(data.len() == Self::SIZE);
+        data[0] = *self as u8;
+        Ok(())
+    }
+}
 
 /// Indicates that all zero bytes is not valid state for a record and it is represented
 /// as an `Option<T>::None` in type system.
@@ -471,7 +487,7 @@ pub const fn max<const N: usize>(array: [usize; N]) -> usize {
         }
         i += 1;
     }
-    return max;
+    max
 }
 
 #[cfg(test)]
@@ -491,6 +507,13 @@ mod tests {
     fn check_ptr_size() {
         assert_eq!(mem::size_of::<Ptr<u128>>(), PTR_SIZE);
         assert_eq!(mem::size_of::<Ptr<u8>>(), PTR_SIZE);
+    }
+
+    #[test]
+    fn test_max() {
+        assert_eq!(max([1, 2, 3]), 3);
+        assert_eq!(max([3, 2, 1]), 3);
+        assert_eq!(max([]), 0);
     }
 
     #[test]
