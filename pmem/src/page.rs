@@ -9,7 +9,7 @@
 //! ## Concepts
 //!
 //! - **Page Pool**: A collection of pages that can be snapshot, modified, and committed. It acts as the primary
-//! interface for interacting with the page memory.
+//!   interface for interacting with the page memory.
 //!
 //! - **Snapshot**: A snapshot represents the state of the page pool at a specific moment.
 //!   It can be modified independently of the pool, and later committed back to the pool to update its state.
@@ -43,9 +43,9 @@
 //! The module ensures safety and correctness through the following mechanisms:
 //!
 //! - **Immutability of Committed Snapshots**: Once a snapshot is committed, it becomes immutable, ensuring that
-//! any reference to its data remains valid and unchanged until corresponding `Rc` reference is held.
+//!   any reference to its data remains valid and unchanged until corresponding `Rc` reference is held.
 //! - **Linear Snapshot History**: The module enforces a linear history of snapshots, preventing branches in the
-//! snapshot history and ensuring consistency of changes proposed in snapshots.
+//!   snapshot history and ensuring consistency of changes proposed in snapshots.
 //!
 //! ## Performance Considerations
 //!
@@ -358,7 +358,7 @@ impl PagePool {
     /// # Arguments
     ///
     /// * `pages` - The number of pages the pool should initially contain. This determines
-    /// the range of valid addresses that can be written to in snapshots derived from this pool.
+    ///   the range of valid addresses that can be written to in snapshots derived from this pool.
     pub fn new(pages: usize) -> Self {
         let snapshot = CommittedSnapshot {
             patches: vec![],
