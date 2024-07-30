@@ -55,7 +55,7 @@
 
 use std::{borrow::Cow, ops::Range, sync::Arc};
 
-pub const PAGE_SIZE: usize = 1 << 24; // 16Mb
+pub const PAGE_SIZE: usize = 1 << 16; // 64Kib
 pub type Addr = u32;
 pub type PageOffset = u32;
 pub type PageNo = u32;
@@ -798,7 +798,7 @@ mod tests {
 
         // Addresses on 3 consequent pages
         let page_a = 0;
-        let page_b = 1 * PAGE_SIZE as Addr;
+        let page_b = PAGE_SIZE as Addr;
         let page_c = 2 * PAGE_SIZE as Addr;
 
         let mut snapshot = mem.snapshot();
@@ -850,7 +850,7 @@ mod tests {
         let mut snapshot = mem.snapshot();
         let bytes = [0; 20];
         let addr = PAGE_SIZE as u32 - 10;
-        let _ = snapshot.write(addr, &bytes);
+        snapshot.write(addr, bytes);
     }
 
     #[test]
@@ -858,7 +858,7 @@ mod tests {
         let mut mem = PagePool::new(1); // Initially 1 page
 
         let page_a = 0;
-        let page_b = 1 * PAGE_SIZE as Addr;
+        let page_b = PAGE_SIZE as Addr;
 
         let alice = b"Alice";
         let bob = b"Bob";
@@ -1013,21 +1013,21 @@ mod tests {
         fn assert_merged(a: Patch, b: Patch, expected: Patch) {
             match a.normalize(b) {
                 NormalizedPatches::Merged(patch) => assert_eq!(patch, expected),
-                result @ _ => panic!("Patch should be merged: {:?}", result),
+                result => panic!("Patch should be merged: {:?}", result),
             }
         }
 
         fn assert_reordered(a: Patch, b: Patch, expected: (Patch, Patch)) {
             match a.normalize(b) {
                 NormalizedPatches::Reordered(p1, p2) => assert_eq!((p1, p2), expected),
-                result @ _ => panic!("Patch should be merged: {:?}", result),
+                result => panic!("Patch should be merged: {:?}", result),
             }
         }
 
         fn assert_split(a: Patch, b: Patch, expected: (Patch, Patch, Patch)) {
             match a.normalize(b) {
                 NormalizedPatches::Split(p1, p2, p3) => assert_eq!((p1, p2, p3), expected),
-                result @ _ => panic!("Patch should be split: {:?}", result),
+                result => panic!("Patch should be split: {:?}", result),
             }
         }
 
@@ -1037,7 +1037,7 @@ mod tests {
                     assert_eq!(p1, a);
                     assert_eq!(p2, b);
                 }
-                result @ _ => panic!("Patch should not be merged: {:?}", result),
+                result => panic!("Patch should not be merged: {:?}", result),
             }
         }
     }
@@ -1047,11 +1047,11 @@ mod tests {
 
         #[test]
         fn split_ptr_generic() {
-            let addr = 0x0A_F01234;
+            let addr = 0x0AF0_1234;
             let (page_no, offset) = split_ptr(addr);
 
-            assert_eq!(page_no, 0x0A, "Unexpected page number");
-            assert_eq!(offset, 0xF01234, "Unexpected offset");
+            assert_eq!(page_no, 0x0AF0);
+            assert_eq!(offset, 0x1234);
         }
 
         #[test]
@@ -1059,15 +1059,8 @@ mod tests {
             let addr = PAGE_SIZE as u32 - 1; // Last address of the first page
             let (page_no, offset) = split_ptr(addr);
 
-            assert_eq!(
-                page_no, 0,
-                "Page number should be 0 at the last address of the first page"
-            );
-            assert_eq!(
-                offset,
-                PAGE_SIZE as u32 - 1,
-                "Offset should be at the page boundary"
-            );
+            assert_eq!(page_no, 0,);
+            assert_eq!(offset, PAGE_SIZE as u32 - 1,);
         }
 
         #[test]
@@ -1081,11 +1074,11 @@ mod tests {
 
         #[test]
         fn test_split_ptr_max_addr() {
-            let addr = Addr::MAX; // Maximum possible address
+            let addr = Addr::MAX;
             let (page_no, offset) = split_ptr(addr);
 
-            assert_eq!(page_no, 0xFF, "Unexpected page number for maximum address");
-            assert_eq!(offset, 0xFFFFFF, "Unexpected offset for maximum address");
+            assert_eq!(page_no, 0xFFFF,);
+            assert_eq!(offset, 0xFFFF);
         }
     }
 
@@ -1133,7 +1126,7 @@ mod tests {
                     mem.commit(snapshot);
                 }
 
-                assert_buffers_eq(&*mem.read(0, DB_SIZE), shadow_buffer.as_slice())?;
+                assert_buffers_eq(&mem.read(0, DB_SIZE), shadow_buffer.as_slice())?;
             }
 
             #[test]
@@ -1170,7 +1163,7 @@ mod tests {
             fn covered_patches_rewrite((covering, covered) in patches::covered()) {
                 match covered.normalize(covering.clone()) {
                     Merged(result) => prop_assert_eq!(covering, result),
-                    r @ _ => prop_assert!(false, "Merged() expected. Got: {:?}", r),
+                    r => prop_assert!(false, "Merged() expected. Got: {:?}", r),
                 }
             }
 
@@ -1233,12 +1226,12 @@ mod tests {
                 let left = &ranges[..connected.start];
                 let right = &ranges[connected.end..];
 
-                for r in left.into_iter().chain(right.into_iter()) {
-                    prop_assert!(!ranges_connected(&r, &range), "Must not be connected: {:?}, {:?}", r, range)
+                for r in left.iter().chain(right.iter()) {
+                    prop_assert!(!ranges_connected(r, &range), "Must not be connected: {:?}, {:?}", r, range)
                 }
 
                 for r in &ranges[connected] {
-                    prop_assert!(ranges_connected(&r, &range), "Must be connected: {:?}, {:?}", r, range)
+                    prop_assert!(ranges_connected(r, &range), "Must be connected: {:?}, {:?}", r, range)
                 }
             }
         }
@@ -1252,7 +1245,7 @@ mod tests {
                 .prop_flat_map(|size| (vec(1u32..3, size), vec(0u32..3, size)))
                 .prop_map(|(size, skip)| {
                     size.into_iter()
-                        .zip(skip.into_iter())
+                        .zip(skip)
                         .scan(0, |offset, (size, skip)| {
                             let start = *offset + skip;
                             let end = start + size;
@@ -1303,7 +1296,7 @@ mod tests {
             pub(super) fn disconnected() -> impl Strategy<Value = (Patch, Patch)> {
                 (any_patch(), any_patch())
                     .prop_filter("Patches should be disconnected", |(p1, p2)| {
-                        !p1.overlaps(&p2) && !p1.adjacent(&p2)
+                        !p1.overlaps(p2) && !p1.adjacent(p2)
                     })
             }
 
@@ -1384,7 +1377,7 @@ mod tests {
 
             let mut mismatch = a
                 .iter()
-                .zip(b.into_iter())
+                .zip(b)
                 .enumerate()
                 .skip_while(|(_, (a, b))| *a == *b)
                 .take_while(|(_, (a, b))| *a != *b)
@@ -1392,7 +1385,7 @@ mod tests {
 
             if let Some(start) = mismatch.next() {
                 let end = mismatch.last().unwrap_or(start) + 1;
-                assert_eq!(
+                prop_assert_eq!(
                     &a[start..end],
                     &b[start..end],
                     "Mismatch detected at {}..{}",

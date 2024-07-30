@@ -1,12 +1,17 @@
-use pmem::{memory::SlicePtr, Handle, Ptr, Storable, Transaction};
+use pmem::{
+    memory::{self, SlicePtr, PTR_SIZE},
+    Handle, Ptr, Record, Storable, Transaction,
+};
 use pmem_derive::Record;
 use std::{
     convert::Into,
     fmt,
-    io::{self, Cursor, Read, Seek, SeekFrom, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
+    ops::{Deref, DerefMut},
     path::{self, Component, Path, PathBuf},
     str::Utf8Error,
 };
+use tracing::{instrument, trace};
 
 type Result<T> = std::result::Result<T, Error>;
 type CreateResult = std::result::Result<Handle<FNode>, Handle<FNode>>;
@@ -60,11 +65,10 @@ impl Storable for Filesystem {
         let name = tx.write_slice("/".as_bytes()).unwrap();
         let root_entry = FNode {
             name: Str(name),
-            fid: 1,
             size: 0,
-            node_type: NodeType::Directory.into(),
+            node_type: NodeType::Directory,
             children: None,
-            file_content: None,
+            content: BlockPointers::default(),
             next: None,
         };
         let root = tx.write(root_entry).unwrap().ptr();
@@ -150,16 +154,10 @@ impl Filesystem {
     pub fn open_file<'a>(&'a mut self, file: &FileMeta) -> Result<File<'a>> {
         let file_info = self.lookup_inode(file)?;
 
-        let content = if let Some(content) = file_info.file_content {
-            self.tx.read_bytes(content)?.to_vec()
-        } else {
-            vec![]
-        };
-
         Ok(File {
-            cursor: Cursor::new(content),
+            pos: 0,
             fs: self,
-            file_info,
+            meta: file_info,
         })
     }
 
@@ -297,15 +295,12 @@ impl Filesystem {
     }
 
     fn write_fsnode(&mut self, name: &str, node_type: NodeType) -> Result<Handle<FNode>> {
-        let fid = self.volume.next_fid;
-        self.volume.next_fid += 1;
         let name = self.tx.write_slice(name.as_bytes())?;
         let entry = FNode {
             name: Str(name),
-            fid,
-            node_type: node_type.into(),
+            node_type,
             size: 0,
-            file_content: None,
+            content: BlockPointers::default(),
             children: None,
             next: None,
         };
@@ -324,40 +319,238 @@ fn components(path: &Path) -> Result<path::Components> {
 }
 
 pub struct File<'a> {
-    cursor: Cursor<Vec<u8>>,
-    file_info: Handle<FNode>,
+    pos: u64,
+    meta: Handle<FNode>,
     fs: &'a mut Filesystem,
 }
 
+impl<'a> File<'a> {
+    /// Allocates given number of blocks and adds them to the file content
+    #[instrument(skip(self))]
+    fn allocate(&mut self, blocks: u64) -> Result<()> {
+        let blocks_to_allocate = blocks;
+        let mut blocks = blocks_required(self.meta.size);
+        let blocks_required = blocks + blocks_to_allocate;
+
+        let tx = &mut self.fs.tx;
+
+        // Allocating direct data blocks if needed
+        let blocks_before = blocks;
+        while blocks < blocks_required && blocks <= LAST_DIRECT_BLOCK as u64 {
+            make_sure_data_block_exists(tx, &mut self.meta.content.direct[blocks as usize])?;
+            blocks += 1;
+        }
+        if blocks > blocks_before {
+            trace!(cnt = blocks - blocks_before, "Allocated direct blocks");
+        }
+
+        // Allocating indirect data block if needed
+        if blocks < blocks_required {
+            let mut indirect_block =
+                make_sure_ptr_block_exists(tx, &mut self.meta.content.indirect)?;
+
+            let blocks_before = blocks;
+            while blocks < blocks_required && blocks <= LAST_INDIRECT_BLOCK as u64 {
+                let idx = blocks as usize - FIRST_INDIRECT_BLOCK;
+                make_sure_data_block_exists(tx, &mut indirect_block[idx])?;
+                blocks += 1;
+            }
+            tx.update(&indirect_block)?;
+            if blocks > blocks_before {
+                trace!(cnt = blocks - blocks_before, "Allocated indirect blocks");
+            }
+        }
+
+        // Allocating double indirect data block if needed
+        if blocks < blocks_required {
+            let mut double_indirect_block =
+                make_sure_ptr_block_exists(tx, &mut self.meta.content.double_indirect)?;
+
+            let blocks_before = blocks;
+            while blocks < blocks_required && blocks <= LAST_DOUBLE_INDIRECT_BLOCK as u64 {
+                let idx = blocks as usize - FIRST_DOUBLE_INDIRECT_BLOCK;
+
+                // Because we have two level of indirection we need to calculate the index of the
+                // two blocks that we need to update
+                let a_idx = idx / POINTERS_PER_BLOCK;
+                let b_idx = idx % POINTERS_PER_BLOCK;
+                let mut a_block =
+                    make_sure_ptr_block_exists(tx, &mut double_indirect_block[a_idx])?;
+                make_sure_data_block_exists(tx, &mut a_block[b_idx])?;
+                // Here is possible performance improvement, technically we don't need to update
+                // the indirect block every time, but we can do it in the end
+                tx.update(&a_block)?;
+                blocks += 1;
+            }
+            tx.update(&double_indirect_block)?;
+
+            if blocks > blocks_before {
+                trace!(
+                    cnt = blocks - blocks_before,
+                    "Allocated double-indirect blocks"
+                );
+            }
+        }
+        tx.update(&self.meta)?;
+        Ok(())
+    }
+
+    fn get_current_block(&mut self) -> Result<Handle<DataBlock>> {
+        let block_no = block_idx(self.pos) as usize;
+        let tx = &mut self.fs.tx;
+
+        dbg!(block_no);
+        match block_no {
+            0..=LAST_DIRECT_BLOCK => {
+                trace!("Current block: Direct({})", block_no);
+                let block_ptr = self.meta.content.direct[block_no].expect("Direct block missing");
+                Ok(self.fs.tx.lookup(block_ptr)?)
+            }
+            FIRST_INDIRECT_BLOCK..=LAST_INDIRECT_BLOCK => {
+                let relative_block_no = block_no - FIRST_INDIRECT_BLOCK;
+                let block_ptr = lookup_step(tx, self.meta.content.indirect, relative_block_no)
+                    .expect("Indirect data block missing");
+                trace!("Current block: Indirect({})", relative_block_no);
+                Ok(self.fs.tx.lookup(block_ptr)?)
+            }
+            FIRST_DOUBLE_INDIRECT_BLOCK..=LAST_DOUBLE_INDIRECT_BLOCK => {
+                let relative_block_no = block_no - FIRST_DOUBLE_INDIRECT_BLOCK;
+                let a_idx = relative_block_no / POINTERS_PER_BLOCK;
+                let b_idx = relative_block_no % POINTERS_PER_BLOCK;
+
+                let a_ptr = lookup_step(tx, self.meta.content.double_indirect, a_idx);
+                let b_ptr = lookup_step(tx, a_ptr, b_idx).expect("Data block missing");
+
+                trace!("Current block: Double indirect({})", relative_block_no);
+                Ok(tx.lookup(b_ptr)?)
+            }
+            _ => unimplemented!("File too large"),
+        }
+    }
+}
+
+fn make_sure_data_block_exists(
+    tx: &mut Transaction,
+    ptr: &mut Option<Ptr<DataBlock>>,
+) -> Result<Handle<DataBlock>> {
+    if let Some(ptr) = ptr {
+        Ok(tx.lookup(*ptr)?)
+    } else {
+        let data_block = tx.write(DataBlock::default())?;
+        *ptr = Some(data_block.ptr());
+        Ok(data_block)
+    }
+}
+
+fn make_sure_ptr_block_exists<T: Record>(
+    tx: &mut Transaction,
+    ptr: &mut Option<Ptr<PointersBlock<T>>>,
+) -> Result<Handle<PointersBlock<T>>> {
+    if let Some(ptr) = ptr {
+        Ok(tx.lookup(*ptr)?)
+    } else {
+        trace!("Allocating double indirect pointers block");
+        let indirect_block = tx.write::<PointersBlock<T>>([None; BLOCK_SIZE / PTR_SIZE])?;
+        *ptr = Some(indirect_block.ptr());
+        Ok(indirect_block)
+    }
+}
+
+fn lookup_step<T>(
+    tx: &mut Transaction,
+    block_ptr: NullPtr<PointersBlock<T>>,
+    idx: usize,
+) -> NullPtr<T> {
+    let block_ptr = block_ptr.expect("Block pointer missing");
+    let block = tx.lookup(block_ptr).expect("Unable to read block");
+    block[idx]
+}
+
 impl<'a> Read for File<'a> {
+    #[instrument(level = "trace", skip(self, buf), fields(buf.len = buf.len(), pos=self.pos), ret)]
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.cursor.read(buf)
+        // we must use saturating_seb here, because pos can technically be larger than file size
+        let bytes_left_in_file = self.meta.size.saturating_sub(self.pos);
+        if bytes_left_in_file == 0 {
+            return Ok(0);
+        }
+
+        let offset = self.pos as usize % BLOCK_SIZE;
+        let bytes_left_in_block = BLOCK_SIZE - offset;
+
+        let len = buf
+            .len()
+            .min(bytes_left_in_block)
+            .min(bytes_left_in_file as usize);
+
+        let block = self.get_current_block()?;
+        buf[..len].copy_from_slice(&block[offset..offset + len]);
+
+        self.pos += len as u64;
+        Ok(len)
     }
 }
 
 impl<'a> Write for File<'a> {
+    #[instrument(level = "trace", skip(self, buf), fields(buf.len = buf.len(), pos=self.pos), ret)]
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.cursor.write(buf)
+        // user can seek after the end of file and write there, so we use self.pos here
+        // TODO what we right after the end of file, should we extend the file?
+        if self.pos + buf.len() as u64 > self.meta.size {
+            // there is not enough space in the file, we need to allocate more blocks
+            let current_blocks = blocks_required(self.meta.size);
+            let new_blocks = blocks_required(self.pos + buf.len() as u64);
+            let blocks_to_allocate = new_blocks - current_blocks;
+            if blocks_to_allocate > 0 {
+                self.allocate(blocks_to_allocate)?;
+            }
+        }
+
+        let mut block = self.get_current_block()?;
+
+        let offset = self.pos as usize % BLOCK_SIZE;
+        let bytes_left = BLOCK_SIZE - offset;
+        let len = buf.len().min(bytes_left);
+
+        block[offset..(offset + len)].copy_from_slice(&buf[..len]);
+        self.fs.tx.update(&block)?;
+
+        self.pos += len as u64;
+        self.meta.size = self.meta.size.max(self.pos);
+
+        self.fs.tx.update(&self.meta)?;
+
+        Ok(len)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        if let Some(_old_content) = self.file_info.file_content.take() {
-            // TODO Remove old content
-        }
-        let value = self.cursor.get_ref();
-        let size = value.len();
-        let slice = self.fs.tx.write_bytes(value)?;
-        self.file_info.file_content = Some(slice);
-        self.file_info.size = size as u64;
-        self.fs.tx.update(&self.file_info)?;
         Ok(())
     }
 }
 
 impl<'a> Seek for File<'a> {
+    #[instrument(level = "trace", skip(self), fields(curr=self.pos), ret)]
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        self.cursor.seek(pos)
+        // Calculate new position in a file
+        let abs_pos = match pos {
+            SeekFrom::Start(pos) => pos,
+            SeekFrom::End(pos) => ((self.meta.size as i64) + pos) as u64,
+            SeekFrom::Current(pos) => (self.pos as i64 + pos) as u64,
+        };
+
+        self.pos = abs_pos;
+        Ok(abs_pos)
     }
+}
+
+/// Returns the number of blocks required to store `n` bytes
+fn blocks_required(n: u64) -> u64 {
+    (n + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64
+}
+
+/// Returns the index of the block that contains the byte at position `n`
+fn block_idx(n: u64) -> u64 {
+    n / BLOCK_SIZE as u64
 }
 
 impl From<Error> for io::Error {
@@ -409,13 +602,111 @@ impl FileMeta {
 #[derive(Clone, Debug, Record)]
 struct FNode {
     name: Str,
-    // Unique file id on a volume
-    fid: u64,
     node_type: NodeType,
     size: u64,
     children: Option<Ptr<FNode>>,
-    file_content: Option<SlicePtr<u8>>,
+    content: BlockPointers,
     next: Option<Ptr<FNode>>,
+}
+
+/// The size of a data block containing file data in bytes
+///
+/// It is analogous to the block size (cluster) of a file system. File size in the storage
+/// is increased in multiples of this size.
+#[cfg(not(test))]
+const BLOCK_SIZE: usize = 4096;
+
+/// For the tests we use a smaller block size to be able to hit all code paths that are related
+/// to indirect and double indirect blocks. Also error messages are more comprehensible.
+#[cfg(test)]
+const BLOCK_SIZE: usize = 64;
+
+/// The number of pointers that fit into a block
+const POINTERS_PER_BLOCK: usize = BLOCK_SIZE / PTR_SIZE;
+
+const DIRECT_BLOCKS: usize = 10;
+const INDIRECT_BLOCKS: usize = BLOCK_SIZE / PTR_SIZE;
+const DOUBLE_INDIRECT_BLOCKS: usize = INDIRECT_BLOCKS * INDIRECT_BLOCKS;
+
+const LAST_DIRECT_BLOCK: usize = DIRECT_BLOCKS - 1;
+
+const FIRST_INDIRECT_BLOCK: usize = LAST_DIRECT_BLOCK + 1;
+const LAST_INDIRECT_BLOCK: usize = FIRST_INDIRECT_BLOCK + INDIRECT_BLOCKS - 1;
+
+const FIRST_DOUBLE_INDIRECT_BLOCK: usize = LAST_INDIRECT_BLOCK + 1;
+const LAST_DOUBLE_INDIRECT_BLOCK: usize = FIRST_DOUBLE_INDIRECT_BLOCK + DOUBLE_INDIRECT_BLOCKS - 1;
+
+/// Simple type alias to minimize the amount of angle brackets in the code
+type NullPtr<T> = Option<Ptr<T>>;
+type PointersBlock<T> = [NullPtr<T>; BLOCK_SIZE / PTR_SIZE];
+
+/// This wrapper exists primarily to opt out of default implementation of `Record` trait
+/// for arrays. We want to have a custom implementation that will write the array directly as slice.
+struct DataBlock([u8; BLOCK_SIZE]);
+
+impl Record for DataBlock {
+    const SIZE: usize = BLOCK_SIZE;
+
+    fn read(data: &[u8]) -> std::result::Result<Self, memory::Error> {
+        assert!(data.len() == Self::SIZE);
+
+        let mut result = [0; Self::SIZE];
+        result.copy_from_slice(data);
+        Ok(Self(result))
+    }
+
+    fn write(&self, data: &mut [u8]) -> std::result::Result<(), memory::Error> {
+        assert!(data.len() == Self::SIZE);
+
+        data.copy_from_slice(&self.0);
+        Ok(())
+    }
+}
+
+impl Default for DataBlock {
+    fn default() -> Self {
+        DataBlock([0; BLOCK_SIZE])
+    }
+}
+
+impl Deref for DataBlock {
+    type Target = [u8; BLOCK_SIZE];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for DataBlock {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+/// Pointers addressing blocks of file data.
+///
+/// This struct follows the ext4 layout for block pointers [1]. It contains limited number of
+/// direct pointers, one indirect pointer and double-indirect pointer.
+/// Indirect pointer points to a block containing pointers to data blocks.
+/// Double-indirect pointer points to a block containing pointers to indirect pointers (2 levels of indirection).
+///
+/// Therefore the maximum file size is limited by the number data blocks that can be addressed by the
+/// directo pointers, indirect pointers and double-indirect pointers.
+///
+/// The maximum file size is calculated as follows:
+/// ```ignore
+/// BLOCK_SIZE * (10 + POINTERS_PER_BLOCK + POINTERS_PER_BLOCK^2)
+///               ^             ^                     ^
+///      direct pointers  indirect pointers  double-indirect pointers
+/// ```
+/// 4096 * (10 + 1024 + 1024^2) = 4,229,202,560 bytes
+///
+/// [1]: https://github.com/torvalds/linux/blob/master/Documentation/filesystems/ext4/blockmap.rst
+#[derive(Debug, Record, Clone, Default)]
+struct BlockPointers {
+    direct: [NullPtr<DataBlock>; DIRECT_BLOCKS],
+    indirect: NullPtr<PointersBlock<DataBlock>>,
+    double_indirect: NullPtr<PointersBlock<PointersBlock<DataBlock>>>,
 }
 
 impl FNode {
@@ -444,16 +735,17 @@ impl fmt::Debug for Str {
 #[cfg(test)]
 mod tests {
 
+    use std::fs;
+
     use super::*;
     use pmem::{Memory, Storable};
+    use proptest::prop_assert_eq;
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
     macro_rules! assert_missing {
-        ($result:expr) => {
-            assert_missing!($result, "Expected item to be missing");
-        };
-        ($result:expr, $msg:expr) => {
-            let Some(Error::NotFound) = $result.err() else {
-                panic!($msg);
+        ($fs:expr, $name:expr) => {
+            let Some(Error::NotFound) = $fs.find($name).err() else {
+                panic!("{} should be missing", $name);
             };
         };
     }
@@ -525,7 +817,7 @@ mod tests {
         fs.create_dir(&root, "usr")?;
         fs.delete(&root, "usr")?;
 
-        assert_missing!(fs.find("/usr"), "/usr should be missing");
+        assert_missing!(fs, "/usr");
         Ok(())
     }
 
@@ -537,7 +829,7 @@ mod tests {
         fs.create_file(&root, "swap")?;
         fs.delete(&root, "swap")?;
 
-        assert_missing!(fs.find("/swap"), "/swap should be missing");
+        assert_missing!(fs, "/swap");
 
         Ok(())
     }
@@ -551,12 +843,12 @@ mod tests {
         fs.create_file(&root, "swap")?;
 
         fs.delete(&root, "etc")?;
-        assert_missing!(fs.find("/etc"), "/etc should be missing");
+        assert_missing!(fs, "/etc");
 
         let _ = fs.lookup(&root, "swap")?;
 
         fs.delete(&root, "swap")?;
-        assert_missing!(fs.find("/swap"), "/swap should be missing");
+        assert_missing!(fs, "/swap");
 
         Ok(())
     }
@@ -614,17 +906,12 @@ mod tests {
         let (mut fs, _) = create_fs();
 
         let root = fs.get_root()?;
-        let file_meta = fs.create_file(&root, "file.txt")?;
-        let mut file = fs.open_file(&file_meta)?;
-        file.write_all("Hello world".as_bytes())?;
-        file.flush()?;
+        let file = fs.create_file(&root, "file.txt")?;
 
-        let mut file = fs.open_file(&file_meta)?;
-        file.seek(SeekFrom::Start(6))?;
-        file.write_all("Rust!".as_bytes())?;
-        file.flush()?;
+        write_file(&mut fs, &file, "Hello world".as_bytes(), None)?;
+        write_file(&mut fs, &file, "Rust!".as_bytes(), Some(SeekFrom::Start(6)))?;
 
-        let mut file = fs.open_file(&file_meta)?;
+        let mut file = fs.open_file(&file)?;
         let mut content = String::new();
         file.read_to_string(&mut content)?;
         assert_eq!(content, "Hello Rust!");
@@ -652,20 +939,112 @@ mod tests {
     }
 
     #[test]
-    fn no_space_left() {
+    fn write_direct_blocks() -> Result<()> {
         let (mut fs, _) = create_fs();
+        let root = fs.get_root()?;
+        let file_meta = fs.create_file(&root, "file.txt")?;
 
-        let root = fs.get_root().unwrap();
-        let f = fs.create_file(&root, "swap").unwrap();
-        let mut file = fs.open_file(&f).unwrap();
-        let data = [0; 20 * 1024];
-        for _ in 0..1024 {
-            file.write_all(&data).unwrap();
+        let data = [1u8; BLOCK_SIZE * 2];
+        write_file(&mut fs, &file_meta, &data, None)?;
+        let read_data = read_file(fs, file_meta, BLOCK_SIZE * 2, None)?;
+
+        assert_eq!(&read_data, &data); // Check initial data
+
+        Ok(())
+    }
+
+    #[test]
+    fn write_indirect_blocks() -> Result<()> {
+        let (mut fs, _) = create_fs();
+        let root = fs.get_root()?;
+        let meta = fs.create_file(&root, "file.txt")?;
+
+        let pos = SeekFrom::Start((BLOCK_SIZE * FIRST_INDIRECT_BLOCK) as u64);
+
+        let data = [1u8; 2 * BLOCK_SIZE];
+        write_file(&mut fs, &meta, &data, Some(pos))?;
+        let read_data = read_file(fs, meta, 2 * BLOCK_SIZE, Some(pos))?;
+
+        assert_eq!(&read_data, &data);
+        Ok(())
+    }
+
+    #[test]
+    fn write_double_indirect_blocks() -> Result<()> {
+        let (mut fs, _) = create_fs();
+        let root = fs.get_root()?;
+        let meta = fs.create_file(&root, "file.txt")?;
+
+        let pos = SeekFrom::Start((BLOCK_SIZE * FIRST_DOUBLE_INDIRECT_BLOCK) as u64);
+
+        let data = [1u8; 2 * BLOCK_SIZE];
+        write_file(&mut fs, &meta, &data, Some(pos))?;
+        let read_data = read_file(fs, meta, 2 * BLOCK_SIZE, Some(pos))?;
+
+        assert_eq!(&read_data, &data);
+        Ok(())
+    }
+
+    fn read_file(
+        mut fs: Filesystem,
+        meta: FileMeta,
+        size: usize,
+        pos: Option<SeekFrom>,
+    ) -> Result<Vec<u8>> {
+        let mut buf = vec![0u8; size];
+        let mut file = fs.open_file(&meta)?;
+        if let Some(pos) = pos {
+            file.seek(pos)?;
         }
+        file.read_exact(&mut buf)?;
+        Ok(buf)
+    }
 
-        let result = file.flush();
-        eprintln!("{:?}", result);
-        assert!(result.is_err(), "Err should be generated");
+    fn write_file(
+        fs: &mut Filesystem,
+        meta: &FileMeta,
+        data: &[u8],
+        pos: Option<SeekFrom>,
+    ) -> Result<()> {
+        let mut file = fs.open_file(meta)?;
+        if let Some(pos) = pos {
+            file.seek(pos)?;
+        }
+        file.write_all(data)?;
+        file.flush()?;
+        Ok(())
+    }
+
+    #[test]
+    #[should_panic(expected = "PMemError(NoSpaceLeft)")]
+    fn no_space_left() {
+        // Maximum file size is 17984 bytes in test environment. So in order to trigger NoSpaceLeft
+        // we need to write 64Kib (1 page in PagePool) / 17984 = 4 files.
+        const MAX_FILE_SIZE: usize = BLOCK_SIZE * LAST_DOUBLE_INDIRECT_BLOCK;
+
+        let (mut fs, _) = create_fs();
+        let root = fs.get_root().unwrap();
+
+        let pos = Some(SeekFrom::Start((MAX_FILE_SIZE - 1) as u64));
+        for idx in 0..4 {
+            let f = fs.create_file(&root, format!("swap{}", idx)).unwrap();
+            write_file(&mut fs, &f, &[1], pos).unwrap();
+        }
+    }
+
+    #[test]
+    fn block_calculation_utilities() {
+        assert_eq!(blocks_required(0), 0);
+        assert_eq!(blocks_required(1), 1);
+        assert_eq!(blocks_required(BLOCK_SIZE as u64 - 1), 1);
+        assert_eq!(blocks_required(BLOCK_SIZE as u64), 1);
+        assert_eq!(blocks_required(BLOCK_SIZE as u64 + 1), 2);
+
+        assert_eq!(block_idx(0), 0);
+        assert_eq!(block_idx(1), 0);
+        assert_eq!(block_idx(BLOCK_SIZE as u64 - 1), 0);
+        assert_eq!(block_idx(BLOCK_SIZE as u64), 1);
+        assert_eq!(block_idx(BLOCK_SIZE as u64 + 1), 1);
     }
 
     fn create_fs() -> (Filesystem, Memory) {
@@ -674,11 +1053,12 @@ mod tests {
         (Filesystem::allocate(tx), mem)
     }
 
+    #[cfg(not(miri))]
     mod proptests {
-        use std::fs;
-
         use super::*;
+        use pmem::page::PagePool;
         use proptest::{collection::vec, prelude::*, prop_oneof, proptest, strategy::Strategy};
+        use std::fs;
         use tempfile::TempDir;
 
         #[derive(Debug)]
@@ -695,32 +1075,38 @@ mod tests {
 
             #[test]
             fn can_write_file(ops in vec(any_write_operation(), 0..10)) {
-                let (mut fs, _) = create_fs();
+                let mem = Memory::new(PagePool::new(1024 * 1024));
+                let mut fs = Filesystem::allocate(mem.start());
+
                 let tmp_dir = TempDir::new().unwrap();
                 let root = fs.get_root().unwrap();
                 let file = fs.create_file(&root, "file.txt").unwrap();
                 let shadow_file_path = tmp_dir.path().join("file.txt");
 
-                // File pair just mirrors the write and seek operations to a shadow file
-                let mut target = FilePair(
-                    fs.open_file(&file).unwrap(),
-                    fs::File::create_new(shadow_file_path).unwrap(),
-                );
+                let mut file = fs.open_file(&file).unwrap();
+                let mut shadow_file = fs::File::create_new(shadow_file_path).unwrap();
 
                 for op in ops {
                     match op {
                         WriteOperation::Write(data) => {
-                            target.write_all(&data).unwrap();
+                            file.write_all(&data).unwrap();
+                            shadow_file.write_all(&data).unwrap();
                         }
                         WriteOperation::Seek(seek) => {
-                            target.seek(seek).unwrap();
+                            let seek = adjust_seek(seek, &mut shadow_file)?;
+                            let pos_a = file.seek(seek).unwrap();
+                            let pos_b = shadow_file.seek(seek).unwrap();
+                            prop_assert_eq!(pos_a, pos_b, "Seek positions differs");
                         }
                     }
                 }
-                target.flush().unwrap();
-                target.seek(SeekFrom::Start(0)).unwrap();
+                file.flush().unwrap();
+                shadow_file.flush().unwrap();
 
-                let (mut file, mut shadow_file) = target.into();
+                let pos_a = file.seek(SeekFrom::Start(0)).unwrap();
+                let pos_b = shadow_file.seek(SeekFrom::Start(0)).unwrap();
+                prop_assert_eq!(pos_a, 0, "Seek is not at the beginning");
+                prop_assert_eq!(pos_b, 0, "Seek is not at the beginning");
 
                 let mut file_buf = vec![];
                 file.read_to_end(&mut file_buf).unwrap();
@@ -728,65 +1114,68 @@ mod tests {
                 let mut shadow_file_buf = vec![];
                 shadow_file.read_to_end(&mut shadow_file_buf).unwrap();
 
-                assert_eq!(file_buf, shadow_file_buf);
+                prop_assert_eq!(file_buf, shadow_file_buf);
             }
         }
 
         fn any_write_operation() -> impl Strategy<Value = WriteOperation> {
-            prop_oneof![any_write(), any_seek(),]
+            prop_oneof![any_write(), any_seek()]
         }
 
         fn any_write() -> impl Strategy<Value = WriteOperation> {
-            vec(any::<u8>(), 0..100).prop_map(WriteOperation::Write)
+            vec(any::<u8>(), 0..10).prop_map(WriteOperation::Write)
         }
 
         fn any_seek() -> impl Strategy<Value = WriteOperation> {
-            let from_end = (0i64..100).prop_map(|x| SeekFrom::End(x));
-            let from_start = (0u64..100).prop_map(|x| SeekFrom::Start(x));
-            let from_current = (0i64..100).prop_map(|x| SeekFrom::Current(x));
+            const MAX_SEEK: usize = BLOCK_SIZE * INDIRECT_BLOCKS;
+            let seek_range = -10i64 * BLOCK_SIZE as i64..10 * BLOCK_SIZE as i64;
+
+            let from_end = seek_range.clone().prop_map(SeekFrom::End);
+            let from_start = (0u64..MAX_SEEK as u64).prop_map(SeekFrom::Start);
+            let from_current = seek_range.prop_map(SeekFrom::Current);
+
             prop_oneof![from_end, from_start, from_current].prop_map(WriteOperation::Seek)
         }
     }
 
-    // A simple wrapper around two files that mirrors write and seek operations
-    struct FilePair<A, B>(A, B);
-
-    impl<A, B> Into<(A, B)> for FilePair<A, B> {
-        fn into(self) -> (A, B) {
-            (self.0, self.1)
-        }
+    // This function adjusts the seek operation to be valid for a given file
+    //
+    // Compensate for the fact that it's invalid to seek before the start of a file
+    fn adjust_seek(seek: SeekFrom, file: &mut fs::File) -> io::Result<SeekFrom> {
+        let seek = match seek {
+            SeekFrom::Current(offset) => {
+                let pos = file.stream_position()?;
+                // If we're at position `pos` offsets `-pos` and before are incorrect
+                let offset = offset.max(-(pos as i64));
+                SeekFrom::Current(offset)
+            }
+            SeekFrom::End(offset) => {
+                let file_len = stream_len(file)?;
+                // offsets `-file_len` and before are incorrect
+                let offset = offset.max(-(file_len as i64));
+                SeekFrom::End(offset)
+            }
+            // it is correct to seek after the end of the file, so we don't need to do anything
+            seek @ SeekFrom::Start(..) => seek,
+        };
+        Ok(seek)
     }
 
-    impl<A: Write + Seek, B: Write + Seek> Write for FilePair<A, B> {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            let size_a = self.0.write(buf)?;
-            let size_b = self.1.write(buf)?;
-            if size_a == size_b {
-                Ok(size_a)
-            } else {
-                Err(io::Error::new(io::ErrorKind::Other, "Write sizes differ"))
-            }
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            self.0.flush()?;
-            self.1.flush()?;
-            Ok(())
-        }
+    fn stream_len<T: Seek>(file: &mut T) -> io::Result<u64> {
+        let current_pos = file.stream_position()?;
+        let end_pos = file.seek(SeekFrom::End(0))?;
+        file.seek(SeekFrom::Start(current_pos))?;
+        Ok(end_pos)
     }
 
-    impl<A: Seek, B: Seek> Seek for FilePair<A, B> {
-        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-            let pos_a = self.0.seek(pos)?;
-            let pos_b = self.1.seek(pos)?;
-            if pos_a == pos_b {
-                Ok(pos_a)
-            } else {
-                Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "Seek positions differ",
-                ))
-            }
-        }
+    #[allow(unused)]
+    fn init_tracing() {
+        let fmt_layer = tracing_subscriber::fmt::layer().with_writer(io::stderr);
+        let filter_layer = EnvFilter::from_default_env();
+
+        tracing_subscriber::registry()
+            .with(fmt_layer)
+            .with(filter_layer)
+            .init();
     }
 }

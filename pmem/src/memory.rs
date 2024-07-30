@@ -10,6 +10,8 @@ use std::{
     mem,
     ops::{Deref, DerefMut},
 };
+/// The size of any pointer in bytes
+pub const PTR_SIZE: usize = 4;
 const START_ADDR: PageOffset = 4;
 
 /// The size of a header of each entity written to storage
@@ -216,7 +218,7 @@ impl Transaction {
             Ptr::from_addr(self.alloc(size)?).expect("Alloc failed")
         };
 
-        value.write(&mut buffer).unwrap();
+        value.write(&mut buffer)?;
         self.do_write_bytes(ptr.addr, buffer);
         Ok((ptr, size))
     }
@@ -496,8 +498,6 @@ mod tests {
     use super::*;
     use pmem_derive::Record;
     use std::mem;
-
-    const PTR_SIZE: usize = 4;
 
     // Helper container used for testing read/writes
     #[derive(Record, PartialEq, Debug)]
