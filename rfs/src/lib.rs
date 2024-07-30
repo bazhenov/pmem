@@ -231,12 +231,14 @@ impl Filesystem {
     fn get_root_handle(&self) -> Handle<FNode> {
         self.tx.lookup(self.volume.root).unwrap()
     }
+
     fn lookup_inode(&self, meta: &FileMeta) -> Result<Handle<FNode>> {
         assert!(meta.fid <= u32::MAX as u64);
 
         let ptr = Ptr::from_addr(meta.fid as u32).ok_or(Error::NotFound)?;
         self.tx.lookup(ptr).map_err(|e| e.into())
     }
+
     fn do_lookup_file(&self, path: impl AsRef<str>) -> Result<Handle<FNode>> {
         let path = PathBuf::from(path.as_ref());
         let components = components(&path)?;
@@ -399,7 +401,6 @@ impl<'a> File<'a> {
         let block_no = block_idx(self.pos) as usize;
         let tx = &mut self.fs.tx;
 
-        dbg!(block_no);
         match block_no {
             0..=LAST_DIRECT_BLOCK => {
                 trace!("Current block: Direct({})", block_no);

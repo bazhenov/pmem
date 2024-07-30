@@ -363,7 +363,7 @@ impl PagePool {
         let snapshot = CommittedSnapshot {
             patches: vec![],
             base: None,
-            pages: pages as u32,
+            pages: u32::try_from(pages).unwrap(),
             lsn: 1,
         };
         Self {
