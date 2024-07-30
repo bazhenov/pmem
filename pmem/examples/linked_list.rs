@@ -100,10 +100,7 @@ impl<'a> Iterator for ListIterator<'a> {
     type Item = i32;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let Some(ptr) = self.ptr else {
-            return None;
-        };
-        let node = self.tx.lookup(ptr).unwrap();
+        let node = self.tx.lookup(self.ptr?).unwrap();
         self.ptr = node.next;
         Some(node.value)
     }

@@ -1,6 +1,6 @@
 use pmem::Record;
 use pmem_derive::Record;
-use std::{fmt::Debug, usize};
+use std::fmt::Debug;
 
 #[test]
 fn size_of_tuples() {

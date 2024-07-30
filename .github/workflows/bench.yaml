@@ -1,0 +1,36 @@
+name: Benchmarks
+
+on: workflow_dispatch
+
+jobs:
+  bench:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/checkout@v3
+        with:
+          ref: main
+          path: baseline-branch
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-export
+
+      - name: Building Benchmarks
+        run: |
+          cargo export target/benchmarks -- bench --bench=page
+          cd baseline-branch
+          cargo export target/benchmarks -- bench --bench=page
+
+      - name: Run Benchmarks
+        run: |
+          set -eo pipefail
+
+          target/benchmarks/page --color=never compare baseline-branch/target/benchmarks/page \
+            -v -t 1 --fail-threshold 10 | tee target/benchmark.txt
+
+      - uses: actions/upload-artifact@v3
+        with:
+          name: benchmark.txt
+          path: target/benchmark.txt
