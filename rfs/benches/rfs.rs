@@ -30,7 +30,7 @@ fn bench_4k_write(b: Bencher) -> Box<dyn Sampler> {
     b.iter(move || {
         let mut fs_borrow = fs.borrow_mut();
         let mut file = fs_borrow.open_file(&file).unwrap();
-        file.write(&BLOCK).unwrap();
+        file.write_all(&BLOCK).unwrap();
         file.flush().unwrap();
     })
 }
@@ -43,8 +43,10 @@ fn bench_random_4k_write(b: Bencher) -> Box<dyn Sampler> {
     {
         let mut fs_borrow = fs.borrow_mut();
         let mut file = fs_borrow.open_file(&meta).unwrap();
+
         file.seek(SeekFrom::Start(file_size - 1)).unwrap();
-        file.write(&[0]).unwrap();
+        file.write_all(&[0]).unwrap();
+
         file.flush().unwrap();
     }
 
@@ -53,10 +55,10 @@ fn bench_random_4k_write(b: Bencher) -> Box<dyn Sampler> {
         let pos = rand.gen_range(0u64..file_size - (BLOCK.len() as u64));
         let mut fs_borrow = fs.borrow_mut();
         let mut file = fs_borrow.open_file(&meta).unwrap();
-        // for _ in 0..1024 {
+
         file.seek(SeekFrom::Start(pos)).unwrap();
-        file.write(&BLOCK).unwrap();
-        // }
+        file.write_all(&BLOCK).unwrap();
+
         file.flush().unwrap();
     })
 }
