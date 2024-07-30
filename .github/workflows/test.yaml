@@ -1,0 +1,45 @@
+name: Test
+
+on: push
+
+jobs:
+  lint:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: "clippy, rustfmt"
+      - uses: olix0r/cargo-action-fmt/setup@v2
+      - uses: Swatinem/rust-cache@v2
+      - name: Running clippy
+        run: cargo clippy --all-targets --all-features --message-format=json | cargo-action-fmt
+      - name: Checking formatting
+        run: cargo fmt -- --check --color always
+      - name: Typo
+        uses: crate-ci/typos@master
+  test:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-22.04
+          - os: macos-12
+          - os: windows-2019
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run Tests
+        run: cargo test
+  miri:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: "miri"
+      - uses: Swatinem/rust-cache@v2
+      - name: miri
+        run: cargo +nightly miri test
