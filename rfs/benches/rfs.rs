@@ -3,17 +3,15 @@ use pmem::{
     Memory, Storable,
 };
 use rand::{rngs::SmallRng, Rng, SeedableRng};
-use rfs::Filesystem;
-use std::{
-    cell::RefCell,
-    io::{Seek, SeekFrom, Write},
-};
+use rfs::{FileMeta, Filesystem};
+use std::io::{Seek, SeekFrom, Write};
 use tango_bench::{
     benchmark_fn, tango_benchmarks, tango_main, Bencher, IntoBenchmarks, MeasurementSettings,
     Sampler,
 };
 
-const BLOCK: [u8; 4096] = [0; 4096];
+const BLOCK: [u8; 4096] = [0xAA; 4096];
+const FILE_SIZE: u64 = 4 * 1024 * 1024;
 
 fn page_benchmarks() -> impl IntoBenchmarks {
     [
@@ -23,44 +21,46 @@ fn page_benchmarks() -> impl IntoBenchmarks {
 }
 
 fn bench_4k_write(b: Bencher) -> Box<dyn Sampler> {
-    let fs = RefCell::new(create_fs());
-    let root = fs.borrow().get_root().unwrap();
-    let file = fs.borrow_mut().create_file(&root, "file").unwrap();
-
+    let mut fs = create_fs();
+    let root = fs.get_root().unwrap();
+    let file = fs.create_file(&root, "file").unwrap();
     b.iter(move || {
-        let mut fs_borrow = fs.borrow_mut();
-        let mut file = fs_borrow.open_file(&file).unwrap();
+        let mut file = fs.open_file(&file).unwrap();
         file.write_all(&BLOCK).unwrap();
         file.flush().unwrap();
     })
 }
 
 fn bench_random_4k_write(b: Bencher) -> Box<dyn Sampler> {
-    let fs = RefCell::new(create_fs());
-    let root = fs.borrow().get_root().unwrap();
-    let meta = fs.borrow_mut().create_file(&root, "file").unwrap();
-    let file_size = 4 * 1024 * 1024; // 4MiB
-    {
-        let mut fs_borrow = fs.borrow_mut();
-        let mut file = fs_borrow.open_file(&meta).unwrap();
-
-        file.seek(SeekFrom::Start(file_size - 1)).unwrap();
-        file.write_all(&[0]).unwrap();
-
-        file.flush().unwrap();
-    }
-
+    let mut fs = create_fs();
     let mut rand = SmallRng::seed_from_u64(b.seed);
+    let meta = create_test_file(&mut fs, FILE_SIZE);
+
     b.iter(move || {
-        let pos = rand.gen_range(0u64..file_size - (BLOCK.len() as u64));
-        let mut fs_borrow = fs.borrow_mut();
-        let mut file = fs_borrow.open_file(&meta).unwrap();
+        let pos = rand.gen_range(0u64..FILE_SIZE - (BLOCK.len() as u64));
+        let mut file = fs.open_file(&meta).unwrap();
 
         file.seek(SeekFrom::Start(pos)).unwrap();
         file.write_all(&BLOCK).unwrap();
 
         file.flush().unwrap();
     })
+}
+
+fn create_test_file(fs: &mut Filesystem, file_size: u64) -> FileMeta {
+    let root = fs.get_root().unwrap();
+    let meta = fs.create_file(&root, "file").unwrap();
+
+    let mut file = fs.open_file(&meta).unwrap();
+
+    file.seek(SeekFrom::Start(file_size - 1)).unwrap();
+    for _ in 0..file_size / BLOCK.len() as u64 {
+        file.write_all(&BLOCK).unwrap();
+    }
+
+    file.flush().unwrap();
+
+    meta
 }
 
 fn create_fs() -> Filesystem {
