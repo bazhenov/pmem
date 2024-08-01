@@ -1,5 +1,5 @@
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
-use pmem::{page::PagePool, Memory, Storable};
+use pmem::{page::PagePool, Memory};
 use rfs::{nfs::RFS, Filesystem};
 use std::io;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -18,7 +18,7 @@ async fn main() {
 
     let pool = PagePool::new(1024);
     let mem = Memory::new(pool);
-    let fs = Filesystem::allocate(mem.start());
+    let fs = Filesystem::allocate(mem);
     let listener = NFSTcpListener::bind(&format!("127.0.0.1:{HOSTPORT}"), RFS::new(fs))
         .await
         .unwrap();

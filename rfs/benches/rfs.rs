@@ -1,6 +1,6 @@
 use pmem::{
     page::{PagePool, PAGE_SIZE},
-    Memory, Storable,
+    Memory,
 };
 use rand::{rngs::SmallRng, seq::SliceRandom, Rng, SeedableRng};
 use rfs::{FileMeta, Filesystem};
@@ -142,7 +142,7 @@ fn create_deep_tree(fs: &mut Filesystem, parent: &FileMeta, level: u64, names: &
 
 fn create_fs() -> Filesystem {
     let mem = Memory::new(PagePool::new(2usize.pow(32) / PAGE_SIZE)); // 4GiB
-    Filesystem::allocate(mem.start())
+    Filesystem::allocate(mem)
 }
 
 tango_benchmarks!(page_benchmarks());
