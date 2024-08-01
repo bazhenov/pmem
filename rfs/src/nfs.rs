@@ -5,7 +5,7 @@
 //! $ mkdir mnt
 //! $ mount -t nfs -o nolocks,vers=3,tcp,port=11111,mountport=11111,soft 127.0.0.1:/ mnt/
 //! ```
-use crate::{Error, FileMeta, Filesystem, NodeType};
+use crate::{FileMeta, Filesystem, NodeType};
 use async_trait::async_trait;
 use nfsserve::{
     nfs::{
@@ -49,15 +49,15 @@ impl NFSFileSystem for RFS {
     async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
         let mut fs = self.fs.lock().await;
 
-        let meta = fs.lookup_by_id(id).map_err(pmem_to_nfs_error)?;
-        let mut file = fs.open_file(&meta).map_err(pmem_to_nfs_error)?;
+        let meta = fs.lookup_by_id(id).map_err(io_to_nfs_error)?;
+        let mut file = fs.open_file(&meta).map_err(io_to_nfs_error)?;
         if offset > 0 {
             file.seek(SeekFrom::Start(offset))
                 .map_err(io_to_nfs_error)?;
         }
         file.write_all(data).map_err(io_to_nfs_error)?;
         file.flush().map_err(io_to_nfs_error)?;
-        let new_meta = fs.lookup_by_id(id).map_err(pmem_to_nfs_error)?;
+        let new_meta = fs.lookup_by_id(id).map_err(io_to_nfs_error)?;
         Ok(create_fattr(&new_meta))
     }
 
@@ -69,10 +69,10 @@ impl NFSFileSystem for RFS {
         _attr: sattr3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
         let mut fs = self.fs.lock().await;
-        let dir = fs.lookup_by_id(dirid).map_err(pmem_to_nfs_error)?;
+        let dir = fs.lookup_by_id(dirid).map_err(io_to_nfs_error)?;
         let new_file = fs
             .create_file(&dir, to_string(filename))
-            .map_err(pmem_to_nfs_error)?;
+            .map_err(io_to_nfs_error)?;
         Ok((new_file.fid, create_fattr(&new_file)))
     }
 
@@ -83,10 +83,10 @@ impl NFSFileSystem for RFS {
         filename: &filename3,
     ) -> Result<fileid3, nfsstat3> {
         let mut fs = self.fs.lock().await;
-        let dir = fs.lookup_by_id(dirid).map_err(pmem_to_nfs_error)?;
+        let dir = fs.lookup_by_id(dirid).map_err(io_to_nfs_error)?;
         let new_file = fs
             .create_file(&dir, to_string(filename))
-            .map_err(pmem_to_nfs_error)?;
+            .map_err(io_to_nfs_error)?;
         Ok(new_file.fid)
     }
 
@@ -94,15 +94,15 @@ impl NFSFileSystem for RFS {
     async fn lookup(&self, dirid: fileid3, filename: &filename3) -> Result<fileid3, nfsstat3> {
         let fs = self.fs.lock().await;
         let filename = to_string(filename);
-        let dir = fs.lookup_by_id(dirid).map_err(pmem_to_nfs_error)?;
-        let result = fs.lookup(&dir, filename).map_err(pmem_to_nfs_error)?;
+        let dir = fs.lookup_by_id(dirid).map_err(io_to_nfs_error)?;
+        let result = fs.lookup(&dir, filename).map_err(io_to_nfs_error)?;
         Ok(result.fid)
     }
 
     #[instrument(level = "trace", skip(self))]
     async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3> {
         let fs = self.fs.lock().await;
-        let entry = fs.lookup_by_id(id).map_err(pmem_to_nfs_error)?;
+        let entry = fs.lookup_by_id(id).map_err(io_to_nfs_error)?;
         Ok(create_fattr(&entry))
     }
 
@@ -110,7 +110,7 @@ impl NFSFileSystem for RFS {
     async fn setattr(&self, id: fileid3, _setattr: sattr3) -> Result<fattr3, nfsstat3> {
         let fs = self.fs.lock().await;
 
-        let file = fs.lookup_by_id(id).map_err(pmem_to_nfs_error)?;
+        let file = fs.lookup_by_id(id).map_err(io_to_nfs_error)?;
 
         Ok(create_fattr(&file))
     }
@@ -124,11 +124,11 @@ impl NFSFileSystem for RFS {
     ) -> Result<(Vec<u8>, bool), nfsstat3> {
         let mut fs = self.fs.lock().await;
 
-        let entry = fs.lookup_by_id(id).map_err(pmem_to_nfs_error)?;
+        let entry = fs.lookup_by_id(id).map_err(io_to_nfs_error)?;
         if entry.node_type != NodeType::File {
             return Err(nfsstat3::NFS3ERR_ISDIR);
         }
-        let mut file = fs.open_file(&entry).map_err(pmem_to_nfs_error)?;
+        let mut file = fs.open_file(&entry).map_err(io_to_nfs_error)?;
         if offset > 0 {
             file.seek(SeekFrom::Start(offset))
                 .map_err(io_to_nfs_error)?;
@@ -147,9 +147,9 @@ impl NFSFileSystem for RFS {
     ) -> Result<ReadDirResult, nfsstat3> {
         let fs = self.fs.lock().await;
 
-        let dir = fs.lookup_by_id(dirid).map_err(pmem_to_nfs_error)?;
+        let dir = fs.lookup_by_id(dirid).map_err(io_to_nfs_error)?;
 
-        let mut children = fs.readdir(&dir).map_err(pmem_to_nfs_error)?;
+        let mut children = fs.readdir(&dir).map_err(io_to_nfs_error)?;
         let start_idx = start_after as usize;
         if start_idx >= children.len() {
             return Ok(ReadDirResult {
@@ -170,9 +170,9 @@ impl NFSFileSystem for RFS {
     #[allow(unused)]
     async fn remove(&self, dirid: fileid3, filename: &filename3) -> Result<(), nfsstat3> {
         let mut fs = self.fs.lock().await;
-        let dir_meta = fs.lookup_by_id(dirid).map_err(pmem_to_nfs_error)?;
+        let dir_meta = fs.lookup_by_id(dirid).map_err(io_to_nfs_error)?;
         fs.delete(&dir_meta, to_string(filename))
-            .map_err(pmem_to_nfs_error)
+            .map_err(io_to_nfs_error)
     }
 
     #[instrument(level = "trace", skip(self), err(Debug, level = "warn"))]
@@ -196,11 +196,11 @@ impl NFSFileSystem for RFS {
     ) -> Result<(fileid3, fattr3), nfsstat3> {
         let mut fs = self.fs.lock().await;
 
-        let parent = fs.lookup_by_id(dirid).map_err(pmem_to_nfs_error)?;
+        let parent = fs.lookup_by_id(dirid).map_err(io_to_nfs_error)?;
         let name = String::from_utf8(dirname.0.clone())
             .ok()
             .ok_or(nfsstat3::NFS3ERR_INVAL)?;
-        let dir = fs.create_dir(&parent, name).map_err(pmem_to_nfs_error)?;
+        let dir = fs.create_dir(&parent, name).map_err(io_to_nfs_error)?;
         Ok((dir.fid, create_fattr(&dir)))
     }
 
@@ -218,23 +218,6 @@ impl NFSFileSystem for RFS {
     #[instrument(level = "trace", skip(self), err(Debug, level = "warn"))]
     async fn readlink(&self, _id: fileid3) -> Result<nfspath3, nfsstat3> {
         return Err(nfsstat3::NFS3ERR_NOTSUPP);
-    }
-}
-
-fn pmem_to_nfs_error(e: Error) -> nfsstat3 {
-    match e {
-        Error::NotFound => nfsstat3::NFS3ERR_NOENT,
-        Error::NotSupported => nfsstat3::NFS3ERR_NOTSUPP,
-        Error::PathMustBeAbsolute => nfsstat3::NFS3ERR_INVAL,
-        Error::AlreadyExists => nfsstat3::NFS3ERR_EXIST,
-        Error::PMemError(e) => match e {
-            pmem::memory::Error::DataIntegrity(_) => nfsstat3::NFS3ERR_SERVERFAULT,
-            pmem::memory::Error::NoSpaceLeft => nfsstat3::NFS3ERR_NOSPC,
-            pmem::memory::Error::NullPointer => nfsstat3::NFS3ERR_SERVERFAULT,
-            pmem::memory::Error::UnexpectedVariantCode(_) => nfsstat3::NFS3ERR_SERVERFAULT,
-        },
-        Error::IOError(e) => io_to_nfs_error(e),
-        Error::Utf8(_) => nfsstat3::NFS3ERR_INVAL,
     }
 }
 

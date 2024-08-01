@@ -6,41 +6,16 @@ use pmem_derive::Record;
 use std::{
     convert::Into,
     fmt,
-    io::{self, Read, Seek, SeekFrom, Write},
+    io::{self, Error, ErrorKind, Read, Seek, SeekFrom, Write},
     ops::{Deref, DerefMut},
     path::{self, Component, Path, PathBuf},
-    str::Utf8Error,
 };
 use tracing::{instrument, trace};
 
-type Result<T> = std::result::Result<T, Error>;
+type Result<T> = std::io::Result<T>;
 type CreateResult = std::result::Result<Handle<FNode>, Handle<FNode>>;
 
 pub mod nfs;
-
-#[derive(thiserror::Error, Debug)]
-pub enum Error {
-    #[error("not found")]
-    NotFound,
-
-    #[error("not supported")]
-    NotSupported,
-
-    #[error("path must be absolute")]
-    PathMustBeAbsolute,
-
-    #[error("already exists")]
-    AlreadyExists,
-
-    #[error("pmem error")]
-    PMemError(#[from] pmem::memory::Error),
-
-    #[error("IO Error")]
-    IOError(#[from] std::io::Error),
-
-    #[error("Invalid utf8 encoding")]
-    Utf8(#[from] Utf8Error),
-}
 
 pub struct Filesystem {
     volume: Handle<VolumeInfo>,
@@ -88,16 +63,19 @@ impl Filesystem {
 
     /// Finds the file/directory at the given path
     ///
-    /// Return [Error::NotFound] if the file/directory does not exist
+    /// Return [ErrorKind::NotFound] if the file/directory does not exist
     pub fn find(&self, path: impl AsRef<str>) -> Result<FileMeta> {
         FileMeta::from(self.do_lookup_file(path)?, &self.tx)
     }
 
     /// Finds the given child in the given directory
     ///
-    /// Return [Error::NotFound] if the child does not exist
+    /// Return [ErrorKind::NotFound] if the child does not exist
     pub fn lookup(&self, dir: &FileMeta, name: impl AsRef<str>) -> Result<FileMeta> {
-        let children = self.lookup_inode(dir)?.children.ok_or(Error::NotFound)?;
+        let children = self
+            .lookup_inode(dir)?
+            .children
+            .ok_or(ErrorKind::NotFound)?;
         let child = self.find_child(children, name.as_ref())?;
         FileMeta::from(child.node, &self.tx)
     }
@@ -105,7 +83,7 @@ impl Filesystem {
     /// Returns the file/directory with a given inode ([FileMeta::fid])
     pub fn lookup_by_id(&self, id: u64) -> Result<FileMeta> {
         assert!(id <= u32::MAX as u64);
-        let ptr = Ptr::<FNode>::from_addr(id as u32).ok_or(Error::NotFound)?;
+        let ptr = Ptr::<FNode>::from_addr(id as u32).ok_or(ErrorKind::NotFound)?;
         let handle = self.tx.lookup(ptr)?;
         FileMeta::from(handle, &self.tx)
     }
@@ -113,9 +91,7 @@ impl Filesystem {
     pub fn delete(&mut self, dir: &FileMeta, name: impl AsRef<str>) -> Result<()> {
         let mut dir = self.lookup_inode(dir)?;
 
-        let Some(children) = dir.children else {
-            return Err(Error::NotFound);
-        };
+        let children = dir.children.ok_or(ErrorKind::NotFound)?;
         let file = self.find_child(children, name.as_ref())?;
 
         let next_ptr = file.node.next;
@@ -139,7 +115,7 @@ impl Filesystem {
         let file_info = if let Some(children) = dir.children {
             self.create_child(children, file_name, NodeType::File)?
                 .ok()
-                .ok_or(Error::AlreadyExists)?
+                .ok_or(ErrorKind::AlreadyExists)?
         } else {
             let new_node = self.write_fsnode(file_name, NodeType::File)?;
             dir.children = Some(new_node.ptr());
@@ -165,14 +141,14 @@ impl Filesystem {
     ///
     /// Returns:
     /// - [Error::AlreadyExists] if the directory already exists;
-    /// - [Error::NotFound] if the parent directory does not exist;
+    /// - [ErrorKind::NotFound] if the parent directory does not exist;
     pub fn create_dir(&mut self, parent: &FileMeta, name: impl AsRef<str>) -> Result<FileMeta> {
         let mut parent = self.lookup_inode(parent)?;
 
         let directory_inode = if let Some(first_child) = parent.children {
             self.create_child(first_child, name.as_ref(), NodeType::Directory)?
                 .ok()
-                .ok_or(Error::AlreadyExists)?
+                .ok_or(ErrorKind::AlreadyExists)?
         } else {
             let dir_inode = self.write_fsnode(name.as_ref(), NodeType::Directory)?;
             parent.children = Some(dir_inode.ptr());
@@ -186,7 +162,7 @@ impl Filesystem {
     /// Reads the contents of a directory
     ///
     /// Returns:
-    /// - [Error::NotFound] if the directory does not exist
+    /// - [ErrorKind::NotFound] if the directory does not exist
     pub fn readdir(&self, dir: &FileMeta) -> Result<Vec<FileMeta>> {
         let parent = self.lookup_inode(dir)?;
 
@@ -211,7 +187,7 @@ impl Filesystem {
         let mut node = self.get_root_handle();
         for component in components(&path)? {
             let Component::Normal(name) = component else {
-                return Err(Error::NotSupported);
+                return Err(ErrorKind::InvalidInput.into());
             };
 
             node = if node.children.is_none() {
@@ -235,7 +211,7 @@ impl Filesystem {
     fn lookup_inode(&self, meta: &FileMeta) -> Result<Handle<FNode>> {
         assert!(meta.fid <= u32::MAX as u64);
 
-        let ptr = Ptr::from_addr(meta.fid as u32).ok_or(Error::NotFound)?;
+        let ptr = Ptr::from_addr(meta.fid as u32).ok_or(ErrorKind::NotFound)?;
         self.tx.lookup(ptr).map_err(|e| e.into())
     }
 
@@ -245,11 +221,11 @@ impl Filesystem {
         let mut cur_node = self.get_root_handle();
         for component in components {
             let Component::Normal(name) = component else {
-                return Err(Error::NotSupported);
+                return Err(ErrorKind::InvalidInput.into());
             };
             let name = name.to_str().unwrap();
 
-            let children = cur_node.children.ok_or(Error::NotFound)?;
+            let children = cur_node.children.ok_or(ErrorKind::NotFound)?;
             let child = self.find_child(children, name)?;
             cur_node = child.node;
         }
@@ -268,7 +244,7 @@ impl Filesystem {
             cur_node = node.next;
             referent = Some(node);
         }
-        Err(Error::NotFound)
+        Err(ErrorKind::NotFound.into())
     }
 
     /// Returns `Ok(child)` if it was found otherwise create new [FileInfo] and returns `Err(new_child)`
@@ -315,7 +291,7 @@ impl Filesystem {
 fn components(path: &Path) -> Result<path::Components> {
     let mut components = path.components();
     let Some(Component::RootDir) = components.next() else {
-        return Err(Error::PathMustBeAbsolute);
+        return Err(ErrorKind::InvalidInput.into());
     };
     Ok(components)
 }
@@ -554,21 +530,6 @@ fn block_idx(n: u64) -> u64 {
     n / BLOCK_SIZE as u64
 }
 
-impl From<Error> for io::Error {
-    fn from(e: Error) -> Self {
-        let kind = match e {
-            Error::NotFound => io::ErrorKind::NotFound,
-            Error::NotSupported => io::ErrorKind::Unsupported,
-            Error::PathMustBeAbsolute => io::ErrorKind::Other,
-            Error::AlreadyExists => io::ErrorKind::AlreadyExists,
-            Error::PMemError(_) => io::ErrorKind::Other,
-            Error::Utf8(_) => io::ErrorKind::InvalidInput,
-            Error::IOError(e) => return e,
-        };
-        io::Error::new(kind, e)
-    }
-}
-
 /// Helper structure that is used when iterating over linked list of [FileInfo] instances
 ///
 /// Contains the node itself as well as the previous node. It is useful when we need to remove the node
@@ -713,7 +674,9 @@ struct BlockPointers {
 impl FNode {
     fn name(&self, tx: &Transaction) -> Result<String> {
         let bytes = tx.read_bytes(self.name.0)?;
-        Ok(String::from_utf8(bytes.to_vec()).map_err(|e| e.utf8_error())?)
+        String::from_utf8(bytes.to_vec())
+            .map_err(|e| e.utf8_error())
+            .map_err(Error::other)
     }
 }
 
@@ -741,7 +704,7 @@ mod tests {
 
     macro_rules! assert_missing {
         ($fs:expr, $name:expr) => {
-            let Some(Error::NotFound) = $fs.find($name).err() else {
+            let Some(ErrorKind::NotFound) = $fs.find($name).map_err(|e| e.kind()).err() else {
                 panic!("{} should be missing", $name);
             };
         };
@@ -762,7 +725,7 @@ mod tests {
         let (fs, _) = create_fs();
 
         let node = fs.find("/foo");
-        let Some(Error::NotFound) = node.err() else {
+        let Some(ErrorKind::NotFound) = node.map_err(|e| e.kind()).err() else {
             panic!("Node should be missing");
         };
         Ok(())
@@ -1013,7 +976,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "PMemError(NoSpaceLeft)")]
+    #[should_panic(expected = "NoSpaceLeft")]
     fn no_space_left() {
         // Maximum file size is 17984 bytes in test environment. So in order to trigger NoSpaceLeft
         // we need to write 64Kib (1 page in PagePool) / 17984 = 4 files.
