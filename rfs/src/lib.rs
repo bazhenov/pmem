@@ -267,7 +267,7 @@ impl Filesystem {
 
         while let Some(node) = cur_node {
             let node = tx.lookup(node)?;
-            let child_name = node.name(&tx)?;
+            let child_name = node.name(tx)?;
             if name == child_name.as_str() {
                 return Ok(FileInfoReferent { referent, node });
             }
@@ -289,7 +289,7 @@ impl Filesystem {
         let mut cur_node = Some(start_node);
         while let Some(node) = cur_node {
             let value = tx.lookup(node)?;
-            let child_name = value.name(&tx)?;
+            let child_name = value.name(tx)?;
             if name == child_name.as_str() {
                 return Ok(CreateResult::Err(value));
             }
