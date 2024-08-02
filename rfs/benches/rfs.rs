@@ -84,13 +84,13 @@ fn random_read_4k(b: Bencher) -> Box<dyn Sampler> {
 }
 
 fn create_empty_file(b: Bencher) -> Box<dyn Sampler> {
-    let mut fs = create_fs();
-    let root = fs.get_root().unwrap();
-    let mut file_no = 0;
     b.iter(move || {
-        file_no += 1;
-        let file = format!("file{}", file_no);
-        fs.create_file(&root, &file).unwrap()
+        let mut fs = create_fs();
+        let root = fs.get_root().unwrap();
+        for file_no in 0..100 {
+            let file = format!("file{}", file_no);
+            fs.create_file(&root, &file).unwrap();
+        }
     })
 }
 
