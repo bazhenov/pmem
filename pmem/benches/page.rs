@@ -13,12 +13,13 @@ const DB_SIZE: usize = 1024 * 1024;
 
 fn page_benchmarks() -> impl IntoBenchmarks {
     [
-        benchmark_fn("arbitrary_read", bench_arbitrary_read),
-        benchmark_fn("arbitrary_write", bench_arbitrary_write),
+        benchmark_fn("arbitrary_read", bench_read),
+        benchmark_fn("arbitrary_write", bench_write),
+        benchmark_fn("write_comit", bench_write_commit),
     ]
 }
 
-fn bench_arbitrary_read(b: Bencher) -> Box<dyn Sampler> {
+fn bench_read(b: Bencher) -> Box<dyn Sampler> {
     let mut rng = SmallRng::seed_from_u64(b.seed);
     let mem = generate_mem(&mut rng);
     b.iter(move || {
@@ -28,7 +29,7 @@ fn bench_arbitrary_read(b: Bencher) -> Box<dyn Sampler> {
     })
 }
 
-fn bench_arbitrary_write(b: Bencher) -> Box<dyn Sampler> {
+fn bench_write(b: Bencher) -> Box<dyn Sampler> {
     let mut rng = SmallRng::seed_from_u64(b.seed);
 
     let mut buffer = [0u8; DB_SIZE];
@@ -39,6 +40,22 @@ fn bench_arbitrary_write(b: Bencher) -> Box<dyn Sampler> {
     b.iter(move || {
         let (addr, len) = random_segment(&mut rng, 0..DB_SIZE);
         snapshot.write(addr as Addr, &buffer[..len]);
+    })
+}
+
+fn bench_write_commit(b: Bencher) -> Box<dyn Sampler> {
+    let mut rng = SmallRng::seed_from_u64(b.seed);
+
+    let mut buffer = [0u8; DB_SIZE];
+    rng.fill(&mut buffer[..]);
+
+    let mut mem = PagePool::new(DB_SIZE / PAGE_SIZE + 1);
+
+    b.iter(move || {
+        let (addr, len) = random_segment(&mut rng, 0..DB_SIZE);
+        let mut snapshot = mem.snapshot();
+        snapshot.write(addr as Addr, &buffer[..len]);
+        mem.commit(snapshot);
     })
 }
 

@@ -19,7 +19,7 @@ fn page_benchmarks() -> impl IntoBenchmarks {
         benchmark_fn("streaming_write_4m", streaming_write_4m),
         benchmark_fn("random_read_4k", random_read_4k),
         benchmark_fn("random_write_4k", random_write_4k),
-        benchmark_fn("create_empty_file", create_empty_file),
+        benchmark_fn("create_100_empty_files", create_100_empty_files),
         benchmark_fn("navigate_directories", navigate_directories),
     ]
 }
@@ -83,7 +83,7 @@ fn random_read_4k(b: Bencher) -> Box<dyn Sampler> {
     })
 }
 
-fn create_empty_file(b: Bencher) -> Box<dyn Sampler> {
+fn create_100_empty_files(b: Bencher) -> Box<dyn Sampler> {
     b.iter(move || {
         let mut fs = create_fs();
         let root = fs.get_root().unwrap();
