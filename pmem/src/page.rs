@@ -191,9 +191,13 @@ impl Patch {
         debug_assert!(self.adjacent(&other));
 
         match self.reorder(other) {
-            (Write(addr, mut a), Write(_, b)) => {
-                a.extend(b);
-                Merged(Write(addr, a))
+            (Write(addr_a, mut a), Write(addr_b, b)) => {
+                if a.len() + b.len() < 1024 {
+                    a.extend(b);
+                    Merged(Write(addr_a, a))
+                } else {
+                    Reordered(Write(addr_a, a), Write(addr_b, b))
+                }
             }
             (Reclaim(addr, a), Reclaim(_, b)) => Merged(Reclaim(addr, a + b)),
             (a, b) => Reordered(a, b),
@@ -422,12 +426,25 @@ impl PagePool {
             "Proposed snapshot is not linear"
         );
         let lsn = self.latest.lsn + 1;
-        self.latest = Arc::new(CommittedSnapshot {
-            patches: snapshot.patches,
-            base: Some(Arc::clone(&self.latest)),
-            pages: snapshot.pages,
-            lsn,
-        });
+
+        if self.latest.patches.len() + snapshot.patches.len() < 100 {
+            // merging consecutive snapshots because they are small
+            let mut patch_clone = CommittedSnapshot::default();
+            patch_clone.clone_from(&self.latest);
+            patch_clone.lsn = lsn;
+            let patches = snapshot.patches;
+            for patch in patches {
+                push_patch(&mut patch_clone.patches, patch);
+            }
+            self.latest = Arc::new(patch_clone);
+        } else {
+            self.latest = Arc::new(CommittedSnapshot {
+                patches: snapshot.patches,
+                base: Some(Arc::clone(&self.latest)),
+                pages: snapshot.pages,
+                lsn,
+            });
+        }
     }
 
     #[cfg(test)]
@@ -450,6 +467,7 @@ impl PagePool {
 /// that represents the full history of modifications leading up to the current state.
 /// This chain is traversed backwards when reading from a snapshot to reconstruct the state
 /// of a page by applying patches in reverse chronological order.
+#[derive(Clone)]
 pub struct CommittedSnapshot {
     /// A patches that have been applied in this snapshot.
     patches: Vec<Patch>,
@@ -524,7 +542,7 @@ impl Snapshot {
         split_ptr_checked(addr, bytes.len(), self.pages);
 
         if !bytes.is_empty() {
-            self.push_patch(Patch::Write(addr, bytes))
+            push_patch(&mut self.patches, Patch::Write(addr, bytes))
         }
     }
 
@@ -537,55 +555,8 @@ impl Snapshot {
     /// after snapshot compaction.
     pub fn reclaim(&mut self, addr: Addr, len: usize) {
         if len > 0 {
-            self.push_patch(Patch::Reclaim(addr, len))
+            push_patch(&mut self.patches, Patch::Reclaim(addr, len))
         }
-    }
-
-    /// Pushes a patch to a snapshot ensuring the following invariants hold:
-    ///
-    /// 1. All patches are sorted by [Patch:addr()]
-    /// 2. All patches are non-overlapping
-    fn push_patch(&mut self, patch: Patch) {
-        assert!(patch.len() > 0, "Patch should not be empty");
-        let connected = find_connected_ranges(&self.patches, &patch);
-
-        if connected.is_empty() {
-            // inserting new patch preserving order
-            let insert_idx = self
-                .patches
-                .binary_search_by(|i| i.addr().cmp(&patch.addr()))
-                // because new patch is not connected to anything we must get Err() here
-                .unwrap_err();
-            self.patches.insert(insert_idx, patch);
-        } else {
-            // Splitting all the patches on left and right disconnected parts and a middle part
-            // that contains connected patches that need to be normalized. We keep left part in place,
-            // there is no need to move it anywhere
-            let mut middle = self.patches.split_off(connected.start);
-            let right = middle.split_off(connected.len());
-
-            // Normalizing all connected patches one by one with the new patch.
-            // After normalizing any particular pair we need to keep continue normalizing
-            // "tail" patch with the rest of connected patches
-            let mut tail_patch = patch;
-            for p in middle {
-                tail_patch = match p.normalize(tail_patch) {
-                    NormalizedPatches::Merged(a) => a,
-                    NormalizedPatches::Reordered(a, b) => {
-                        self.patches.push(a);
-                        b
-                    }
-                    NormalizedPatches::Split(a, b, c) => {
-                        self.patches.extend([a, b]);
-                        c
-                    }
-                }
-            }
-            self.patches.push(tail_patch);
-            self.patches.extend(right);
-        }
-
-        debug_assert_sorted_and_has_no_overlaps(&self.patches);
     }
 
     pub fn read(&self, addr: Addr, len: usize) -> Cow<[u8]> {
@@ -612,6 +583,52 @@ impl Snapshot {
     fn resize(&mut self, pages: usize) {
         self.pages = pages as PageNo;
     }
+}
+
+/// Pushes a patch to a snapshot ensuring the following invariants hold:
+///
+/// 1. All patches are sorted by [Patch:addr()]
+/// 2. All patches are non-overlapping
+fn push_patch(patches: &mut Vec<Patch>, patch: Patch) {
+    assert!(patch.len() > 0, "Patch should not be empty");
+    let connected = find_connected_ranges(&patches, &patch);
+
+    if connected.is_empty() {
+        // inserting new patch preserving order
+        let insert_idx = patches
+            .binary_search_by(|i| i.addr().cmp(&patch.addr()))
+            // because new patch is not connected to anything we must get Err() here
+            .unwrap_err();
+        patches.insert(insert_idx, patch);
+    } else {
+        // Splitting all the patches on left and right disconnected parts and a middle part
+        // that contains connected patches that need to be normalized. We keep left part in place,
+        // there is no need to move it anywhere
+        let mut middle = patches.split_off(connected.start);
+        let right = middle.split_off(connected.len());
+
+        // Normalizing all connected patches one by one with the new patch.
+        // After normalizing any particular pair we need to keep continue normalizing
+        // "tail" patch with the rest of connected patches
+        let mut tail_patch = patch;
+        for p in middle {
+            tail_patch = match p.normalize(tail_patch) {
+                NormalizedPatches::Merged(a) => a,
+                NormalizedPatches::Reordered(a, b) => {
+                    patches.push(a);
+                    b
+                }
+                NormalizedPatches::Split(a, b, c) => {
+                    patches.extend([a, b]);
+                    c
+                }
+            }
+        }
+        patches.push(tail_patch);
+        patches.extend(right);
+    }
+
+    debug_assert_sorted_and_has_no_overlaps(&patches);
 }
 
 /// Applies a list of patches to a given buffer within a specified range.
