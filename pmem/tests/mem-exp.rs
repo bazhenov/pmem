@@ -1,16 +1,14 @@
 use arc_swap::ArcSwap;
-use rand::{rngs::SmallRng, Rng};
+use rand::{rngs::SmallRng, Rng, SeedableRng};
 use std::{
-    collections::HashSet,
-    ops::Range,
+    cell::{Cell, UnsafeCell},
+    mem,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{fence, AtomicU64, Ordering},
         Arc,
     },
     thread,
 };
-use sync_unsafe_cell::SyncUnsafeCell;
-
 const SIZE: usize = 10;
 
 /// Buffer update protocol:
@@ -40,13 +38,17 @@ const SIZE: usize = 10;
 #[derive(Clone)]
 struct Buf {
     lsn: Arc<AtomicU64>,
-    data: Arc<SyncUnsafeCell<[u8; SIZE]>>,
+    data: Arc<Cell<[u8]>>,
     snapshots: Arc<ArcSwap<Delta>>,
 }
 
+unsafe impl Sync for Buf {}
+unsafe impl Send for Buf {}
+
 impl Buf {
-    fn commit_patches(&mut self, patches: Vec<(usize, Vec<u8>)>) {
-        let b: *mut [u8; SIZE] = self.data.get();
+    fn write(&mut self, patches: Vec<(usize, Vec<u8>)>) {
+        let d = self.data.as_ptr() as *const UnsafeCell<[u8]>;
+        let b: &mut [u8] = unsafe { &mut *UnsafeCell::raw_get(d) };
 
         let lsn = self.lsn.load(Ordering::SeqCst);
         let new_lsn = lsn + 1;
@@ -56,7 +58,7 @@ impl Buf {
             let offset = *offset;
             let len = patch.len();
             let mut inverse = vec![0; len];
-            inverse.copy_from_slice(unsafe { &(*b)[offset..offset + len] });
+            inverse.copy_from_slice(&b[offset..offset + len]);
             inverse_patch.push((offset, inverse));
         }
 
@@ -67,10 +69,12 @@ impl Buf {
         });
         self.snapshots.swap(new_snapshot);
 
+        fence(Ordering::Acquire);
         for (offset, patch) in patches {
             let len = patch.len();
-            unsafe { (*b)[offset..offset + len].copy_from_slice(&patch) };
+            b[offset..offset + len].copy_from_slice(&patch);
         }
+        fence(Ordering::Release);
         self.lsn.store(new_lsn, Ordering::SeqCst);
     }
 
@@ -88,13 +92,28 @@ impl Buf {
 
 struct Snapshot {
     lsn: u64,
-    data: Arc<SyncUnsafeCell<[u8; SIZE]>>,
+    data: Arc<Cell<[u8]>>,
     snapshots: Arc<ArcSwap<Delta>>,
 }
 
 impl Snapshot {
-    fn as_slice(&self) -> &[u8] {
-        unsafe { &*self.data.get() }
+    fn read(&self, buf: &mut [u8], offset: usize) {
+        let src: &[u8] = unsafe { mem::transmute(self.data.as_slice_of_cells()) };
+        buf.copy_from_slice(&src[offset..offset + buf.len()]);
+
+        let mut delta = Some(self.snapshots.load_full());
+        while let Some(d) = delta {
+            if d.lsn < self.lsn {
+                break;
+            }
+
+            for (offset, patch) in &d.patches {
+                let offset = *offset;
+                let len = patch.len();
+                buf[offset..offset + len].copy_from_slice(&patch);
+            }
+            delta = d.next.clone();
+        }
     }
 }
 
@@ -106,14 +125,15 @@ struct Delta {
 
 #[test]
 fn check_mem() {
-    for _ in 0..10000 {
-        do_run();
+    for _ in 0..1000 {
+        run();
     }
 }
 
-fn do_run() {
+fn run() {
+    let mut state = [0u8; SIZE];
     let mut buf = Buf {
-        data: Arc::new([0x0; SIZE].into()),
+        data: Arc::new(Cell::new(state.clone())),
         lsn: Arc::new(AtomicU64::new(0)),
         snapshots: Arc::new(ArcSwap::from_pointee(Delta {
             lsn: 0,
@@ -122,73 +142,77 @@ fn do_run() {
         })),
     };
 
-    let handle = {
-        let buf_handle = buf.clone();
-        thread::spawn(move || {
-            let mut lsn = 0;
-            while lsn < 255 {
-                let mut b = vec![0u8; SIZE];
-                let s = buf_handle.snapshot();
-                lsn = s.lsn;
-                b.copy_from_slice(s.as_slice());
-                let mut delta = Some(s.snapshots.load_full());
-                let last_snapshot_lsn = delta.as_ref().unwrap().lsn;
-                // println!("Latest snapshot: {}", s.lsn);
-
-                let mut snapshots_applied = 0;
-                while let Some(d) = delta {
-                    // println!("Applying LSN: {} (patches: {})", d.lsn, d.patches.len());
-                    if d.lsn < s.lsn {
-                        break;
-                    }
-
-                    for (offset, patch) in &d.patches {
-                        let offset = *offset;
-                        let len = patch.len();
-                        b[offset..offset + len].copy_from_slice(&patch);
-                    }
-                    delta = d.next.clone();
-                    snapshots_applied += 1;
-                }
-
-                let all_ok = b.iter().all(|x| *x == s.lsn as u8);
-                if !all_ok {
-                    panic!(
-                        "LSN :{} (last snapshot: {}, applied: {}), data: {:?}",
-                        s.lsn, last_snapshot_lsn, snapshots_applied, b,
-                    );
-                }
-            }
-        })
-    };
-
-    for i in 1..=255 {
-        buf.commit_patches(vec![(0, vec![i; 10])]);
+    let iterations = 1000;
+    // Spawning threads that reads buffer and checks consistency
+    let mut handles = vec![];
+    for _ in 0..4 {
+        let buf = buf.clone();
+        let handle = thread::spawn(move || {
+            check_read_consistency(buf, iterations);
+        });
+        handles.push(handle);
     }
 
-    handle.join().unwrap();
+    // Updating buffer with random patches but keeping the sum of the buffer to be 0
+    let mut rnd = SmallRng::from_entropy();
+    for _ in 0..iterations {
+        let mut patches = random_patches(&mut rnd, SIZE, 4);
+        for (offset, patch) in &patches {
+            let len = patch.len();
+            state[*offset..*offset + len].copy_from_slice(&patch);
+        }
+        let sum = slice_wrapping_sum(&state);
+
+        // The value that will make the sum of the buffer to be exactly 0
+        let compensator = 255 - sum.wrapping_sub(state[0]).wrapping_sub(1);
+        state[0] = compensator;
+        patches.push((0, vec![compensator]));
+
+        debug_assert_eq!(slice_wrapping_sum(&state), 0);
+        buf.write(patches);
+    }
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
 }
 
-fn random_segments(rng: &mut SmallRng, size: usize) -> Vec<Range<usize>> {
-    use rand::seq::SliceRandom;
+fn check_read_consistency(buf_handle: Buf, max_lsn: u64) {
+    let mut last_lsn = 0;
+    while last_lsn < max_lsn {
+        let mut b = vec![0u8; SIZE];
+        let s = buf_handle.snapshot();
+        last_lsn = s.lsn;
+        let delta = Some(s.snapshots.load_full());
+        let latest_delta_lsn = delta.as_ref().unwrap().lsn;
+        s.read(&mut b, 0);
 
-    let mut points = HashSet::new();
-    let ranges_cnt = (size / 10).max(1).min(10);
-    while points.len() < ranges_cnt - 1 {
-        points.insert(rng.gen_range(1..size - 1));
+        let sum = slice_wrapping_sum(&b);
+        if sum != 0 {
+            panic!(
+                "LSN :{} (last snapshot: {}), data: {:?}",
+                s.lsn, latest_delta_lsn, b,
+            );
+        }
     }
-    points.insert(0);
-    points.insert(size);
+}
 
-    let mut split_points = points.into_iter().collect::<Vec<_>>();
-    split_points.sort();
+fn slice_wrapping_sum(initial_state: &[u8]) -> u8 {
+    initial_state
+        .iter()
+        .copied()
+        .reduce(|a, b| a.wrapping_add(b))
+        .unwrap()
+}
 
-    let mut ranges = Vec::new();
-    for pair in split_points.windows(2) {
-        let [from, to] = [pair[0], pair[1]];
-        ranges.push(from..to);
+fn random_patches(rng: &mut SmallRng, size: usize, count: usize) -> Vec<(usize, Vec<u8>)> {
+    let mut patches = vec![];
+    for _ in 0..count {
+        let len = rng.gen_range(1..=size);
+        let offset = rng.gen_range(0..=size - len);
+        let mut patch = vec![0; len];
+        rng.fill(&mut patch[..]);
+        patches.push((offset, patch));
     }
-    ranges.shuffle(rng);
-
-    ranges
+    patches
 }

@@ -12,7 +12,6 @@ fatfs = "0.3.6"
 proptest = "1.0.0"
 rand = { workspace = true, features = ["small_rng"] }
 tango-bench = { workspace = true }
-sync-unsafe-cell = "0.1.1"
 arc-swap = "1.7.1"
 
 [[bench]]
