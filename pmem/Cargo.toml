@@ -10,8 +10,9 @@ pmem-derive = { workspace = true }
 [dev-dependencies]
 fatfs = "0.3.6"
 proptest = "1.0.0"
-rand = { version = "0.8.5", features = ["small_rng"] }
-tango-bench = "0.5.0"
+rand = { workspace = true, features = ["small_rng"] }
+tango-bench = { workspace = true }
+arc-swap = "1.7.1"
 
 [[bench]]
 name = "page"

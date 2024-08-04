@@ -191,9 +191,13 @@ impl Patch {
         debug_assert!(self.adjacent(&other));
 
         match self.reorder(other) {
-            (Write(addr, mut a), Write(_, b)) => {
-                a.extend(b);
-                Merged(Write(addr, a))
+            (Write(addr_a, mut a), Write(addr_b, b)) => {
+                if a.len() + b.len() < 1024 {
+                    a.extend(b);
+                    Merged(Write(addr_a, a))
+                } else {
+                    Reordered(Write(addr_a, a), Write(addr_b, b))
+                }
             }
             (Reclaim(addr, a), Reclaim(_, b)) => Merged(Reclaim(addr, a + b)),
             (a, b) => Reordered(a, b),
@@ -363,7 +367,7 @@ impl PagePool {
         let snapshot = CommittedSnapshot {
             patches: vec![],
             base: None,
-            pages: pages as u32,
+            pages: u32::try_from(pages).unwrap(),
             lsn: 1,
         };
         Self {
@@ -422,18 +426,32 @@ impl PagePool {
             "Proposed snapshot is not linear"
         );
         let lsn = self.latest.lsn + 1;
-        self.latest = Arc::new(CommittedSnapshot {
-            patches: snapshot.patches,
-            base: Some(Arc::clone(&self.latest)),
-            pages: snapshot.pages,
-            lsn,
-        });
+
+        if self.latest.patches.len() + snapshot.patches.len() < 100 {
+            // merging consecutive snapshots because they are small
+            let mut patch_clone = CommittedSnapshot::default();
+            patch_clone.clone_from(&self.latest);
+            patch_clone.lsn = lsn;
+            let patches = snapshot.patches;
+            for patch in patches {
+                push_patch(&mut patch_clone.patches, patch);
+            }
+            self.latest = Arc::new(patch_clone);
+        } else {
+            self.latest = Arc::new(CommittedSnapshot {
+                patches: snapshot.patches,
+                base: Some(Arc::clone(&self.latest)),
+                pages: snapshot.pages,
+                lsn,
+            });
+        }
     }
 
     #[cfg(test)]
     fn read(&self, addr: PageOffset, len: usize) -> Cow<[u8]> {
         let mut buffer = vec![0; len];
-        self.latest.read_to_buf(addr, &mut buffer);
+        let mut buf_ranges = vec![0..len];
+        self.latest.read_to_buf(addr, &mut buffer, &mut buf_ranges);
         Cow::Owned(buffer)
     }
 }
@@ -449,6 +467,7 @@ impl PagePool {
 /// that represents the full history of modifications leading up to the current state.
 /// This chain is traversed backwards when reading from a snapshot to reconstruct the state
 /// of a page by applying patches in reverse chronological order.
+#[derive(Clone)]
 pub struct CommittedSnapshot {
     /// A patches that have been applied in this snapshot.
     patches: Vec<Patch>,
@@ -479,22 +498,16 @@ impl Default for CommittedSnapshot {
 }
 
 impl CommittedSnapshot {
-    fn read_to_buf(&self, addr: PageOffset, buf: &mut [u8]) {
+    fn read_to_buf(self: &Arc<Self>, addr: Addr, buf: &mut [u8], buf_mask: &mut Vec<Range<usize>>) {
         split_ptr_checked(addr, buf.len(), self.pages);
 
-        let range = (addr as usize)..addr as usize + buf.len();
+        let mut snapshot = Some(Arc::clone(self));
+        while !buf_mask.is_empty() && snapshot.is_some() {
+            let s = snapshot.take().unwrap();
 
-        let mut patch_list = vec![self.patches.as_slice()];
-        #[allow(clippy::useless_asref)]
-        let snapshots = self
-            .base
-            .as_ref()
-            .map(Arc::clone)
-            .map(collect_snapshots)
-            .unwrap_or_default();
-        patch_list.extend(snapshots.iter().map(|s| s.patches.as_slice()));
-
-        apply_patches(&patch_list, buf, &range);
+            apply_patches(&s.patches, addr as usize, buf, buf_mask);
+            snapshot.clone_from(&s.base);
+        }
     }
 }
 
@@ -529,7 +542,7 @@ impl Snapshot {
         split_ptr_checked(addr, bytes.len(), self.pages);
 
         if !bytes.is_empty() {
-            self.push_patch(Patch::Write(addr, bytes))
+            push_patch(&mut self.patches, Patch::Write(addr, bytes))
         }
     }
 
@@ -542,66 +555,23 @@ impl Snapshot {
     /// after snapshot compaction.
     pub fn reclaim(&mut self, addr: Addr, len: usize) {
         if len > 0 {
-            self.push_patch(Patch::Reclaim(addr, len))
+            push_patch(&mut self.patches, Patch::Reclaim(addr, len))
         }
-    }
-
-    /// Pushes a patch to a snapshot ensuring the following invariants hold:
-    ///
-    /// 1. All patches are sorted by [Patch:addr()]
-    /// 2. All patches are non-overlapping
-    fn push_patch(&mut self, patch: Patch) {
-        assert!(patch.len() > 0, "Patch should not be empty");
-        let connected = find_connected_ranges(&self.patches, &patch);
-
-        if connected.is_empty() {
-            // inserting new patch preserving order
-            let insert_idx = self
-                .patches
-                .binary_search_by(|i| i.addr().cmp(&patch.addr()))
-                // because new patch is not connected to anything we must get Err() here
-                .unwrap_err();
-            self.patches.insert(insert_idx, patch);
-        } else {
-            // Splitting all the patches on left and right disconnected parts and a middle part
-            // that contains connected patches that need to be normalized. We keep left part in place,
-            // there is no need to move it anywhere
-            let mut middle = self.patches.split_off(connected.start);
-            let right = middle.split_off(connected.len());
-
-            // Normalizing all connected patches one by one with the new patch.
-            // After normalizing any particular pair we need to keep continue normalizing
-            // "tail" patch with the rest of connected patches
-            let mut tail_patch = patch;
-            for p in middle {
-                tail_patch = match p.normalize(tail_patch) {
-                    NormalizedPatches::Merged(a) => a,
-                    NormalizedPatches::Reordered(a, b) => {
-                        self.patches.push(a);
-                        b
-                    }
-                    NormalizedPatches::Split(a, b, c) => {
-                        self.patches.extend([a, b]);
-                        c
-                    }
-                }
-            }
-            self.patches.push(tail_patch);
-            self.patches.extend(right);
-        }
-
-        debug_assert_sorted_and_has_no_overlaps(&self.patches);
     }
 
     pub fn read(&self, addr: Addr, len: usize) -> Cow<[u8]> {
         split_ptr_checked(addr, len, self.pages);
 
         let mut buf = vec![0; len];
-        self.base.read_to_buf(addr, &mut buf);
+        #[allow(clippy::single_range_in_vec_init)]
+        let mut buf_mask = vec![0..len];
 
-        let addr = addr as usize;
-        let range = addr..addr + len;
-        apply_patches(&[self.patches.as_slice()], &mut buf, &range);
+        // Apply uncommitted changes
+        apply_patches(&self.patches, addr as usize, &mut buf, &mut buf_mask);
+
+        // Apply committed changes
+        self.base.read_to_buf(addr, &mut buf, &mut buf_mask);
+
         Cow::Owned(buf)
     }
 
@@ -615,63 +585,133 @@ impl Snapshot {
     }
 }
 
-fn collect_snapshots(snapshot: Arc<CommittedSnapshot>) -> Vec<Arc<CommittedSnapshot>> {
-    let mut snapshots = vec![];
-    let mut snapshot = Some(snapshot);
-    #[allow(clippy::useless_asref)]
-    while let Some(s) = snapshot {
-        snapshots.push(Arc::clone(&s));
-        snapshot = s.base.as_ref().map(Arc::clone);
+/// Pushes a patch to a snapshot ensuring the following invariants hold:
+///
+/// 1. All patches are sorted by [Patch:addr()]
+/// 2. All patches are non-overlapping
+fn push_patch(patches: &mut Vec<Patch>, patch: Patch) {
+    assert!(patch.len() > 0, "Patch should not be empty");
+    let connected = find_connected_ranges(&patches, &patch);
+
+    if connected.is_empty() {
+        // inserting new patch preserving order
+        let insert_idx = patches
+            .binary_search_by(|i| i.addr().cmp(&patch.addr()))
+            // because new patch is not connected to anything we must get Err() here
+            .unwrap_err();
+        patches.insert(insert_idx, patch);
+    } else {
+        // Splitting all the patches on left and right disconnected parts and a middle part
+        // that contains connected patches that need to be normalized. We keep left part in place,
+        // there is no need to move it anywhere
+        let mut middle = patches.split_off(connected.start);
+        let right = middle.split_off(connected.len());
+
+        // Normalizing all connected patches one by one with the new patch.
+        // After normalizing any particular pair we need to keep continue normalizing
+        // "tail" patch with the rest of connected patches
+        let mut tail_patch = patch;
+        for p in middle {
+            tail_patch = match p.normalize(tail_patch) {
+                NormalizedPatches::Merged(a) => a,
+                NormalizedPatches::Reordered(a, b) => {
+                    patches.push(a);
+                    b
+                }
+                NormalizedPatches::Split(a, b, c) => {
+                    patches.extend([a, b]);
+                    c
+                }
+            }
+        }
+        patches.push(tail_patch);
+        patches.extend(right);
     }
-    snapshots
+
+    debug_assert_sorted_and_has_no_overlaps(&patches);
 }
 
 /// Applies a list of patches to a given buffer within a specified range.
 ///
 /// This function iterates over the provided snapshots and applies each patch from each snapshot
-/// that intersects with the specified range to the given buffer. Snapshots must be provided in reversed order
-/// (recent first).
+/// that intersects with the specified range to the given buffer.
 ///
 /// # Arguments
 ///
-/// * `snapshots` - A slice of slices of `Patch` instances. Each inner slice represents
-///                 a set of patches to be applied, and the outer slice represents a chain
-///                 of snapshots, with the most recent snapshot first.
-/// * `buffer` - A mutable reference to the buffer where the patches will be applied.
-/// * `range` - A range specifying the portion of the buffer to which the patches should be applied.
-fn apply_patches(snapshots: &[&[Patch]], buffer: &mut [u8], range: &Range<usize>) {
-    for snapshot in snapshots.iter().rev() {
-        debug_assert_sorted_and_has_no_overlaps(snapshot);
-        let first_matching_idx = snapshot
+/// * `snapshot` - A slice of `Patch` instances.
+/// * `addr` - An address where to read data from.
+/// * `buf` - A mutable reference to the buffer where the patches will be applied.
+/// * `buf_mask` - A mutable vector of ranges within the buffer where the patches need to be applied.
+///
+/// This functions will find and apply corresponding patches to the buffer using `addr` as a base address
+/// for a buffer. It will also update `buf_mask` vector with ranges of buffer that still need to be patched.
+/// Therefore it is required to start with a full buffer range and then this function will update it with
+/// ranges that still need to be patched.
+fn apply_patches(
+    patches: &[Patch],
+    addr: usize,
+    buf: &mut [u8],
+    buf_masks: &mut Vec<Range<usize>>,
+) {
+    debug_assert_sorted_and_has_no_overlaps(patches);
+
+    let masks_cnt = buf_masks.len();
+    let mut mask_idx = 0;
+    // When iterating over mask regions we will push new masks that can not be processed by current snapshot
+    // to the same Vec. We need to keep track of the number of masks at the start to avoid
+    // processing the same mask multiple times.
+    while mask_idx < buf_masks.len().min(masks_cnt) {
+        let start_addr = addr + buf_masks[mask_idx].start;
+        let end_addr = start_addr + buf_masks[mask_idx].len();
+        let first_matching_idx = patches
             // because end address is exclusive we need to subtract 1 from it to find idx of first possibly
             // intersecting patch
-            .binary_search_by(|i| (i.end() - 1).cmp(&(range.start as u32)))
+            .binary_search_by(|i| (i.end() - 1).cmp(&(start_addr as u32)))
             .unwrap_or_else(|idx| idx);
 
-        let overlapping_patches = snapshot[first_matching_idx..]
+        let overlapping_patches = patches[first_matching_idx..]
             .iter()
-            .take_while(|p| intersects(p, range));
+            .take_while(|p| intersects(p, &(start_addr..end_addr)));
         for patch in overlapping_patches {
             // Calculating intersection of the path and input interval
-            let offset = patch.addr() as usize;
-            let start = range.start.max(offset);
-            let end = range.end.min(offset + patch.len());
-            let len = end - start;
+            let patch_addr = patch.addr() as usize;
 
-            let buffer_range = {
-                let from = start.saturating_sub(range.start);
+            let start_addr = start_addr.max(patch_addr);
+            let end_addr = end_addr.min(patch_addr + patch.len());
+            let len = end_addr - start_addr;
+
+            let buf_range = {
+                let from = start_addr.saturating_sub(addr);
                 from..from + len
             };
 
             let patch_range = {
-                let from = start.saturating_sub(offset);
+                let from = start_addr.saturating_sub(patch_addr);
                 from..from + len
             };
+            debug_assert!(patch_range.len() == buf_range.len());
+
+            if buf_range.start > buf_masks[mask_idx].start {
+                // patch starts after the current mask, we need to split the mask
+                // and add the missing range to the list to process later by a different snapshot
+                buf_masks.push(buf_masks[mask_idx].start..buf_range.start);
+            }
+
+            // Shrinking current mask according to the bytes processed by the patch
+            buf_masks[mask_idx].start = buf_range.end;
 
             match patch {
-                Patch::Write(_, bytes) => buffer[buffer_range].copy_from_slice(&bytes[patch_range]),
-                Patch::Reclaim(..) => buffer[buffer_range].fill(0),
+                Patch::Write(_, bytes) => buf[buf_range].copy_from_slice(&bytes[patch_range]),
+                Patch::Reclaim(..) => buf[buf_range].fill(0),
             }
+        }
+        if buf_masks[mask_idx].is_empty() {
+            // current mask was fully processed, we can remove it, but we don't need to increment mask_idx.
+            // Because of swap_remove the next mask will be at the same index
+            buf_masks.remove(mask_idx);
+        } else {
+            // current mask was processed only partially, leaving it in place and moving to the next one
+            mask_idx += 1;
         }
     }
 }
@@ -786,6 +826,38 @@ mod tests {
         assert_str_eq(mem.read(6, 5), "world");
         assert_str_eq(mem.read(8, 4), "rld!");
         assert_str_eq(mem.read(7, 3), "orl");
+    }
+
+    #[test]
+    fn test_regression() {
+        let mut mem = PagePool::default();
+
+        let mut snapshot = mem.snapshot();
+        snapshot.write(70, &[0, 0, 1]);
+        mem.commit(snapshot);
+        let mut snapshot = mem.snapshot();
+        snapshot.reclaim(71, 2);
+        snapshot.write(73, &[0]);
+        mem.commit(snapshot);
+
+        assert_eq!(mem.read(70, 4).as_ref(), &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_regression2() {
+        let mut mem = PagePool::default();
+
+        let mut snapshot = mem.snapshot();
+        snapshot.write(70, &[0, 0, 1]);
+        mem.commit(snapshot);
+        let mut snapshot = mem.snapshot();
+        snapshot.write(0, &[0]);
+        mem.commit(snapshot);
+        let mut snapshot = mem.snapshot();
+        snapshot.reclaim(71, 2);
+        mem.commit(snapshot);
+
+        assert_eq!(mem.read(70, 4).as_ref(), &[0, 0, 0, 0]);
     }
 
     #[test]
