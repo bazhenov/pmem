@@ -35,18 +35,17 @@ const SIZE: usize = 10;
 /// Form (1), (2) and (3) we can see that this rule is always satisfied.
 ///
 /// Thus, the reader will always see the patches required to restore requested LSN.
-#[derive(Clone)]
 struct Buf {
-    lsn: Arc<AtomicU64>,
-    data: Arc<Cell<[u8]>>,
-    snapshots: Arc<ArcSwap<Delta>>,
+    lsn: AtomicU64,
+    data: Box<Cell<[u8]>>,
+    snapshots: ArcSwap<Delta>,
 }
 
 unsafe impl Sync for Buf {}
 unsafe impl Send for Buf {}
 
 impl Buf {
-    fn write(&mut self, patches: Vec<(usize, Vec<u8>)>) {
+    fn write(self: &Arc<Self>, patches: Vec<(usize, Vec<u8>)>) {
         let d = self.data.as_ptr() as *const UnsafeCell<[u8]>;
         let b: &mut [u8] = unsafe { &mut *UnsafeCell::raw_get(d) };
 
@@ -78,32 +77,15 @@ impl Buf {
         self.lsn.store(new_lsn, Ordering::SeqCst);
     }
 
-    fn snapshot(&self) -> Snapshot {
-        let data = self.data.clone();
+    fn read(self: &Arc<Self>, buf: &mut [u8], offset: usize) -> u64 {
         let lsn = self.lsn.load(Ordering::SeqCst);
-        let snapshots = Arc::clone(&self.snapshots);
-        Snapshot {
-            lsn,
-            data,
-            snapshots,
-        }
-    }
-}
 
-struct Snapshot {
-    lsn: u64,
-    data: Arc<Cell<[u8]>>,
-    snapshots: Arc<ArcSwap<Delta>>,
-}
-
-impl Snapshot {
-    fn read(&self, buf: &mut [u8], offset: usize) {
         let src: &[u8] = unsafe { mem::transmute(self.data.as_slice_of_cells()) };
         buf.copy_from_slice(&src[offset..offset + buf.len()]);
 
         let mut delta = Some(self.snapshots.load_full());
         while let Some(d) = delta {
-            if d.lsn < self.lsn {
+            if d.lsn < lsn {
                 break;
             }
 
@@ -114,6 +96,7 @@ impl Snapshot {
             }
             delta = d.next.clone();
         }
+        lsn
     }
 }
 
@@ -132,15 +115,15 @@ fn check_mem() {
 
 fn run() {
     let mut state = [0u8; SIZE];
-    let mut buf = Buf {
-        data: Arc::new(Cell::new(state.clone())),
-        lsn: Arc::new(AtomicU64::new(0)),
-        snapshots: Arc::new(ArcSwap::from_pointee(Delta {
+    let buf = Arc::new(Buf {
+        data: Box::new(Cell::new(state.clone())),
+        lsn: AtomicU64::new(0),
+        snapshots: ArcSwap::from_pointee(Delta {
             lsn: 0,
             patches: vec![],
             next: None,
-        })),
-    };
+        }),
+    });
 
     let iterations = 1000;
     // Spawning threads that reads buffer and checks consistency
@@ -157,12 +140,14 @@ fn run() {
     let mut rnd = SmallRng::from_entropy();
     for _ in 0..iterations {
         let mut patches = random_patches(&mut rnd, SIZE, 4);
+
+        // mirroring changes on the local buffer to be able to calculate the compensator
+        // to make the sum of the buffer to be 0
         for (offset, patch) in &patches {
             let len = patch.len();
             state[*offset..*offset + len].copy_from_slice(&patch);
         }
         let sum = slice_wrapping_sum(&state);
-
         // The value that will make the sum of the buffer to be exactly 0
         let compensator = 255 - sum.wrapping_sub(state[0]).wrapping_sub(1);
         state[0] = compensator;
@@ -177,23 +162,13 @@ fn run() {
     }
 }
 
-fn check_read_consistency(buf_handle: Buf, max_lsn: u64) {
-    let mut last_lsn = 0;
-    while last_lsn < max_lsn {
-        let mut b = vec![0u8; SIZE];
-        let s = buf_handle.snapshot();
-        last_lsn = s.lsn;
-        let delta = Some(s.snapshots.load_full());
-        let latest_delta_lsn = delta.as_ref().unwrap().lsn;
-        s.read(&mut b, 0);
-
+fn check_read_consistency(buf: Arc<Buf>, max_lsn: u64) {
+    let mut b = vec![0u8; SIZE];
+    let mut read_lsn = 0;
+    while read_lsn < max_lsn {
+        read_lsn = buf.read(&mut b, 0);
         let sum = slice_wrapping_sum(&b);
-        if sum != 0 {
-            panic!(
-                "LSN :{} (last snapshot: {}), data: {:?}",
-                s.lsn, latest_delta_lsn, b,
-            );
-        }
+        assert_eq!(sum, 0, "Mismatch found. LSN: {}, data: {:?}", read_lsn, b);
     }
 }
 
