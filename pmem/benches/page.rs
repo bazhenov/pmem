@@ -15,7 +15,7 @@ fn page_benchmarks() -> impl IntoBenchmarks {
     [
         benchmark_fn("arbitrary_read", bench_read),
         benchmark_fn("arbitrary_write", bench_write),
-        benchmark_fn("write_comit", bench_write_commit),
+        benchmark_fn("write_commit", bench_write_commit),
     ]
 }
 
