@@ -1,3 +1,36 @@
+//! This test is exploring the algorithm of sharing a buffer between multiple threads
+//! without using locks. The buffer is updated by one thread only, but may be read by multiple threads.
+//!
+//! Consistency is guaranteed by maintaining a list of inverse (restoring) patches that allows the reader to
+//! fix the buffer that is being read without any locks. The inverse patch allows to restore previous
+//! versions of the buffer. The writer thread saves the inverse patch before updating the buffer. The reader
+//! thread reads the buffer (possibly inconsistent), and then uses the inverse patches to restore the buffer
+//! at a specific LSN.
+//!
+//! Buffer update protocol:
+//!
+//! # Writing side
+//! 1. generate new LSN, but not update it yet
+//! 2. create new inverse patch with new LSN and push it to the list
+//! 3. update the buffer itself with the new data
+//! 4. update the lsn
+//!
+//! # Reading side
+//! 1. read the last lsn and save a copy to snapshot
+//! 2. read the latest buffer, which may be inconsistent
+//! 3. read the last delta reference
+//! 4. updates all the delta patches that are greater than LSN from step (1).
+//!
+//! Happens-before relationships:
+//! 1. patch.store -> buffer.store -> lsn.store (program order writer side)
+//! 2. lsn.load -> buffer.load -> patch.load (program order reader side)
+//! 3. lsn.store -> lsn.load (atomic store/load)
+//!
+//! The main consistency rule is patch.store -> patch.load. Which means that the reader will
+//! always see the patches required to restore requested LSN, even if the buffer is inconsistent.
+//! Form (1), (2) and (3) we can see that this rule is always satisfied.
+//!
+//! Thus, the reader will always see the patches required to restore requested LSN.
 use arc_swap::ArcSwap;
 use rand::{rngs::SmallRng, Rng, SeedableRng};
 use std::{
@@ -9,32 +42,9 @@ use std::{
     },
     thread,
 };
+
 const SIZE: usize = 10;
 
-/// Buffer update protocol:
-///
-/// # Writing side
-/// 1. generate new LSN, but not update it yet
-/// 2. create new inverse patch with new LSN and push it to the list
-/// 3. update the buffer itself with the new data
-/// 4. update the lsn
-///
-/// # Reading side
-/// 1. read the last lsn and save a copy to snapshot
-/// 2. read the latest buffer, which may be inconsistent
-/// 3. read the last delta reference
-/// 4. updates all the delta patches that are greater than LSN from step (1).
-///
-/// Happens-before relationships:
-/// 1. patch.store -> buffer.store -> lsn.store (program order writer side)
-/// 2. lsn.load -> buffer.load -> patch.load (program order reader side)
-/// 3. lsn.store -> lsn.load (atomic store/load)
-///
-/// The main consistency rule is patch.store -> patch.load. Which means that the reader will
-/// always see the patches required to restore requested LSN, even if the buffer is inconsistent.
-/// Form (1), (2) and (3) we can see that this rule is always satisfied.
-///
-/// Thus, the reader will always see the patches required to restore requested LSN.
 struct Buf {
     lsn: AtomicU64,
     data: Box<Cell<[u8]>>,
