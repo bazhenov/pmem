@@ -1198,7 +1198,6 @@ mod tests {
                     mem.commit(snapshot);
                 }
 
-                println!("-------------------");
                 assert_buffers_eq(&mem.read(0, DB_SIZE), shadow_buffer.as_slice())?;
             }
 

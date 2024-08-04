@@ -31,6 +31,7 @@
 //! Form (1), (2) and (3) we can see that this rule is always satisfied.
 //!
 //! Thus, the reader will always see the patches required to restore requested LSN.
+
 use arc_swap::ArcSwap;
 use rand::{rngs::SmallRng, Rng, SeedableRng};
 use std::{
@@ -43,7 +44,7 @@ use std::{
     thread,
 };
 
-const SIZE: usize = 10;
+const SIZE: usize = 1 << 16;
 
 struct Buf {
     lsn: AtomicU64,
@@ -116,14 +117,14 @@ struct Delta {
     next: Option<Arc<Self>>,
 }
 
-#[test]
-fn check_mem() {
-    for _ in 0..1000 {
-        run();
+fn main() {
+    for _ in 0..100 {
+        run_single_pass();
     }
+    println!("Ok");
 }
 
-fn run() {
+fn run_single_pass() {
     let mut state = [0u8; SIZE];
     let buf = Arc::new(Buf {
         data: Box::new(Cell::new(state.clone())),
@@ -149,7 +150,7 @@ fn run() {
     // Updating buffer with random patches but keeping the sum of the buffer to be 0
     let mut rnd = SmallRng::from_entropy();
     for _ in 0..iterations {
-        let mut patches = random_patches(&mut rnd, SIZE, 4);
+        let mut patches = random_patches(&mut rnd, SIZE, 40);
 
         // mirroring changes on the local buffer to be able to calculate the compensator
         // to make the sum of the buffer to be 0
@@ -163,7 +164,7 @@ fn run() {
         state[0] = compensator;
         patches.push((0, vec![compensator]));
 
-        debug_assert_eq!(slice_wrapping_sum(&state), 0);
+        assert_eq!(slice_wrapping_sum(&state), 0);
         buf.write(patches);
     }
 
@@ -193,7 +194,7 @@ fn slice_wrapping_sum(initial_state: &[u8]) -> u8 {
 fn random_patches(rng: &mut SmallRng, size: usize, count: usize) -> Vec<(usize, Vec<u8>)> {
     let mut patches = vec![];
     for _ in 0..count {
-        let len = rng.gen_range(1..=size);
+        let len = rng.gen_range(1..100);
         let offset = rng.gen_range(0..=size - len);
         let mut patch = vec![0; len];
         rng.fill(&mut patch[..]);

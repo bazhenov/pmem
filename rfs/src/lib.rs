@@ -1018,6 +1018,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     #[should_panic(expected = "NoSpaceLeft")]
     fn no_space_left() {
         // Maximum file size is 17984 bytes in test environment. So in order to trigger NoSpaceLeft
