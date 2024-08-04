@@ -1,0 +1,20 @@
+name: Test Memory Ordering
+
+on: push
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-22.04
+          - os: macos-12
+          - os: windows-2019
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run Tests
+        run: cargo run --release --example=memory-non-blocking-read
