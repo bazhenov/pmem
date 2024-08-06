@@ -95,6 +95,11 @@ impl Transaction {
         self.snapshot.write(addr, bytes)
     }
 
+    pub fn read_super_block<T: Record>(&self) -> Result<Handle<T>> {
+        let ptr = Ptr::from_addr(START_ADDR).unwrap();
+        self.lookup(ptr)
+    }
+
     pub fn lookup<T: Record>(&self, ptr: Ptr<T>) -> Result<Handle<T>> {
         let bytes = self.read_uncommitted(ptr.addr, T::SIZE);
         let value = T::read(&bytes)?;
@@ -145,7 +150,7 @@ impl Transaction {
         self.snapshot.read(addr, len)
     }
 
-    fn alloc(&mut self, size: usize) -> Result<Addr> {
+    fn alloc_space(&mut self, size: usize) -> Result<Addr> {
         assert!(size > 0);
         if !self.snapshot.valid_range(self.next_addr, size) {
             return Err(Error::NoSpaceLeft);
@@ -153,6 +158,17 @@ impl Transaction {
         let addr = self.next_addr;
         self.next_addr += size as u32;
         Ok(addr)
+    }
+
+    pub fn alloc<T: Record>(&mut self) -> Result<Ptr<T>> {
+        let addr = self.alloc_space(T::SIZE)?;
+        Ok(Ptr::from_addr(addr).unwrap())
+    }
+
+    pub fn write_at<T: Record>(&mut self, ptr: Ptr<T>, value: T) -> Result<Handle<T>> {
+        let (ptr, size) = self.write_to_memory(&value, Some(ptr))?;
+        let addr = ptr.addr;
+        Ok(Handle { addr, value, size })
     }
 
     pub fn write<T: Record>(&mut self, value: T) -> Result<Handle<T>> {
@@ -165,7 +181,7 @@ impl Transaction {
         assert!(values.len() <= PageOffset::MAX as usize);
 
         let size = SLICE_HEADER_SIZE + T::SIZE * values.len();
-        let ptr = SlicePtr::from_addr(self.alloc(size)?).expect("Alloc failed");
+        let ptr = SlicePtr::from_addr(self.alloc_space(size)?).expect("Alloc failed");
 
         let mut buffer = vec![0u8; size];
 
@@ -188,7 +204,7 @@ impl Transaction {
         assert!(bytes.len() <= PageOffset::MAX as usize);
 
         let size = SLICE_HEADER_SIZE + bytes.len();
-        let ptr = SlicePtr::from_addr(self.alloc(size)?).expect("Alloc failed");
+        let ptr = SlicePtr::from_addr(self.alloc_space(size)?).expect("Alloc failed");
 
         let mut buffer = vec![0u8; size];
 
@@ -215,7 +231,7 @@ impl Transaction {
         let ptr = if let Some(ptr) = ptr {
             ptr
         } else {
-            Ptr::from_addr(self.alloc(size)?).expect("Alloc failed")
+            Ptr::from_addr(self.alloc_space(size)?).expect("Alloc failed")
         };
 
         value.write(&mut buffer)?;

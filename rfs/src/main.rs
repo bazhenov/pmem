@@ -18,7 +18,7 @@ async fn main() {
 
     let pool = PagePool::new(1024);
     let mem = Memory::new(pool);
-    let fs = Filesystem::allocate(mem);
+    let fs = Filesystem::allocate(mem.start());
     let listener = NFSTcpListener::bind(&format!("127.0.0.1:{HOSTPORT}"), RFS::new(fs))
         .await
         .unwrap();

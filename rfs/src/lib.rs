@@ -1,13 +1,12 @@
 use pmem::{
     memory::{self, SlicePtr, PTR_SIZE},
-    Handle, Memory, Ptr, Record, Transaction,
+    Handle, Ptr, Record, Transaction,
 };
 use pmem_derive::Record;
 use std::{
     convert::Into,
     fmt,
     io::{self, Error, ErrorKind, Read, Seek, SeekFrom, Write},
-    mem,
     ops::{Deref, DerefMut},
     path::{self, Component, Path, PathBuf},
 };
@@ -20,8 +19,7 @@ pub mod nfs;
 
 pub struct Filesystem {
     volume: Handle<VolumeInfo>,
-    mem: Memory,
-    // tx: Transaction,
+    tx: Transaction,
 }
 
 #[derive(Debug, Record)]
@@ -30,14 +28,13 @@ pub struct VolumeInfo {
 }
 
 impl Filesystem {
-    pub fn open(mem: Memory, volume: Ptr<VolumeInfo>) -> Self {
-        let tx = mem.start();
-        let volume = tx.lookup(volume).unwrap();
-        Self { volume, mem }
+    pub fn open(tx: Transaction) -> Self {
+        let volume = tx.read_super_block().unwrap();
+        Self { volume, tx }
     }
 
-    pub fn allocate(mut mem: Memory) -> Self {
-        let mut tx = mem.start();
+    pub fn allocate(mut tx: Transaction) -> Self {
+        let super_block_ptr = tx.alloc::<VolumeInfo>().unwrap();
         let name = tx.write_slice("/".as_bytes()).unwrap();
         let root_entry = FNode {
             name: Str(name),
@@ -48,100 +45,86 @@ impl Filesystem {
             next: None,
         };
         let root = tx.write(root_entry).unwrap().ptr();
-        let volume = tx.write(VolumeInfo { root }).unwrap();
-        mem.commit(tx);
-        Self { volume, mem }
+        let volume = tx.write_at(super_block_ptr, VolumeInfo { root }).unwrap();
+        Self { volume, tx }
     }
 }
 
 impl Filesystem {
     pub fn get_root(&self) -> Result<FileMeta> {
-        let tx = self.mem.start();
-        FileMeta::from(self.get_root_handle(&tx), &tx)
+        FileMeta::from(self.get_root_handle(), &self.tx)
     }
 
     /// Finds the file/directory at the given path
     ///
     /// Return [ErrorKind::NotFound] if the file/directory does not exist
     pub fn find(&self, path: impl AsRef<str>) -> Result<FileMeta> {
-        let tx = self.mem.start();
-        FileMeta::from(self.do_lookup_file(&tx, path)?, &tx)
+        FileMeta::from(self.do_lookup_file(path)?, &self.tx)
     }
 
     /// Finds the given child in the given directory
     ///
     /// Return [ErrorKind::NotFound] if the child does not exist
     pub fn lookup(&self, dir: &FileMeta, name: impl AsRef<str>) -> Result<FileMeta> {
-        let tx = self.mem.start();
         let children = self
-            .lookup_inode(&tx, dir)?
+            .lookup_inode(dir)?
             .children
             .ok_or(ErrorKind::NotFound)?;
-        let child = self.find_child(&tx, children, name.as_ref())?;
-        FileMeta::from(child.node, &tx)
+        let child = self.find_child(children, name.as_ref())?;
+        FileMeta::from(child.node, &self.tx)
     }
 
     /// Returns the file/directory with a given inode ([FileMeta::fid])
     pub fn lookup_by_id(&self, id: u64) -> Result<FileMeta> {
-        let tx = self.mem.start();
         assert!(id <= u32::MAX as u64);
         let ptr = Ptr::<FNode>::from_addr(id as u32).ok_or(ErrorKind::NotFound)?;
-        let handle = tx.lookup(ptr)?;
-        FileMeta::from(handle, &tx)
+        let handle = self.tx.lookup(ptr)?;
+        FileMeta::from(handle, &self.tx)
     }
 
     pub fn delete(&mut self, dir: &FileMeta, name: impl AsRef<str>) -> Result<()> {
-        let mut tx = self.mem.start();
-
-        let mut dir = self.lookup_inode(&tx, dir)?;
+        let mut dir = self.lookup_inode(dir)?;
 
         let children = dir.children.ok_or(ErrorKind::NotFound)?;
-        let file = self.find_child(&tx, children, name.as_ref())?;
+        let file = self.find_child(children, name.as_ref())?;
 
         let next_ptr = file.node.next;
-        tx.reclaim(file.node);
+        self.tx.reclaim(file.node);
 
         if let Some(mut referent) = file.referent {
             // Child is not first in a list
             referent.next = next_ptr;
-            tx.update(&referent)?;
+            self.tx.update(&referent)?;
         } else {
             dir.children = next_ptr;
-            tx.update(&dir)?;
+            self.tx.update(&dir)?;
         }
-
-        self.mem.commit(tx);
         Ok(())
     }
 
     pub fn create_file(&mut self, dir: &FileMeta, name: impl AsRef<str>) -> Result<FileMeta> {
         let file_name = name.as_ref();
-        let mut tx = self.mem.start();
 
-        let mut dir = self.lookup_inode(&tx, dir)?;
+        let mut dir = self.lookup_inode(dir)?;
         let file_info = if let Some(children) = dir.children {
-            self.create_child(&mut tx, children, file_name, NodeType::File)?
+            self.create_child(children, file_name, NodeType::File)?
                 .ok()
                 .ok_or(ErrorKind::AlreadyExists)?
         } else {
-            let new_node = self.write_fsnode(&mut tx, file_name, NodeType::File)?;
+            let new_node = self.write_fsnode(file_name, NodeType::File)?;
             dir.children = Some(new_node.ptr());
-            tx.update(&dir)?;
+            self.tx.update(&dir)?;
             new_node
         };
 
-        let meta = FileMeta::from(file_info, &tx);
-        self.mem.commit(tx);
-        meta
+        FileMeta::from(file_info, &self.tx)
     }
 
     /// Opens a file for reading and writing
     pub fn open_file<'a>(&'a mut self, file: &FileMeta) -> Result<File<'a>> {
-        let tx = self.mem.start();
-        let file_info = self.lookup_inode(&tx, file)?;
+        let file_info = self.lookup_inode(file)?;
 
         Ok(File {
-            tx,
             pos: 0,
             fs: self,
             meta: file_info,
@@ -154,23 +137,20 @@ impl Filesystem {
     /// - [Error::AlreadyExists] if the directory already exists;
     /// - [ErrorKind::NotFound] if the parent directory does not exist;
     pub fn create_dir(&mut self, parent: &FileMeta, name: impl AsRef<str>) -> Result<FileMeta> {
-        let mut tx = self.mem.start();
-        let mut parent = self.lookup_inode(&tx, parent)?;
+        let mut parent = self.lookup_inode(parent)?;
 
         let directory_inode = if let Some(first_child) = parent.children {
-            self.create_child(&mut tx, first_child, name.as_ref(), NodeType::Directory)?
+            self.create_child(first_child, name.as_ref(), NodeType::Directory)?
                 .ok()
                 .ok_or(ErrorKind::AlreadyExists)?
         } else {
-            let dir_inode = self.write_fsnode(&mut tx, name.as_ref(), NodeType::Directory)?;
+            let dir_inode = self.write_fsnode(name.as_ref(), NodeType::Directory)?;
             parent.children = Some(dir_inode.ptr());
-            tx.update(&parent)?;
+            self.tx.update(&parent)?;
             dir_inode
         };
 
-        let meta = FileMeta::from(directory_inode, &tx);
-        self.mem.commit(tx);
-        meta
+        FileMeta::from(directory_inode, &self.tx)
     }
 
     /// Reads the contents of a directory
@@ -178,16 +158,15 @@ impl Filesystem {
     /// Returns:
     /// - [ErrorKind::NotFound] if the directory does not exist
     pub fn readdir(&self, dir: &FileMeta) -> Result<Vec<FileMeta>> {
-        let tx = self.mem.start();
-        let parent = self.lookup_inode(&tx, dir)?;
+        let parent = self.lookup_inode(dir)?;
 
         if let Some(children) = parent.children {
             let mut result = vec![];
             let mut current_node = Some(children);
             while let Some(node) = current_node {
-                let child = tx.lookup(node)?;
+                let child = self.tx.lookup(node)?;
                 current_node = child.next;
-                result.push(FileMeta::from(child, &tx)?);
+                result.push(FileMeta::from(child, &self.tx)?);
             }
             Ok(result)
         } else {
@@ -197,52 +176,42 @@ impl Filesystem {
 
     /// Creates a directory and all its parents
     pub fn create_dirs(&mut self, name: impl AsRef<str>) -> Result<FileMeta> {
-        let mut tx = self.mem.start();
-
         let path = PathBuf::from(name.as_ref());
-        let mut node = self.get_root_handle(&tx);
+        let mut node = self.get_root_handle();
         for component in components(&path)? {
             let Component::Normal(name) = component else {
                 return Err(ErrorKind::InvalidInput.into());
             };
 
             node = if node.children.is_none() {
-                let new_node =
-                    self.write_fsnode(&mut tx, name.to_str().unwrap(), NodeType::Directory)?;
+                let new_node = self.write_fsnode(name.to_str().unwrap(), NodeType::Directory)?;
                 node.children = Some(new_node.ptr());
-                tx.update(&node)?;
+                self.tx.update(&node)?;
                 new_node
             } else {
-                self.create_child(
-                    &mut tx,
-                    node.ptr(),
-                    name.to_str().unwrap(),
-                    NodeType::Directory,
-                )?
-                .unwrap_or_else(|found_dir| found_dir)
+                self.create_child(node.ptr(), name.to_str().unwrap(), NodeType::Directory)?
+                    .unwrap_or_else(|found_dir| found_dir)
             }
         }
 
-        let meta = FileMeta::from(node, &tx);
-        self.mem.commit(tx);
-        meta
+        FileMeta::from(node, &self.tx)
     }
 
-    fn get_root_handle(&self, tx: &Transaction) -> Handle<FNode> {
-        tx.lookup(self.volume.root).unwrap()
+    fn get_root_handle(&self) -> Handle<FNode> {
+        self.tx.lookup(self.volume.root).unwrap()
     }
 
-    fn lookup_inode(&self, tx: &Transaction, meta: &FileMeta) -> Result<Handle<FNode>> {
+    fn lookup_inode(&self, meta: &FileMeta) -> Result<Handle<FNode>> {
         assert!(meta.fid <= u32::MAX as u64);
 
         let ptr = Ptr::from_addr(meta.fid as u32).ok_or(ErrorKind::NotFound)?;
-        tx.lookup(ptr).map_err(|e| e.into())
+        self.tx.lookup(ptr).map_err(|e| e.into())
     }
 
-    fn do_lookup_file(&self, tx: &Transaction, path: impl AsRef<str>) -> Result<Handle<FNode>> {
+    fn do_lookup_file(&self, path: impl AsRef<str>) -> Result<Handle<FNode>> {
         let path = PathBuf::from(path.as_ref());
         let components = components(&path)?;
-        let mut cur_node = self.get_root_handle(tx);
+        let mut cur_node = self.get_root_handle();
         for component in components {
             let Component::Normal(name) = component else {
                 return Err(ErrorKind::InvalidInput.into());
@@ -250,24 +219,19 @@ impl Filesystem {
             let name = name.to_str().unwrap();
 
             let children = cur_node.children.ok_or(ErrorKind::NotFound)?;
-            let child = self.find_child(tx, children, name)?;
+            let child = self.find_child(children, name)?;
             cur_node = child.node;
         }
         Ok(cur_node)
     }
 
-    fn find_child(
-        &self,
-        tx: &Transaction,
-        start_node: Ptr<FNode>,
-        name: &str,
-    ) -> Result<FileInfoReferent> {
+    fn find_child(&self, start_node: Ptr<FNode>, name: &str) -> Result<FileInfoReferent> {
         let mut cur_node = Some(start_node);
         let mut referent = None;
 
         while let Some(node) = cur_node {
-            let node = tx.lookup(node)?;
-            let child_name = node.name(tx)?;
+            let node = self.tx.lookup(node)?;
+            let child_name = node.name(&self.tx)?;
             if name == child_name.as_str() {
                 return Ok(FileInfoReferent { referent, node });
             }
@@ -280,7 +244,6 @@ impl Filesystem {
     /// Returns `Ok(child)` if it was found otherwise create new [FileInfo] and returns `Err(new_child)`
     fn create_child(
         &mut self,
-        tx: &mut Transaction,
         start_node: Ptr<FNode>,
         name: &str,
         node_type: NodeType,
@@ -288,29 +251,24 @@ impl Filesystem {
         let mut prev_node = start_node;
         let mut cur_node = Some(start_node);
         while let Some(node) = cur_node {
-            let value = tx.lookup(node)?;
-            let child_name = value.name(tx)?;
+            let value = self.tx.lookup(node)?;
+            let child_name = value.name(&self.tx)?;
             if name == child_name.as_str() {
                 return Ok(CreateResult::Err(value));
             }
             prev_node = node;
             cur_node = value.next;
         }
-        let new_node = self.write_fsnode(tx, name, node_type)?;
-        let mut prev_node = tx.lookup(prev_node)?;
+        let new_node = self.write_fsnode(name, node_type)?;
+        let mut prev_node = self.tx.lookup(prev_node)?;
         prev_node.next = Some(new_node.ptr());
-        tx.update(&prev_node)?;
+        self.tx.update(&prev_node)?;
 
         Ok(CreateResult::Ok(new_node))
     }
 
-    fn write_fsnode(
-        &mut self,
-        tx: &mut Transaction,
-        name: &str,
-        node_type: NodeType,
-    ) -> Result<Handle<FNode>> {
-        let name = tx.write_slice(name.as_bytes())?;
+    fn write_fsnode(&mut self, name: &str, node_type: NodeType) -> Result<Handle<FNode>> {
+        let name = self.tx.write_slice(name.as_bytes())?;
         let entry = FNode {
             name: Str(name),
             node_type,
@@ -319,8 +277,8 @@ impl Filesystem {
             children: None,
             next: None,
         };
-        tx.update(&self.volume)?;
-        Ok(tx.write(entry)?)
+        self.tx.update(&self.volume)?;
+        Ok(self.tx.write(entry)?)
     }
 }
 
@@ -334,7 +292,6 @@ fn components(path: &Path) -> Result<path::Components> {
 }
 
 pub struct File<'a> {
-    tx: Transaction,
     pos: u64,
     meta: Handle<FNode>,
     fs: &'a mut Filesystem,
@@ -348,7 +305,7 @@ impl<'a> File<'a> {
         let mut blocks = blocks_required(self.meta.size);
         let blocks_required = blocks + blocks_to_allocate;
 
-        let tx = &mut self.tx;
+        let tx = &mut self.fs.tx;
 
         // Allocating direct data blocks if needed
         let blocks_before = blocks;
@@ -413,7 +370,7 @@ impl<'a> File<'a> {
 
     fn get_current_block(&mut self) -> Result<Handle<DataBlock>> {
         let block_no = block_idx(self.pos) as usize;
-        let tx = &mut self.tx;
+        let tx = &mut self.fs.tx;
 
         match block_no {
             0..=LAST_DIRECT_BLOCK => {
@@ -528,21 +485,17 @@ impl<'a> Write for File<'a> {
         let len = buf.len().min(bytes_left);
 
         block[offset..(offset + len)].copy_from_slice(&buf[..len]);
-        self.tx.update(&block)?;
+        self.fs.tx.update(&block)?;
 
         self.pos += len as u64;
         self.meta.size = self.meta.size.max(self.pos);
 
-        self.tx.update(&self.meta)?;
+        self.fs.tx.update(&self.meta)?;
 
         Ok(len)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        let mut tx2 = self.fs.mem.start();
-        mem::swap(&mut self.tx, &mut tx2);
-        self.fs.mem.commit(tx2);
-        self.tx = self.fs.mem.start();
         Ok(())
     }
 }
@@ -593,7 +546,7 @@ pub struct FileMeta {
 
 impl FileMeta {
     fn from(file_info: Handle<FNode>, tx: &Transaction) -> Result<Self> {
-        let name = file_info.name(tx)?;
+        let name = file_info.name(&tx)?;
         Ok(FileMeta {
             name,
             fid: u64::from(file_info.ptr().unwrap_addr()),
@@ -1051,7 +1004,8 @@ mod tests {
     }
 
     fn create_fs() -> Filesystem {
-        Filesystem::allocate(Memory::default())
+        let mem = Memory::default();
+        Filesystem::allocate(mem.start())
     }
 
     #[cfg(not(miri))]
@@ -1077,7 +1031,7 @@ mod tests {
             #[test]
             fn can_write_file(ops in vec(any_write_operation(), 0..10)) {
                 let mem = Memory::new(PagePool::new(1024 * 1024));
-                let mut fs = Filesystem::allocate(mem);
+                let mut fs = Filesystem::allocate(mem.start());
 
                 let tmp_dir = TempDir::new().unwrap();
                 let root = fs.get_root().unwrap();

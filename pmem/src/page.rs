@@ -429,6 +429,7 @@ impl PagePool {
 
         if self.latest.patches.len() + snapshot.patches.len() < 100 {
             // merging consecutive snapshots because they are small
+            // Need to be removed after implementing realtime snapshots
             let mut patch_clone = CommittedSnapshot::default();
             patch_clone.clone_from(&self.latest);
             patch_clone.lsn = lsn;
