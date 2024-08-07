@@ -324,6 +324,9 @@ impl NormalizedPatches {
 pub enum Error {
     #[error("Read of the page out-of-bounds")]
     OutOfBounds,
+
+    #[error("No valid snapshot found for lsn: {0}. Latest LSN: {1}")]
+    NoSnapshot(u64, u64),
 }
 
 /// A pool of pages that can capture and commit snapshots of data changes.
@@ -407,6 +410,19 @@ impl PagePool {
         }
     }
 
+    /// Returns a snapshot of the page pool at a specific LSN **or newer**.
+    pub fn snapshot_at(&self, lsn: u64) -> Result<Snapshot, Error> {
+        let latest = &self.latest;
+        let base = latest
+            .find_at_lsn(lsn)
+            .ok_or(Error::NoSnapshot(lsn, latest.lsn))?;
+        Ok(Snapshot {
+            patches: vec![],
+            base,
+            pages: latest.pages,
+        })
+    }
+
     /// Commits the changes made in a snapshot back to the page pool.
     ///
     /// This method updates the state of the page pool to reflect the modifications
@@ -420,32 +436,20 @@ impl PagePool {
     /// # Arguments
     ///
     /// * `snapshot` - A snapshot containing modifications to commit to the page pool.
-    pub fn commit(&mut self, snapshot: Snapshot) {
+    pub fn commit(&mut self, snapshot: Snapshot) -> u64 {
         assert!(
             Arc::ptr_eq(&self.latest, &snapshot.base),
             "Proposed snapshot is not linear"
         );
         let lsn = self.latest.lsn + 1;
 
-        if self.latest.patches.len() + snapshot.patches.len() < 100 {
-            // merging consecutive snapshots because they are small
-            // Need to be removed after implementing realtime snapshots
-            let mut patch_clone = CommittedSnapshot::default();
-            patch_clone.clone_from(&self.latest);
-            patch_clone.lsn = lsn;
-            let patches = snapshot.patches;
-            for patch in patches {
-                push_patch(&mut patch_clone.patches, patch);
-            }
-            self.latest = Arc::new(patch_clone);
-        } else {
-            self.latest = Arc::new(CommittedSnapshot {
-                patches: snapshot.patches,
-                base: Some(Arc::clone(&self.latest)),
-                pages: snapshot.pages,
-                lsn,
-            });
-        }
+        self.latest = Arc::new(CommittedSnapshot {
+            patches: snapshot.patches,
+            base: Some(Arc::clone(&self.latest)),
+            pages: snapshot.pages,
+            lsn,
+        });
+        lsn
     }
 
     #[cfg(test)]
@@ -509,6 +513,19 @@ impl CommittedSnapshot {
             apply_patches(&s.patches, addr as usize, buf, buf_mask);
             snapshot.clone_from(&s.base);
         }
+    }
+
+    /// Returns first snapshot in the chain that has LSN greater or equal to the provided LSN or newer.
+    fn find_at_lsn(self: &Arc<Self>, lsn: u64) -> Option<Arc<Self>> {
+        let mut snapshot = self;
+        while let Some(s) = snapshot.base.as_ref() {
+            if s.lsn < lsn {
+                break;
+            } else {
+                snapshot = s;
+            }
+        }
+        (snapshot.lsn >= lsn).then(|| Arc::clone(&snapshot))
     }
 }
 
@@ -944,6 +961,29 @@ mod tests {
         mem.commit(snapshot);
     }
 
+    #[test]
+    fn can_read_previous_snapshots() -> Result<(), Error> {
+        let mut mem = PagePool::new(1);
+
+        let mut a = mem.snapshot();
+        a.write(0, [1]);
+        let a_lsn = mem.commit(a);
+
+        let mut b = mem.snapshot();
+        b.write(0, [2]);
+        let b_lsn = mem.commit(b);
+
+        assert!(b_lsn >= a_lsn);
+
+        let a = mem.snapshot_at(a_lsn)?;
+        assert_eq!(&*a.read(0, 1), &[1]);
+
+        let b = mem.snapshot_at(b_lsn)?;
+        assert_eq!(&*b.read(0, 1), &[2]);
+
+        Ok(())
+    }
+
     /// When dropping PagePool all related snapshots will be removed. It may lead
     /// to stackoverflow if snapshots removed recursively.
     #[test]
@@ -955,7 +995,7 @@ mod tests {
             .spawn(|| {
                 let mut mem = PagePool::new(1);
                 for _ in 0..1000 {
-                    mem.commit(mem.snapshot())
+                    mem.commit(mem.snapshot());
                 }
             })
             .unwrap()

@@ -38,6 +38,9 @@ pub enum Error {
 
     #[error("Unexpected variant code: {0}")]
     UnexpectedVariantCode(u64),
+
+    #[error("Page error: {0}")]
+    Page(#[from] crate::page::Error),
 }
 
 impl From<Error> for io::Error {
@@ -47,6 +50,7 @@ impl From<Error> for io::Error {
             Error::NoSpaceLeft => io::ErrorKind::OutOfMemory,
             Error::NullPointer => io::ErrorKind::InvalidInput,
             Error::UnexpectedVariantCode(..) => io::ErrorKind::InvalidInput,
+            Error::Page(..) => io::ErrorKind::Other,
         };
         io::Error::new(kind, error)
     }
@@ -60,13 +64,14 @@ impl Memory {
             seq: 0,
         }
     }
-    pub fn commit(&mut self, tx: Transaction) {
+    pub fn commit(&mut self, tx: Transaction) -> u64 {
         assert!(tx.next_addr >= self.next_addr);
         assert!(tx.seq == self.seq);
         // Page should be committed first, because it's check for snapshot linearity
-        self.pool.commit(tx.snapshot);
+        let lsn = self.pool.commit(tx.snapshot);
         self.seq += 1;
         self.next_addr = tx.next_addr;
+        lsn
     }
 
     pub fn start(&self) -> Transaction {
@@ -75,6 +80,14 @@ impl Memory {
             next_addr: self.next_addr,
             seq: self.seq,
         }
+    }
+
+    pub fn start_at(&self, lsn: u64) -> Result<Transaction> {
+        Ok(Transaction {
+            snapshot: self.pool.snapshot_at(lsn)?,
+            next_addr: self.next_addr,
+            seq: self.seq,
+        })
     }
 }
 
