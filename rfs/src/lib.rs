@@ -207,6 +207,14 @@ impl Filesystem {
         FileMeta::from(node, &self.tx)
     }
 
+    pub fn changes<'a>(&'a self, other: &'a Self) -> impl Iterator<Item = Result<Change>> + 'a {
+        Changes { a: self, b: other }
+    }
+
+    pub fn finish(self) -> Transaction {
+        self.tx
+    }
+
     fn get_root_handle(&self) -> Handle<FNode> {
         self.tx.lookup(self.volume.root).unwrap()
     }
@@ -429,9 +437,7 @@ impl Iterator for ReadDir<'_> {
     type Item = Result<FileMeta>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let Some(node) = self.next.take() else {
-            return None;
-        };
+        let node = self.next.take()?;
         match self.fs.tx.lookup(node) {
             Ok(child) => {
                 self.next = child.next;
@@ -439,6 +445,21 @@ impl Iterator for ReadDir<'_> {
             }
             Err(e) => Some(Err(e.into())),
         }
+    }
+}
+
+pub enum Change {}
+
+pub struct Changes<'a> {
+    a: &'a Filesystem,
+    b: &'a Filesystem,
+}
+
+impl<'a> Iterator for Changes<'a> {
+    type Item = Result<Change>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        todo!()
     }
 }
 
@@ -587,7 +608,7 @@ pub struct FileMeta {
 
 impl FileMeta {
     fn from(file_info: Handle<FNode>, tx: &Transaction) -> Result<Self> {
-        let name = file_info.name(&tx)?;
+        let name = file_info.name(tx)?;
         Ok(FileMeta {
             name,
             fid: u64::from(file_info.ptr().unwrap_addr()),
@@ -738,17 +759,30 @@ mod tests {
     use pmem::Memory;
     use std::fs;
 
-    macro_rules! assert_missing {
+    macro_rules! assert_not_exists {
         ($fs:expr, $name:expr) => {
-            let Some(ErrorKind::NotFound) = $fs.find($name).map_err(|e| e.kind()).err() else {
-                panic!("{} should be missing", $name);
-            };
+            match $fs.find($name).map_err(|e| e.kind()) {
+                Ok(_) => panic!("{} should not exists", $name),
+                Err(ErrorKind::NotFound) => (),
+                e @ Err(..) => panic!("find() failed: {:?}", e),
+            }
+        };
+    }
+
+    macro_rules! assert_exists {
+        ($fs:expr, $name:expr) => {
+            if let Err(e) = $fs.find($name) {
+                match e.kind() {
+                    ErrorKind::NotFound => panic!("{} should exists", $name),
+                    _ => panic!("find() failed: {:?}", e),
+                }
+            }
         };
     }
 
     #[test]
     fn check_root() -> Result<()> {
-        let fs = create_fs();
+        let (fs, _) = create_fs();
 
         let root = fs.get_root()?;
         assert_eq!(root.name, "/");
@@ -758,7 +792,7 @@ mod tests {
 
     #[test]
     fn check_find_should_return_none_if_dir_is_missing() -> Result<()> {
-        let fs = create_fs();
+        let (fs, _) = create_fs();
 
         let node = fs.find("/foo");
         let Some(ErrorKind::NotFound) = node.map_err(|e| e.kind()).err() else {
@@ -769,7 +803,7 @@ mod tests {
 
     #[test]
     fn check_lookup_dir() -> Result<()> {
-        let mut fs = create_fs();
+        let (mut fs, _) = create_fs();
 
         fs.create_dirs("/etc")?;
         let root = fs.get_root()?;
@@ -779,7 +813,7 @@ mod tests {
 
     #[test]
     fn check_creating_directories() -> Result<()> {
-        let mut fs = create_fs();
+        let (mut fs, _) = create_fs();
 
         let root = fs.get_root()?;
         fs.create_dir(&root, "etc")?;
@@ -794,7 +828,7 @@ mod tests {
 
     #[test]
     fn check_creating_multiple_directories() -> Result<()> {
-        let mut fs = create_fs();
+        let (mut fs, _) = create_fs();
 
         fs.create_dirs("/usr/bin")?;
 
@@ -807,51 +841,51 @@ mod tests {
 
     #[test]
     fn can_delete_directory() -> Result<()> {
-        let mut fs = create_fs();
+        let (mut fs, _) = create_fs();
 
         let root = fs.get_root()?;
         fs.create_dir(&root, "usr")?;
         fs.delete(&root, "usr")?;
 
-        assert_missing!(fs, "/usr");
+        assert_not_exists!(fs, "/usr");
         Ok(())
     }
 
     #[test]
     fn can_delete_file() -> Result<()> {
-        let mut fs = create_fs();
+        let (mut fs, _) = create_fs();
 
         let root = fs.get_root()?;
         fs.create_file(&root, "swap")?;
         fs.delete(&root, "swap")?;
 
-        assert_missing!(fs, "/swap");
+        assert_not_exists!(fs, "/swap");
 
         Ok(())
     }
 
     #[test]
     fn can_remove_several_items() -> Result<()> {
-        let mut fs = create_fs();
+        let (mut fs, _) = create_fs();
 
         let root = fs.get_root()?;
         fs.create_dir(&root, "etc")?;
         fs.create_file(&root, "swap")?;
 
         fs.delete(&root, "etc")?;
-        assert_missing!(fs, "/etc");
+        assert_not_exists!(fs, "/etc");
 
         let _ = fs.lookup(&root, "swap")?;
 
         fs.delete(&root, "swap")?;
-        assert_missing!(fs, "/swap");
+        assert_not_exists!(fs, "/swap");
 
         Ok(())
     }
 
     #[test]
     fn check_each_fs_entry_has_its_own_id() -> Result<()> {
-        let mut fs = create_fs();
+        let (mut fs, _) = create_fs();
 
         fs.create_dirs("/usr/lib/bin")?;
 
@@ -874,7 +908,7 @@ mod tests {
 
     #[test]
     fn create_file() -> Result<()> {
-        let mut fs = create_fs();
+        let (mut fs, _) = create_fs();
 
         let root = fs.get_root()?;
         let meta = fs.create_file(&root, "file.txt")?;
@@ -899,7 +933,7 @@ mod tests {
 
     #[test]
     fn write_file_partially() -> Result<()> {
-        let mut fs = create_fs();
+        let (mut fs, _) = create_fs();
 
         let root = fs.get_root()?;
         let file = fs.create_file(&root, "file.txt")?;
@@ -917,7 +951,7 @@ mod tests {
 
     #[test]
     fn readdir_directories() -> Result<()> {
-        let mut fs = create_fs();
+        let (mut fs, _) = create_fs();
         let root = fs.get_root()?;
 
         let etc = fs.create_dir(&root, "etc")?;
@@ -943,7 +977,7 @@ mod tests {
     fn readdir_files() -> Result<()> {
         // At the moment we need to test the same logic for files, because there is
         // duplicate in implementation that should go away after migration to BTree
-        let mut fs = create_fs();
+        let (mut fs, _) = create_fs();
         let root = fs.get_root()?;
 
         let etc = fs.create_file(&root, "etc")?;
@@ -966,8 +1000,30 @@ mod tests {
     }
 
     #[test]
+    fn detect_changes() -> Result<()> {
+        let (fs_a, mut mem) = create_fs();
+
+        let lsn_a = mem.commit(fs_a.finish());
+
+        let mut fs_b = Filesystem::open(mem.start_at(lsn_a)?);
+        fs_b.create_dirs("/etc")?;
+        let lsn_b = mem.commit(fs_b.finish());
+
+        let fs_a = Filesystem::open(mem.start_at(lsn_a)?);
+        let fs_b = Filesystem::open(mem.start_at(lsn_b)?);
+
+        assert_not_exists!(fs_a, "/etc");
+        assert_exists!(fs_b, "/etc");
+        let changes = fs_b.changes(&fs_a);
+
+        todo!();
+
+        Ok(())
+    }
+
+    #[test]
     fn write_direct_blocks() -> Result<()> {
-        let mut fs = create_fs();
+        let (mut fs, _) = create_fs();
         let root = fs.get_root()?;
         let file_meta = fs.create_file(&root, "file.txt")?;
 
@@ -982,7 +1038,7 @@ mod tests {
 
     #[test]
     fn write_indirect_blocks() -> Result<()> {
-        let mut fs = create_fs();
+        let (mut fs, _) = create_fs();
         let root = fs.get_root()?;
         let meta = fs.create_file(&root, "file.txt")?;
 
@@ -998,7 +1054,7 @@ mod tests {
 
     #[test]
     fn write_double_indirect_blocks() -> Result<()> {
-        let mut fs = create_fs();
+        let (mut fs, _) = create_fs();
         let root = fs.get_root()?;
         let meta = fs.create_file(&root, "file.txt")?;
 
@@ -1050,7 +1106,7 @@ mod tests {
         // we need to write 64Kib (1 page in PagePool) / 17984 = 4 files.
         const MAX_FILE_SIZE: usize = BLOCK_SIZE * LAST_DOUBLE_INDIRECT_BLOCK;
 
-        let mut fs = create_fs();
+        let (mut fs, _) = create_fs();
         let root = fs.get_root().unwrap();
 
         let pos = Some(SeekFrom::Start((MAX_FILE_SIZE - 1) as u64));
@@ -1075,9 +1131,10 @@ mod tests {
         assert_eq!(block_idx(BLOCK_SIZE as u64 + 1), 1);
     }
 
-    fn create_fs() -> Filesystem {
+    fn create_fs() -> (Filesystem, Memory) {
         let mem = Memory::default();
-        Filesystem::allocate(mem.start())
+        let tx = mem.start();
+        (Filesystem::allocate(tx), mem)
     }
 
     #[cfg(not(miri))]

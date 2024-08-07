@@ -525,7 +525,7 @@ impl CommittedSnapshot {
                 snapshot = s;
             }
         }
-        (snapshot.lsn >= lsn).then(|| Arc::clone(&snapshot))
+        (snapshot.lsn >= lsn).then(|| Arc::clone(snapshot))
     }
 }
 
@@ -609,7 +609,7 @@ impl Snapshot {
 /// 2. All patches are non-overlapping
 fn push_patch(patches: &mut Vec<Patch>, patch: Patch) {
     assert!(patch.len() > 0, "Patch should not be empty");
-    let connected = find_connected_ranges(&patches, &patch);
+    let connected = find_connected_ranges(patches, &patch);
 
     if connected.is_empty() {
         // inserting new patch preserving order
@@ -646,7 +646,7 @@ fn push_patch(patches: &mut Vec<Patch>, patch: Patch) {
         patches.extend(right);
     }
 
-    debug_assert_sorted_and_has_no_overlaps(&patches);
+    debug_assert_sorted_and_has_no_overlaps(patches);
 }
 
 /// Applies a list of patches to a given buffer within a specified range.
