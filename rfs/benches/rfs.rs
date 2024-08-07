@@ -135,7 +135,7 @@ fn create_deep_tree(fs: &mut Filesystem, parent: &FileMeta, level: u64, names: &
         return;
     }
     for name in names {
-        let dir = fs.create_dir(&parent, &name).unwrap();
+        let dir = fs.create_dir(parent, name).unwrap();
         create_deep_tree(fs, &dir, level - 1, names);
     }
 }

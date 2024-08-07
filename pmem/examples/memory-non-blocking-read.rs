@@ -103,7 +103,7 @@ impl Buf {
             for (offset, patch) in &d.patches {
                 let offset = *offset;
                 let len = patch.len();
-                buf[offset..offset + len].copy_from_slice(&patch);
+                buf[offset..offset + len].copy_from_slice(patch);
             }
             delta = d.next.clone();
         }
@@ -127,7 +127,7 @@ fn main() {
 fn run_single_pass() {
     let mut state = [0u8; SIZE];
     let buf = Arc::new(Buf {
-        data: Box::new(Cell::new(state.clone())),
+        data: Box::new(Cell::new(state)),
         lsn: AtomicU64::new(0),
         snapshots: ArcSwap::from_pointee(Delta {
             lsn: 0,
@@ -156,7 +156,7 @@ fn run_single_pass() {
         // to make the sum of the buffer to be 0
         for (offset, patch) in &patches {
             let len = patch.len();
-            state[*offset..*offset + len].copy_from_slice(&patch);
+            state[*offset..*offset + len].copy_from_slice(patch);
         }
         let sum = slice_wrapping_sum(&state);
         // The value that will make the sum of the buffer to be exactly 0

@@ -208,7 +208,10 @@ impl Filesystem {
     }
 
     pub fn changes<'a>(&'a self, other: &'a Self) -> impl Iterator<Item = Result<Change>> + 'a {
-        Changes { a: self, b: other }
+        Changes {
+            _a: self,
+            _b: other,
+        }
     }
 
     pub fn finish(self) -> Transaction {
@@ -451,8 +454,8 @@ impl Iterator for ReadDir<'_> {
 pub enum Change {}
 
 pub struct Changes<'a> {
-    a: &'a Filesystem,
-    b: &'a Filesystem,
+    _a: &'a Filesystem,
+    _b: &'a Filesystem,
 }
 
 impl<'a> Iterator for Changes<'a> {
@@ -1000,6 +1003,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "WIP"]
     fn detect_changes() -> Result<()> {
         let (fs_a, mut mem) = create_fs();
 
@@ -1014,9 +1018,7 @@ mod tests {
 
         assert_not_exists!(fs_a, "/etc");
         assert_exists!(fs_b, "/etc");
-        let changes = fs_b.changes(&fs_a);
-
-        todo!();
+        let _changes = fs_b.changes(&fs_a);
 
         Ok(())
     }

@@ -454,7 +454,9 @@ impl PagePool {
 
     #[cfg(test)]
     fn read(&self, addr: PageOffset, len: usize) -> Cow<[u8]> {
+        #[allow(clippy::single_range_in_vec_init)]
         let mut buffer = vec![0; len];
+        #[allow(clippy::single_range_in_vec_init)]
         let mut buf_ranges = vec![0..len];
         self.latest.read_to_buf(addr, &mut buffer, &mut buf_ranges);
         Cow::Owned(buffer)
@@ -851,14 +853,14 @@ mod tests {
         let mut mem = PagePool::default();
 
         let mut snapshot = mem.snapshot();
-        snapshot.write(70, &[0, 0, 1]);
+        snapshot.write(70, [0, 0, 1]);
         mem.commit(snapshot);
         let mut snapshot = mem.snapshot();
         snapshot.reclaim(71, 2);
-        snapshot.write(73, &[0]);
+        snapshot.write(73, [0]);
         mem.commit(snapshot);
 
-        assert_eq!(mem.read(70, 4).as_ref(), &[0, 0, 0, 0]);
+        assert_eq!(mem.read(70, 4).as_ref(), [0, 0, 0, 0]);
     }
 
     #[test]
@@ -866,16 +868,16 @@ mod tests {
         let mut mem = PagePool::default();
 
         let mut snapshot = mem.snapshot();
-        snapshot.write(70, &[0, 0, 1]);
+        snapshot.write(70, [0, 0, 1]);
         mem.commit(snapshot);
         let mut snapshot = mem.snapshot();
-        snapshot.write(0, &[0]);
+        snapshot.write(0, [0]);
         mem.commit(snapshot);
         let mut snapshot = mem.snapshot();
         snapshot.reclaim(71, 2);
         mem.commit(snapshot);
 
-        assert_eq!(mem.read(70, 4).as_ref(), &[0, 0, 0, 0]);
+        assert_eq!(mem.read(70, 4).as_ref(), [0, 0, 0, 0]);
     }
 
     #[test]
