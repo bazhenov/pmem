@@ -149,7 +149,11 @@ impl NFSFileSystem for RFS {
 
         let dir = fs.lookup_by_id(dirid).map_err(io_to_nfs_error)?;
 
-        let mut children = fs.readdir(&dir).map_err(io_to_nfs_error)?;
+        let mut children = fs
+            .readdir(&dir)
+            .map_err(io_to_nfs_error)?
+            .collect::<io::Result<Vec<_>>>()
+            .map_err(io_to_nfs_error)?;
         let start_idx = start_after as usize;
         if start_idx >= children.len() {
             return Ok(ReadDirResult {

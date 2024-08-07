@@ -299,6 +299,12 @@ impl<T> Debug for Ptr<T> {
     }
 }
 
+impl<T> PartialEq for Ptr<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.addr == other.addr
+    }
+}
+
 /// Need to implement Copy manually, because derive(Copy) is automatically
 /// adding `T: Copy` bound in auto-generated implementation
 impl<T> Copy for Ptr<T> {}

@@ -4,6 +4,7 @@ use pmem::{
 };
 use pmem_derive::Record;
 use std::{
+    cmp::Ordering,
     convert::Into,
     fmt,
     io::{self, Error, ErrorKind, Read, Seek, SeekFrom, Write},
@@ -107,9 +108,16 @@ impl Filesystem {
 
         let mut dir = self.lookup_inode(dir)?;
         let file_info = if let Some(children) = dir.children {
-            self.create_child(children, file_name, NodeType::File)?
+            let child = self
+                .create_child(children, file_name, NodeType::File)?
                 .ok()
-                .ok_or(ErrorKind::AlreadyExists)?
+                .ok_or(ErrorKind::AlreadyExists)?;
+            // Update the parent directory if the new child is the first in the list
+            if child.next == Some(children) {
+                dir.children = Some(child.ptr());
+                self.tx.update(&dir)?;
+            }
+            child
         } else {
             let new_node = self.write_fsnode(file_name, NodeType::File)?;
             dir.children = Some(new_node.ptr());
@@ -140,9 +148,16 @@ impl Filesystem {
         let mut parent = self.lookup_inode(parent)?;
 
         let directory_inode = if let Some(first_child) = parent.children {
-            self.create_child(first_child, name.as_ref(), NodeType::Directory)?
+            let new_child = self
+                .create_child(first_child, name.as_ref(), NodeType::Directory)?
                 .ok()
-                .ok_or(ErrorKind::AlreadyExists)?
+                .ok_or(ErrorKind::AlreadyExists)?;
+            // Update the parent directory if the new child is the first in the list
+            if new_child.next == Some(first_child) {
+                parent.children = Some(new_child.ptr());
+                self.tx.update(&parent)?;
+            }
+            new_child
         } else {
             let dir_inode = self.write_fsnode(name.as_ref(), NodeType::Directory)?;
             parent.children = Some(dir_inode.ptr());
@@ -157,21 +172,16 @@ impl Filesystem {
     ///
     /// Returns:
     /// - [ErrorKind::NotFound] if the directory does not exist
-    pub fn readdir(&self, dir: &FileMeta) -> Result<Vec<FileMeta>> {
+    pub fn readdir<'a>(
+        &'a self,
+        dir: &FileMeta,
+    ) -> Result<impl Iterator<Item = Result<FileMeta>> + 'a> {
         let parent = self.lookup_inode(dir)?;
 
-        if let Some(children) = parent.children {
-            let mut result = vec![];
-            let mut current_node = Some(children);
-            while let Some(node) = current_node {
-                let child = self.tx.lookup(node)?;
-                current_node = child.next;
-                result.push(FileMeta::from(child, &self.tx)?);
-            }
-            Ok(result)
-        } else {
-            Ok(vec![])
-        }
+        Ok(ReadDir {
+            fs: self,
+            next: parent.children,
+        })
     }
 
     /// Creates a directory and all its parents
@@ -241,28 +251,37 @@ impl Filesystem {
         Err(ErrorKind::NotFound.into())
     }
 
-    /// Returns `Ok(child)` if it was found otherwise create new [FileInfo] and returns `Err(new_child)`
+    /// Returns `Ok(child)` if it was created successfully otherwise returns existing child: `Err(child)`
     fn create_child(
         &mut self,
         start_node: Ptr<FNode>,
         name: &str,
         node_type: NodeType,
     ) -> Result<CreateResult> {
-        let mut prev_node = start_node;
+        let mut prev_node = None;
         let mut cur_node = Some(start_node);
         while let Some(node) = cur_node {
-            let value = self.tx.lookup(node)?;
-            let child_name = value.name(&self.tx)?;
-            if name == child_name.as_str() {
-                return Ok(CreateResult::Err(value));
+            let node = self.tx.lookup(node)?;
+            let child_name = node.name(&self.tx)?;
+            match child_name.as_str().cmp(name) {
+                Ordering::Equal => return Ok(CreateResult::Err(node)),
+                Ordering::Greater => break,
+                Ordering::Less => {
+                    prev_node = cur_node;
+                    cur_node = node.next;
+                }
             }
-            prev_node = node;
-            cur_node = value.next;
         }
-        let new_node = self.write_fsnode(name, node_type)?;
-        let mut prev_node = self.tx.lookup(prev_node)?;
-        prev_node.next = Some(new_node.ptr());
-        self.tx.update(&prev_node)?;
+
+        let mut new_node = self.write_fsnode(name, node_type)?;
+        new_node.next = cur_node;
+        self.tx.update(&new_node)?;
+
+        if let Some(prev_node) = prev_node {
+            let mut prev_node = self.tx.lookup(prev_node)?;
+            prev_node.next = Some(new_node.ptr());
+            self.tx.update(&prev_node)?;
+        }
 
         Ok(CreateResult::Ok(new_node))
     }
@@ -397,6 +416,28 @@ impl<'a> File<'a> {
                 Ok(tx.lookup(b_ptr)?)
             }
             _ => unimplemented!("File too large"),
+        }
+    }
+}
+
+struct ReadDir<'a> {
+    fs: &'a Filesystem,
+    next: Option<Ptr<FNode>>,
+}
+
+impl Iterator for ReadDir<'_> {
+    type Item = Result<FileMeta>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let Some(node) = self.next.take() else {
+            return None;
+        };
+        match self.fs.tx.lookup(node) {
+            Ok(child) => {
+                self.next = child.next;
+                Some(FileMeta::from(child, &self.fs.tx))
+            }
+            Err(e) => Some(Err(e.into())),
         }
     }
 }
@@ -875,20 +916,51 @@ mod tests {
     }
 
     #[test]
-    fn readdir() -> Result<()> {
+    fn readdir_directories() -> Result<()> {
         let mut fs = create_fs();
-
         let root = fs.get_root()?;
 
         let etc = fs.create_dir(&root, "etc")?;
         let bin = fs.create_dir(&root, "bin")?;
         let swap = fs.create_file(&root, "swap")?;
 
-        let children = fs.readdir(&root)?;
+        let children = fs.readdir(&root)?.collect::<Result<Vec<_>>>()?;
 
+        // All children should be present
         assert!(children.contains(&etc), "Root should contains etc");
         assert!(children.contains(&bin), "Root should contains bin");
         assert!(children.contains(&swap), "Root should contains spawn");
+
+        // The children should be sorted by name
+        assert!(children[0] == bin);
+        assert!(children[1] == etc);
+        assert!(children[2] == swap);
+
+        Ok(())
+    }
+
+    #[test]
+    fn readdir_files() -> Result<()> {
+        // At the moment we need to test the same logic for files, because there is
+        // duplicate in implementation that should go away after migration to BTree
+        let mut fs = create_fs();
+        let root = fs.get_root()?;
+
+        let etc = fs.create_file(&root, "etc")?;
+        let bin = fs.create_file(&root, "bin")?;
+        let swap = fs.create_file(&root, "swap")?;
+
+        let children = fs.readdir(&root)?.collect::<Result<Vec<_>>>()?;
+
+        // All children should be present
+        assert!(children.contains(&etc), "Root should contains etc");
+        assert!(children.contains(&bin), "Root should contains bin");
+        assert!(children.contains(&swap), "Root should contains spawn");
+
+        // The children should be sorted by name
+        assert!(children[0] == bin);
+        assert!(children[1] == etc);
+        assert!(children[2] == swap);
 
         Ok(())
     }
