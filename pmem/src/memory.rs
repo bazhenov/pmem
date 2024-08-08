@@ -82,6 +82,7 @@ impl Memory {
         }
     }
 
+    // Start a transaction at a specific LSN or after
     pub fn start_at(&self, lsn: u64) -> Result<Transaction> {
         Ok(Transaction {
             snapshot: self.pool.snapshot_at(lsn)?,

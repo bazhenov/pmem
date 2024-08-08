@@ -465,6 +465,7 @@ impl Iterator for ReadDir<'_> {
 }
 
 #[cfg_attr(test, derive(Debug))]
+#[derive(Clone)]
 pub enum Change {
     Added(FileMeta),
     Deleted(FileMeta),
@@ -472,6 +473,7 @@ pub enum Change {
 }
 
 impl Change {
+    #[cfg(test)]
     fn take_if_added(self) -> Option<FileMeta> {
         match self {
             Change::Added(meta) => Some(meta),
@@ -479,6 +481,7 @@ impl Change {
         }
     }
 
+    #[cfg(test)]
     fn take_if_deleted(self) -> Option<FileMeta> {
         match self {
             Change::Deleted(meta) => Some(meta),
@@ -513,24 +516,27 @@ impl<'a> Iterator for Changes<'a> {
     type Item = Result<Change>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // let a_node = self.a_nodes.pop()?;
-        // let b_node = self.b_nodes.pop()?;
-        //
-
         let a = self.cur_a.take().or_else(|| self.readdir_a.next());
         let b = self.cur_b.take().or_else(|| self.readdir_b.next());
 
         let a = transpose_unwrap!(a);
         let b = transpose_unwrap!(b);
 
-        dbg!(&a);
-        dbg!(&b);
-
         match (a, b) {
             (None, None) => None,
             (Some(a), None) => Some(Ok(Change::Deleted(a))),
             (None, Some(b)) => Some(Ok(Change::Added(b))),
-            _ => todo!(),
+            (Some(a), Some(b)) => match a.name.cmp(&b.name) {
+                Ordering::Less => {
+                    self.cur_b = Some(Ok(b));
+                    Some(Ok(Change::Deleted(a)))
+                }
+                Ordering::Greater => {
+                    self.cur_a = Some(Ok(a));
+                    Some(Ok(Change::Added(b)))
+                }
+                Ordering::Equal => todo!(),
+            },
         }
     }
 }
@@ -1073,27 +1079,37 @@ mod tests {
 
     #[test]
     fn detect_changes() -> Result<()> {
-        let (fs_a, mut mem) = create_fs();
+        let (mut fs_a, mut mem) = create_fs();
+        mkdirs(&mut fs_a, &["/etc"]);
         let lsn_a = mem.commit(fs_a.finish());
+
         let mut fs_b = Filesystem::open(mem.start_at(lsn_a)?);
-
-        mkdirs(&mut fs_b, &["/etc"]);
-
+        fs_b.delete(&fs_b.get_root().unwrap(), "etc").unwrap();
+        mkdirs(&mut fs_b, &["/bin"]);
         let lsn_b = mem.commit(fs_b.finish());
 
         let fs_a = Filesystem::open(mem.start_at(lsn_a)?);
         let fs_b = Filesystem::open(mem.start_at(lsn_b)?);
 
-        let added = fs_b.changes_from(&fs_a)?.collect::<Result<Vec<_>>>()?;
+        let changes = fs_b.changes_from(&fs_a)?.collect::<Result<Vec<_>>>()?;
 
-        let added = added
+        let deleted = changes
+            .clone()
+            .into_iter()
+            .filter_map(Change::take_if_deleted)
+            .collect::<Vec<_>>();
+        let added = changes
             .into_iter()
             .filter_map(Change::take_if_added)
             .collect::<Vec<_>>();
 
         assert_eq!(added.len(), 1);
-        assert_eq!(added[0].name, "etc");
+        assert_eq!(added[0].name, "bin");
         assert_eq!(added[0].node_type, NodeType::Directory);
+
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].name, "etc");
+        assert_eq!(deleted[0].node_type, NodeType::Directory);
 
         Ok(())
     }
@@ -1220,7 +1236,7 @@ mod tests {
         (Filesystem::allocate(tx), mem)
     }
 
-    #[cfg(not(miri))]
+    //#[cfg(not(miri))]
     mod proptests {
         use super::*;
         use pmem::page::PagePool;
