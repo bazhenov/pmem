@@ -176,6 +176,10 @@ impl Filesystem {
         &'a self,
         dir: &FileMeta,
     ) -> Result<impl Iterator<Item = Result<FileMeta>> + 'a> {
+        self.do_readdir(dir)
+    }
+
+    fn do_readdir<'a>(&'a self, dir: &FileMeta) -> Result<ReadDir> {
         let parent = self.lookup_inode(dir)?;
 
         Ok(ReadDir {
@@ -207,11 +211,20 @@ impl Filesystem {
         FileMeta::from(node, &self.tx)
     }
 
-    pub fn changes<'a>(&'a self, other: &'a Self) -> impl Iterator<Item = Result<Change>> + 'a {
-        Changes {
-            _a: self,
-            _b: other,
-        }
+    pub fn changes_from<'a>(
+        &'a self,
+        other: &'a Self,
+    ) -> Result<impl Iterator<Item = Result<Change>> + 'a> {
+        Ok(Changes {
+            a: other,
+            b: self,
+            a_nodes: vec![other.get_root()?],
+            b_nodes: vec![self.get_root()?],
+            readdir_a: other.do_readdir(&other.get_root()?)?,
+            readdir_b: self.do_readdir(&self.get_root()?)?,
+            cur_a: None,
+            cur_b: None,
+        })
     }
 
     pub fn finish(self) -> Transaction {
@@ -451,18 +464,74 @@ impl Iterator for ReadDir<'_> {
     }
 }
 
-pub enum Change {}
+#[cfg_attr(test, derive(Debug))]
+pub enum Change {
+    Added(FileMeta),
+    Deleted(FileMeta),
+    Updated(FileMeta),
+}
+
+impl Change {
+    fn take_if_added(self) -> Option<FileMeta> {
+        match self {
+            Change::Added(meta) => Some(meta),
+            _ => None,
+        }
+    }
+
+    fn take_if_deleted(self) -> Option<FileMeta> {
+        match self {
+            Change::Deleted(meta) => Some(meta),
+            _ => None,
+        }
+    }
+}
+
+macro_rules! transpose_unwrap {
+    ($expr:expr) => {
+        match $expr {
+            Some(Err(e)) => return Some(Err(e)),
+            Some(Ok(val)) => Some(val),
+            None => None,
+        }
+    };
+}
 
 pub struct Changes<'a> {
-    _a: &'a Filesystem,
-    _b: &'a Filesystem,
+    a: &'a Filesystem,
+    b: &'a Filesystem,
+    a_nodes: Vec<FileMeta>,
+    b_nodes: Vec<FileMeta>,
+    readdir_a: ReadDir<'a>,
+    readdir_b: ReadDir<'a>,
+
+    cur_a: Option<Result<FileMeta>>,
+    cur_b: Option<Result<FileMeta>>,
 }
 
 impl<'a> Iterator for Changes<'a> {
     type Item = Result<Change>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        todo!()
+        // let a_node = self.a_nodes.pop()?;
+        // let b_node = self.b_nodes.pop()?;
+        //
+
+        let a = self.cur_a.take().or_else(|| self.readdir_a.next());
+        let b = self.cur_b.take().or_else(|| self.readdir_b.next());
+
+        let a = transpose_unwrap!(a);
+        let b = transpose_unwrap!(b);
+
+        dbg!(&a);
+        dbg!(&b);
+
+        match (a, b) {
+            (None, None) => None,
+            (Some(a), None) => Some(Ok(Change::Deleted(a))),
+            (None, Some(b)) => Some(Ok(Change::Added(b))),
+            _ => todo!(),
+        }
     }
 }
 
@@ -1003,22 +1072,28 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "WIP"]
     fn detect_changes() -> Result<()> {
         let (fs_a, mut mem) = create_fs();
-
         let lsn_a = mem.commit(fs_a.finish());
-
         let mut fs_b = Filesystem::open(mem.start_at(lsn_a)?);
-        fs_b.create_dirs("/etc")?;
+
+        mkdirs(&mut fs_b, &["/etc"]);
+
         let lsn_b = mem.commit(fs_b.finish());
 
         let fs_a = Filesystem::open(mem.start_at(lsn_a)?);
         let fs_b = Filesystem::open(mem.start_at(lsn_b)?);
 
-        assert_not_exists!(fs_a, "/etc");
-        assert_exists!(fs_b, "/etc");
-        let _changes = fs_b.changes(&fs_a);
+        let added = fs_b.changes_from(&fs_a)?.collect::<Result<Vec<_>>>()?;
+
+        let added = added
+            .into_iter()
+            .filter_map(Change::take_if_added)
+            .collect::<Vec<_>>();
+
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0].name, "etc");
+        assert_eq!(added[0].node_type, NodeType::Directory);
 
         Ok(())
     }
@@ -1131,6 +1206,12 @@ mod tests {
         assert_eq!(block_idx(BLOCK_SIZE as u64 - 1), 0);
         assert_eq!(block_idx(BLOCK_SIZE as u64), 1);
         assert_eq!(block_idx(BLOCK_SIZE as u64 + 1), 1);
+    }
+
+    fn mkdirs(fs: &mut Filesystem, content: &[&str]) {
+        for path in content {
+            fs.create_dirs(path).unwrap();
+        }
     }
 
     fn create_fs() -> (Filesystem, Memory) {
