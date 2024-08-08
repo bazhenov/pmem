@@ -179,7 +179,7 @@ impl Filesystem {
         self.do_readdir(dir)
     }
 
-    fn do_readdir<'a>(&'a self, dir: &FileMeta) -> Result<ReadDir> {
+    fn do_readdir(&self, dir: &FileMeta) -> Result<ReadDir> {
         let parent = self.lookup_inode(dir)?;
 
         Ok(ReadDir {
@@ -1283,6 +1283,33 @@ mod tests {
 
                 prop_assert_eq!(file_buf, shadow_file_buf);
             }
+
+            #[test]
+            fn test_create_entries(actions in vec(any_fs_action(), 1..100)) {
+                let (mut fs, _) = create_fs();
+                let mut cwd = PathBuf::from("/");
+
+                for action in actions {
+                    let parent = fs.find(cwd.to_str().unwrap()).unwrap();
+                    assert!(parent.node_type == NodeType::Directory);
+
+                    match action {
+                        FsAction::CreateDirectory(ref name) => {
+                            fs.create_dir(&parent, &name).unwrap();
+                            cwd.push(name);
+                        }
+                        FsAction::CreateFile(ref name) => {
+                            fs.create_file(&parent, &name).unwrap();
+                        },
+                        FsAction::GoToParent => {
+                            cwd.pop();
+                        },
+                        FsAction::GoToRoot => {
+                            cwd = PathBuf::from("/");
+                        }
+                    }
+                }
+            }
         }
 
         fn any_write_operation() -> impl Strategy<Value = WriteOperation> {
@@ -1302,6 +1329,27 @@ mod tests {
             let from_current = seek_range.prop_map(SeekFrom::Current);
 
             prop_oneof![from_end, from_start, from_current].prop_map(WriteOperation::Seek)
+        }
+
+        fn any_fs_action() -> impl Strategy<Value = FsAction> {
+            prop_oneof![
+                any_file_name().prop_map(|name| FsAction::CreateFile(name)),
+                any_file_name().prop_map(|name| FsAction::CreateDirectory(name)),
+                Just(FsAction::GoToParent),
+                Just(FsAction::GoToRoot),
+            ]
+        }
+
+        fn any_file_name() -> impl Strategy<Value = String> {
+            "[0-9a-f]{8}"
+        }
+
+        #[derive(Debug, Clone)]
+        enum FsAction {
+            CreateFile(String),
+            CreateDirectory(String),
+            GoToParent,
+            GoToRoot,
         }
     }
 
