@@ -250,7 +250,7 @@ fn io_to_nfs_error(e: io::Error) -> nfsstat3 {
 fn to_dir_entry(meta: FileMeta) -> DirEntry {
     let attr = create_fattr(&meta);
     let fileid = meta.fid;
-    let name = nfsstring(meta.name.into_bytes());
+    let name = nfsstring(meta.name().to_string().into_bytes());
     DirEntry { fileid, name, attr }
 }
 

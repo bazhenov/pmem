@@ -105,7 +105,11 @@ impl Buf {
                 let len = patch.len();
                 buf[offset..offset + len].copy_from_slice(patch);
             }
-            delta = d.next.clone();
+
+            delta = {
+                #[allow(clippy::assigning_clones)]
+                d.next.clone()
+            };
         }
         lsn
     }

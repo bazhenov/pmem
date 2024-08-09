@@ -110,6 +110,7 @@ fn create_test_file(fs: &mut Filesystem, file_size: u64) -> FileMeta {
 }
 
 fn navigate_directories(b: Bencher) -> Box<dyn Sampler> {
+    // TODO: How to create this setup only once?
     let mut rnd = SmallRng::seed_from_u64(b.seed);
     let mut fs = create_fs();
 
