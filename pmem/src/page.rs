@@ -533,11 +533,11 @@ impl CommittedSnapshot {
 
 impl Drop for CommittedSnapshot {
     /// Custom drop logic is necessary here to prevent a stack overflow that could
-    /// occur due to recursive drop calls on a long chain of `Rc` references to base snapshot.
-    /// Each `Rc` decrement could potentially trigger the drop of another `Rc` in the chain,
+    /// occur due to recursive drop calls on a long chain of `Arc` references to base snapshot.
+    /// Each `Arc` decrement could potentially trigger the drop of another `Arc` in the chain,
     /// leading to deep recursion.
     ///
-    /// By explicitly unwrapping and handling the inner `Rc` references, we ensure that the drop sequence
+    /// By explicitly unwrapping and handling the inner `Arc` references, we ensure that the drop sequence
     /// is performed without any recursion
     fn drop(&mut self) {
         let mut next_base = self.base.take();

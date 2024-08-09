@@ -1,22 +1,23 @@
 //! This test is exploring the algorithm of sharing a buffer between multiple threads
-//! without using locks. The buffer is updated by one thread only, but may be read by multiple threads.
+//! without using locks. The buffer is updated by one thread only (the writer), but may be read by
+//! multiple threads (readers).
 //!
 //! Consistency is guaranteed by maintaining a list of inverse (restoring) patches that allows the reader to
 //! fix the buffer that is being read without any locks. The inverse patch allows to restore previous
 //! versions of the buffer. The writer thread saves the inverse patch before updating the buffer. The reader
 //! thread reads the buffer (possibly inconsistent), and then uses the inverse patches to restore the buffer
-//! at a specific LSN.
+//! at a specific version (LSN).
 //!
 //! Buffer update protocol:
 //!
 //! # Writing side
 //! 1. generate new LSN, but not update it yet
-//! 2. create new inverse patch with new LSN and push it to the list
+//! 2. based on new data create inverse patches with new LSN and publish them atomically
 //! 3. update the buffer itself with the new data
-//! 4. update the lsn
+//! 4. update the LSN atomically
 //!
 //! # Reading side
-//! 1. read the last lsn and save a copy to snapshot
+//! 1. read the last LSN
 //! 2. read the latest buffer, which may be inconsistent
 //! 3. read the last delta reference
 //! 4. updates all the delta patches that are greater than LSN from step (1).
@@ -30,7 +31,8 @@
 //! always see the patches required to restore requested LSN, even if the buffer is inconsistent.
 //! Form (1), (2) and (3) we can see that this rule is always satisfied.
 //!
-//! Thus, the reader will always see the patches required to restore requested LSN.
+//! Thus, the reader will always see the patches required to restore requested LSN content and is able to
+//! fix possibly inconsistent buffer.
 
 use arc_swap::ArcSwap;
 use rand::{rngs::SmallRng, Rng, SeedableRng};
@@ -44,18 +46,27 @@ use std::{
     thread,
 };
 
+// Size of a buffer for the test
 const SIZE: usize = 1 << 16;
 
-struct Buf {
+// Number of threads for the test (readers)
+const THREADS: usize = 4;
+
+const ITERATIONS: usize = 1_000_000;
+
+struct Buffer {
     lsn: AtomicU64,
     data: Box<Cell<[u8]>>,
     snapshots: ArcSwap<Delta>,
 }
 
-unsafe impl Sync for Buf {}
-unsafe impl Send for Buf {}
+unsafe impl Sync for Buffer {}
+unsafe impl Send for Buffer {}
 
-impl Buf {
+impl Buffer {
+    /// Write patches to the buffer
+    ///
+    /// Each patch is a tuple of offset and data to be written to the buffer
     fn write(self: &Arc<Self>, patches: Vec<(usize, Vec<u8>)>) {
         let d = self.data.as_ptr() as *const UnsafeCell<[u8]>;
         let b: &mut [u8] = unsafe { &mut *UnsafeCell::raw_get(d) };
@@ -121,16 +132,27 @@ struct Delta {
     next: Option<Arc<Self>>,
 }
 
-fn main() {
-    for _ in 0..100 {
-        run_single_pass();
+impl Drop for Delta {
+    /// Custom drop logic is necessary here to prevent a stack overflow that could
+    /// occur due to recursive drop calls on a long chain of `Arc` references to base snapshot.
+    /// Each `Arc` decrement could potentially trigger the drop of another `Arc` in the chain,
+    /// leading to deep recursion.
+    ///
+    /// By explicitly unwrapping and handling the inner `Arc` references, we ensure that the drop sequence
+    /// is performed without any recursion
+    fn drop(&mut self) {
+        let mut next_base = self.next.take();
+        while let Some(base) = next_base {
+            next_base = Arc::try_unwrap(base)
+                .map(|mut base| base.next.take())
+                .unwrap_or(None);
+        }
     }
-    println!("Ok");
 }
 
-fn run_single_pass() {
+fn main() {
     let mut state = [0u8; SIZE];
-    let buf = Arc::new(Buf {
+    let buf = Arc::new(Buffer {
         data: Box::new(Cell::new(state)),
         lsn: AtomicU64::new(0),
         snapshots: ArcSwap::from_pointee(Delta {
@@ -140,20 +162,23 @@ fn run_single_pass() {
         }),
     });
 
-    let iterations = 1000;
     // Spawning threads that reads buffer and checks consistency
     let mut handles = vec![];
-    for _ in 0..4 {
-        let buf = buf.clone();
+    for _ in 0..THREADS {
+        let buf = Arc::clone(&buf);
         let handle = thread::spawn(move || {
-            check_read_consistency(buf, iterations);
+            // By using number of iterations as max_lsn we make sure that
+            // readers are able to progress and will see the most up to date
+            // version eventually
+            let max_lsn = ITERATIONS as u64;
+            check_read_consistency(buf, max_lsn);
         });
         handles.push(handle);
     }
 
     // Updating buffer with random patches but keeping the sum of the buffer to be 0
     let mut rnd = SmallRng::from_entropy();
-    for _ in 0..iterations {
+    for _ in 0..ITERATIONS {
         let mut patches = random_patches(&mut rnd, SIZE, 40);
 
         // mirroring changes on the local buffer to be able to calculate the compensator
@@ -175,13 +200,22 @@ fn run_single_pass() {
     for handle in handles {
         handle.join().unwrap();
     }
+
+    println!("Ok");
 }
 
-fn check_read_consistency(buf: Arc<Buf>, max_lsn: u64) {
+fn check_read_consistency(buf: Arc<Buffer>, max_lsn: u64) {
     let mut b = vec![0u8; SIZE];
     let mut read_lsn = 0;
     while read_lsn < max_lsn {
-        read_lsn = buf.read(&mut b, 0);
+        let lsn = buf.read(&mut b, 0);
+        assert!(
+            lsn >= read_lsn,
+            "Memory ordering violated. We've got stale LSN (latest LSN: {}, lsn: {})",
+            read_lsn,
+            lsn
+        );
+        read_lsn = lsn;
         let sum = slice_wrapping_sum(&b);
         assert_eq!(sum, 0, "Mismatch found. LSN: {}, data: {:?}", read_lsn, b);
     }
