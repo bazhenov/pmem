@@ -218,13 +218,12 @@ impl Filesystem {
     }
 
     pub fn changes_from<'a>(&'a self, other: &'a Self) -> impl Iterator<Item = Changed> + 'a {
+        let a = other.do_readdir(&other.get_root().unwrap());
+        let b = self.do_readdir(&self.get_root().unwrap());
         Changes {
             a_fs: other,
             b_fs: self,
-            stack: vec![(
-                other.do_readdir(&other.get_root().unwrap()).peekable(),
-                self.do_readdir(&self.get_root().unwrap()).peekable(),
-            )],
+            stack: vec![Join::new(a, b)],
             path: Rc::new(PathBuf::from("/")),
         }
     }
@@ -547,7 +546,7 @@ pub struct Changes<'a> {
     ///
     /// Each time we encounter a directory, we push two iterators to the stack. Thus effectively
     /// we are implementing a depth-first search of the directory tree.
-    stack: Vec<(Peekable<ReadDir<'a>>, Peekable<ReadDir<'a>>)>,
+    stack: Vec<Join<ReadDir<'a>>>,
     path: Rc<PathBuf>,
 }
 
@@ -576,13 +575,11 @@ impl<'a> Changes<'a> {
 
         let dir_a = dir_a
             .map(|dir| self.a_fs.do_readdir(dir))
-            .unwrap_or(ReadDir::empty(self.a_fs))
-            .peekable();
+            .unwrap_or(ReadDir::empty(self.a_fs));
         let dir_b = dir_b
             .map(|dir| self.b_fs.do_readdir(dir))
-            .unwrap_or(ReadDir::empty(self.b_fs))
-            .peekable();
-        self.stack.push((dir_a, dir_b));
+            .unwrap_or(ReadDir::empty(self.b_fs));
+        self.stack.push(Join::new(dir_a, dir_b));
     }
 }
 
@@ -591,46 +588,17 @@ impl<'a> Iterator for Changes<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         while !self.stack.is_empty() {
-            let (dir_a, dir_b) = self.stack.last_mut().unwrap();
+            let join = self.stack.last_mut().unwrap();
             // println!(
             //     "Comparing: {:?} <=> {:?}",
             //     a.map(FileMeta::name),
             //     b.map(FileMeta::name)
             // );
 
-            let next_item = match (dir_a.peek(), dir_b.peek()) {
-                (None, None) => {
-                    // current directory is exhausted, moving to the parent
-                    self.stack.pop();
-                    Rc::make_mut(&mut self.path).pop();
-                    continue;
-                }
-                (Some(_), None) => {
-                    // All items in B have been exhausted, all remaining items in A are deleted
-                    let a = dir_a.next().unwrap();
-                    let path = Rc::clone(&self.path);
-                    if a.is_directory() {
-                        // println!("Pushing {} to stack", a.name());
-                        self.push_to_stack(Some(&a), None);
-                        Rc::make_mut(&mut self.path).push(a.name());
-                    }
-                    Changed::deleted(&path, a)
-                }
-                (None, Some(_)) => {
-                    // All items in A have been exhausted, all remaining items in B are added
-                    let b = dir_b.next().unwrap();
-                    let path = Rc::clone(&self.path);
-                    if b.is_directory() {
-                        // println!("Pushing {} to stack", b.name());
-                        self.push_to_stack(None, Some(&b));
-                        Rc::make_mut(&mut self.path).push(b.name());
-                    }
-                    Changed::added(&path, b)
-                }
-                (Some(a), Some(b)) => match a.name().cmp(b.name()) {
-                    Ordering::Less => {
-                        // A has an item that B does not have, it means it was deleted in B
-                        let a = dir_a.next().unwrap();
+            let next_yielded_item = if let Some((dir_a, dir_b)) = join.next() {
+                match (dir_a, dir_b) {
+                    (Some(a), None) => {
+                        // All items in B have been exhausted, all remaining items in A are deleted
                         let path = Rc::clone(&self.path);
                         if a.is_directory() {
                             // println!("Pushing {} to stack", a.name());
@@ -639,9 +607,9 @@ impl<'a> Iterator for Changes<'a> {
                         }
                         Changed::deleted(&path, a)
                     }
-                    Ordering::Greater => {
-                        // B has an item that A does not have, it means it was added in B
-                        let b = dir_b.next().unwrap();
+
+                    (None, Some(b)) => {
+                        // All items in A have been exhausted, all remaining items in B are added
                         let path = Rc::clone(&self.path);
                         if b.is_directory() {
                             // println!("Pushing {} to stack", b.name());
@@ -650,29 +618,61 @@ impl<'a> Iterator for Changes<'a> {
                         }
                         Changed::added(&path, b)
                     }
-                    Ordering::Equal if a.node_type == b.node_type => {
-                        // Both A and B have the same item, inspecting children if it's a directory
-                        let a = dir_a.next().unwrap();
-                        let b = dir_b.next().unwrap();
-                        if a.node_type == NodeType::Directory {
-                            // println!("Pushing {} to stack", a.name());
-                            self.push_to_stack(Some(&a), Some(&b));
-                            Rc::make_mut(&mut self.path).push(a.name());
+
+                    (Some(a), Some(b)) => match a.name().cmp(b.name()) {
+                        Ordering::Less => {
+                            // A has an item that B does not have, it means it was deleted in B
+                            let path = Rc::clone(&self.path);
+                            if a.is_directory() {
+                                // println!("Pushing {} to stack", a.name());
+                                self.push_to_stack(Some(&a), None);
+                                Rc::make_mut(&mut self.path).push(a.name());
+                            }
+                            Changed::deleted(&path, a)
                         }
-                        continue;
-                    }
-                    Ordering::Equal => {
-                        // here we have a situation when both A and B has changed. A has been
-                        // removed and B with the same name has been added.
-                        // We can't return two changes at once here, so we returning only one change
-                        // and we rely on the fact that the next call to next() will return another change
-                        // because it was not removed from peekable iterator.
-                        let a = dir_a.next().unwrap();
-                        Changed::deleted(&self.path, a)
-                    }
-                },
+
+                        Ordering::Greater => {
+                            // B has an item that A does not have, it means it was added in B
+                            let path = Rc::clone(&self.path);
+                            if b.is_directory() {
+                                // println!("Pushing {} to stack", b.name());
+                                self.push_to_stack(None, Some(&b));
+                                Rc::make_mut(&mut self.path).push(b.name());
+                            }
+                            Changed::added(&path, b)
+                        }
+
+                        Ordering::Equal if a.node_type == b.node_type => {
+                            // Both A and B have the same item, inspecting children if it's a directory
+                            if a.node_type == NodeType::Directory {
+                                // println!("Pushing {} to stack", a.name());
+                                self.push_to_stack(Some(&a), Some(&b));
+                                Rc::make_mut(&mut self.path).push(a.name());
+                            }
+                            continue;
+                        }
+
+                        Ordering::Equal => {
+                            // here we have a situation when both A and B has changed. A has been
+                            // removed and B with the same name has been added.
+                            // We can't return two changes at once here, so we returning only one change
+                            // and we rely on the fact that the next call to next() will return another change
+                            // because it was not removed from peekable iterator.
+                            Changed::deleted(&self.path, a)
+                        }
+                    },
+
+                    // Join emits items until at least one of the iterators has any items,
+                    // so this state is not possible
+                    (None, None) => unreachable!(),
+                }
+            } else {
+                // Both directories are exhausted, popping the stack
+                self.stack.pop();
+                Rc::make_mut(&mut self.path).pop();
+                continue;
             };
-            return Some(next_item);
+            return Some(next_yielded_item);
         }
         None
     }
@@ -847,6 +847,20 @@ impl FileMeta {
     }
 }
 
+impl Ord for FileMeta {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.name.cmp(&other.name)
+    }
+}
+
+impl PartialOrd for FileMeta {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Eq for FileMeta {}
+
 #[derive(Clone, Debug, Record)]
 struct FNode {
     name: Str,
@@ -979,6 +993,36 @@ struct Str(SlicePtr<u8>);
 impl fmt::Debug for Str {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_fmt(format_args!("Str({:?})", &self.0))
+    }
+}
+
+/// Join two sorted iterators into a single iterator that yields pairs of equal elements
+///
+/// The input iterators must be sorted in ascending order. If there is no pair for an element
+/// from one of the iterators, the corresponding element in the pair will be `None`.
+struct Join<I: Iterator>(Peekable<I>, Peekable<I>);
+
+impl<T, I: Iterator<Item = T>> Join<I> {
+    fn new(a: I, b: I) -> Self {
+        Self(a.peekable(), b.peekable())
+    }
+}
+
+impl<T: Ord, I: Iterator<Item = T>> Iterator for Join<I> {
+    type Item = (Option<T>, Option<T>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let Join(a_iter, b_iter) = self;
+        match (a_iter.peek(), b_iter.peek()) {
+            (Some(a), Some(b)) => match a.cmp(b) {
+                Ordering::Less => Some((a_iter.next(), None)),
+                Ordering::Equal => Some((a_iter.next(), b_iter.next())),
+                Ordering::Greater => Some((None, b_iter.next())),
+            },
+            (Some(_), None) => Some((a_iter.next(), None)),
+            (None, Some(_)) => Some((None, b_iter.next())),
+            (None, None) => None,
+        }
     }
 }
 
@@ -1601,36 +1645,6 @@ mod tests {
             .with(fmt_layer)
             .with(filter_layer)
             .init();
-    }
-
-    /// Join two sorted iterators into a single iterator that yields pairs of equal elements
-    ///
-    /// The input iterators must be sorted in ascending order. If there is no pair for an element
-    /// from one of the iterators, the corresponding element in the pair will be `None`.
-    struct Join<I: Iterator>(Peekable<I>, Peekable<I>);
-
-    impl<T, I: Iterator<Item = T>> Join<I> {
-        fn new(a: I, b: I) -> Self {
-            Self(a.peekable(), b.peekable())
-        }
-    }
-
-    impl<T: Ord, I: Iterator<Item = T>> Iterator for Join<I> {
-        type Item = (Option<T>, Option<T>);
-
-        fn next(&mut self) -> Option<Self::Item> {
-            let Join(a_iter, b_iter) = self;
-            match (a_iter.peek(), b_iter.peek()) {
-                (Some(a), Some(b)) => match a.cmp(b) {
-                    Ordering::Less => Some((a_iter.next(), None)),
-                    Ordering::Equal => Some((a_iter.next(), b_iter.next())),
-                    Ordering::Greater => Some((None, b_iter.next())),
-                },
-                (Some(_), None) => Some((a_iter.next(), None)),
-                (None, Some(_)) => Some((None, b_iter.next())),
-                (None, None) => None,
-            }
-        }
     }
 
     // #[cfg(not(miri))]
