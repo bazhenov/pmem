@@ -219,10 +219,10 @@ impl Filesystem {
 
     pub fn changes_from<'a>(&'a self, other: &'a Self) -> impl Iterator<Item = Changed> + 'a {
         Changes {
-            _a: other,
-            _b: self,
-            readdir_a: vec![other.do_readdir(&other.get_root().unwrap()).peekable()],
-            readdir_b: vec![self.do_readdir(&self.get_root().unwrap()).peekable()],
+            a_fs: other,
+            b_fs: self,
+            a_stack: vec![other.do_readdir(&other.get_root().unwrap()).peekable()],
+            b_stack: vec![self.do_readdir(&self.get_root().unwrap()).peekable()],
             path: Rc::new(PathBuf::from("/")),
         }
     }
@@ -537,103 +537,129 @@ macro_rules! transpose_unwrap {
 }
 
 pub struct Changes<'a> {
-    _a: &'a Filesystem,
-    _b: &'a Filesystem,
-    readdir_a: Vec<Peekable<ReadDir<'a>>>,
-    readdir_b: Vec<Peekable<ReadDir<'a>>>,
+    a_fs: &'a Filesystem,
+    b_fs: &'a Filesystem,
+    a_stack: Vec<Peekable<ReadDir<'a>>>,
+    b_stack: Vec<Peekable<ReadDir<'a>>>,
     path: Rc<PathBuf>,
+}
+
+impl<'a> Changes<'a> {
+    /// Adds two directories to the stack
+    fn push_to_stack(&mut self, dir_a: Option<&FileMeta>, dir_b: Option<&FileMeta>) {
+        if dir_a.is_some() && dir_b.is_some() {
+            let dir_a = dir_a.unwrap();
+            let dir_b = dir_b.unwrap();
+            debug_assert!(
+                dir_a.name == dir_b.name,
+                "Directories must have the same name. {:?} != {:?}",
+                dir_a,
+                dir_b,
+            );
+        }
+
+        let dir_a = dir_a
+            .map(|dir| self.a_fs.do_readdir(dir))
+            .unwrap_or(ReadDir::empty(self.a_fs))
+            .peekable();
+        let dir_b = dir_b
+            .map(|dir| self.b_fs.do_readdir(dir))
+            .unwrap_or(ReadDir::empty(self.b_fs))
+            .peekable();
+        self.a_stack.push(dir_a);
+        self.b_stack.push(dir_b);
+    }
 }
 
 impl<'a> Iterator for Changes<'a> {
     type Item = Changed;
 
     fn next(&mut self) -> Option<Self::Item> {
-        while !self.readdir_a.is_empty() && !self.readdir_b.is_empty() {
-            let readdir_a = self.readdir_a.last_mut().unwrap();
-            let readdir_b = self.readdir_b.last_mut().unwrap();
-            let a = readdir_a.peek();
-            let b = readdir_b.peek();
+        while !self.a_stack.is_empty() && !self.b_stack.is_empty() {
+            let dir_a = self.a_stack.last_mut().unwrap();
+            let dir_b = self.b_stack.last_mut().unwrap();
+            // println!(
+            //     "Comparing: {:?} <=> {:?}",
+            //     a.map(FileMeta::name),
+            //     b.map(FileMeta::name)
+            // );
 
-            println!(
-                "Comparing: {:?} <=> {:?}",
-                a.map(FileMeta::name),
-                b.map(FileMeta::name)
-            );
-
-            match (a, b) {
+            let next_item = match (dir_a.peek(), dir_b.peek()) {
                 (None, None) => {
-                    // current directory is exhausted
-                    self.readdir_a.pop();
-                    self.readdir_b.pop();
+                    // current directory is exhausted, moving to the parent
+                    self.a_stack.pop();
+                    self.b_stack.pop();
                     Rc::make_mut(&mut self.path).pop();
+                    continue;
                 }
                 (Some(_), None) => {
-                    let a = readdir_a.next().unwrap();
+                    // All items in B have been exhausted, all remaining items in A are deleted
+                    let a = dir_a.next().unwrap();
                     let path = Rc::clone(&self.path);
                     if a.is_directory() {
                         // println!("Pushing {} to stack", a.name());
-                        self.readdir_a.push(self._a.do_readdir(&a).peekable());
-                        self.readdir_b.push(ReadDir::empty(self._b).peekable());
+                        self.push_to_stack(Some(&a), None);
                         Rc::make_mut(&mut self.path).push(a.name());
                     }
-                    return Some(Changed::deleted(&path, a));
+                    Changed::deleted(&path, a)
                 }
                 (None, Some(_)) => {
-                    let b = readdir_b.next().unwrap();
+                    // All items in A have been exhausted, all remaining items in B are added
+                    let b = dir_b.next().unwrap();
                     let path = Rc::clone(&self.path);
                     if b.is_directory() {
                         // println!("Pushing {} to stack", b.name());
-                        self.readdir_a.push(ReadDir::empty(self._a).peekable());
-                        self.readdir_b.push(self._b.do_readdir(&b).peekable());
+                        self.push_to_stack(None, Some(&b));
                         Rc::make_mut(&mut self.path).push(b.name());
                     }
-                    return Some(Changed::added(&path, b));
+                    Changed::added(&path, b)
                 }
                 (Some(a), Some(b)) => match a.name().cmp(b.name()) {
                     Ordering::Less => {
-                        let a = readdir_a.next().unwrap();
+                        // A has an item that B does not have, it means it was deleted in B
+                        let a = dir_a.next().unwrap();
                         let path = Rc::clone(&self.path);
                         if a.is_directory() {
                             // println!("Pushing {} to stack", a.name());
-                            self.readdir_a.push(self._a.do_readdir(&a).peekable());
-                            self.readdir_b.push(ReadDir::empty(self._b).peekable());
+                            self.push_to_stack(Some(&a), None);
                             Rc::make_mut(&mut self.path).push(a.name());
                         }
-                        return Some(Changed::deleted(&path, a));
+                        Changed::deleted(&path, a)
                     }
                     Ordering::Greater => {
-                        let b = readdir_b.next().unwrap();
+                        // B has an item that A does not have, it means it was added in B
+                        let b = dir_b.next().unwrap();
                         let path = Rc::clone(&self.path);
                         if b.is_directory() {
                             // println!("Pushing {} to stack", b.name());
-                            self.readdir_a.push(ReadDir::empty(self._a).peekable());
-                            self.readdir_b.push(self._b.do_readdir(&b).peekable());
+                            self.push_to_stack(None, Some(&b));
                             Rc::make_mut(&mut self.path).push(b.name());
                         }
-                        return Some(Changed::added(&path, b));
+                        Changed::added(&path, b)
+                    }
+                    Ordering::Equal if a.node_type == b.node_type => {
+                        // Both A and B have the same item, inspecting children if it's a directory
+                        let a = dir_a.next().unwrap();
+                        let b = dir_b.next().unwrap();
+                        if a.node_type == NodeType::Directory {
+                            // println!("Pushing {} to stack", a.name());
+                            self.push_to_stack(Some(&a), Some(&b));
+                            Rc::make_mut(&mut self.path).push(a.name());
+                        }
+                        continue;
                     }
                     Ordering::Equal => {
-                        if a.node_type == b.node_type {
-                            let a = readdir_a.next().unwrap();
-                            let b = readdir_b.next().unwrap();
-                            if a.node_type == NodeType::Directory {
-                                // println!("Pushing {} to stack", a.name());
-                                self.readdir_a.push(self._a.do_readdir(&a).peekable());
-                                self.readdir_b.push(self._b.do_readdir(&b).peekable());
-                                Rc::make_mut(&mut self.path).push(a.name());
-                            }
-                        } else {
-                            // here we have a situation when both A and B has changed. A has been
-                            // removed and B with the same name has been added.
-                            // We can't return two changes at once here, so we returning only one change
-                            // and we rely on the fact that the next call to next() will return another change
-                            // because it was not removed from peekable iterator.
-                            let a = readdir_a.next().unwrap();
-                            return Some(Changed::deleted(&self.path, a));
-                        }
+                        // here we have a situation when both A and B has changed. A has been
+                        // removed and B with the same name has been added.
+                        // We can't return two changes at once here, so we returning only one change
+                        // and we rely on the fact that the next call to next() will return another change
+                        // because it was not removed from peekable iterator.
+                        let a = dir_a.next().unwrap();
+                        Changed::deleted(&self.path, a)
                     }
                 },
-            }
+            };
+            return Some(next_item);
         }
         None
     }
