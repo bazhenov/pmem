@@ -221,8 +221,10 @@ impl Filesystem {
         Changes {
             a_fs: other,
             b_fs: self,
-            a_stack: vec![other.do_readdir(&other.get_root().unwrap()).peekable()],
-            b_stack: vec![self.do_readdir(&self.get_root().unwrap()).peekable()],
+            stack: vec![(
+                other.do_readdir(&other.get_root().unwrap()).peekable(),
+                self.do_readdir(&self.get_root().unwrap()).peekable(),
+            )],
             path: Rc::new(PathBuf::from("/")),
         }
     }
@@ -539,14 +541,28 @@ macro_rules! transpose_unwrap {
 pub struct Changes<'a> {
     a_fs: &'a Filesystem,
     b_fs: &'a Filesystem,
-    a_stack: Vec<Peekable<ReadDir<'a>>>,
-    b_stack: Vec<Peekable<ReadDir<'a>>>,
+
+    /// Stack of [`ReadDir`] iterators. Each pair of iterators corresponds to the same directory in
+    /// two filesystems.
+    ///
+    /// Each time we encounter a directory, we push two iterators to the stack. Thus effectively
+    /// we are implementing a depth-first search of the directory tree.
+    stack: Vec<(Peekable<ReadDir<'a>>, Peekable<ReadDir<'a>>)>,
     path: Rc<PathBuf>,
 }
 
 impl<'a> Changes<'a> {
     /// Adds two directories to the stack
+    ///
+    /// If one of the directories is None, it means that the directory does not exist in the
+    /// corresponding filesystem. Syntatic empty iterator is created in this case. It will
+    /// effectively emits no entries and the mail loop will emit added/deleted changes
+    /// depending on which filesystem has the directory.
     fn push_to_stack(&mut self, dir_a: Option<&FileMeta>, dir_b: Option<&FileMeta>) {
+        assert!(
+            dir_a.is_some() || dir_b.is_some(),
+            "At least one directory must be present"
+        );
         if dir_a.is_some() && dir_b.is_some() {
             let dir_a = dir_a.unwrap();
             let dir_b = dir_b.unwrap();
@@ -566,8 +582,7 @@ impl<'a> Changes<'a> {
             .map(|dir| self.b_fs.do_readdir(dir))
             .unwrap_or(ReadDir::empty(self.b_fs))
             .peekable();
-        self.a_stack.push(dir_a);
-        self.b_stack.push(dir_b);
+        self.stack.push((dir_a, dir_b));
     }
 }
 
@@ -575,9 +590,8 @@ impl<'a> Iterator for Changes<'a> {
     type Item = Changed;
 
     fn next(&mut self) -> Option<Self::Item> {
-        while !self.a_stack.is_empty() && !self.b_stack.is_empty() {
-            let dir_a = self.a_stack.last_mut().unwrap();
-            let dir_b = self.b_stack.last_mut().unwrap();
+        while !self.stack.is_empty() {
+            let (dir_a, dir_b) = self.stack.last_mut().unwrap();
             // println!(
             //     "Comparing: {:?} <=> {:?}",
             //     a.map(FileMeta::name),
@@ -587,8 +601,7 @@ impl<'a> Iterator for Changes<'a> {
             let next_item = match (dir_a.peek(), dir_b.peek()) {
                 (None, None) => {
                     // current directory is exhausted, moving to the parent
-                    self.a_stack.pop();
-                    self.b_stack.pop();
+                    self.stack.pop();
                     Rc::make_mut(&mut self.path).pop();
                     continue;
                 }
@@ -1375,6 +1388,25 @@ mod tests {
         assert_eq!(block_idx(BLOCK_SIZE as u64 + 1), 1);
     }
 
+    #[test]
+    fn check_join_iterator() {
+        let a = vec![1, 4, 5];
+        let b = vec![3, 4, 6];
+
+        let entries = Join::new(a.into_iter(), b.into_iter()).collect::<Vec<_>>();
+
+        assert_eq!(
+            entries,
+            vec![
+                (Some(1), None),
+                (None, Some(3)),
+                (Some(4), Some(4)),
+                (Some(5), None),
+                (None, Some(6)),
+            ]
+        );
+    }
+
     fn assert_uniq_and_sorted<T: Ord + Debug>(mut iter: impl Iterator<Item = T>) {
         let mut prev = iter.next();
         while let (Some(a), Some(b)) = (prev, iter.next()) {
@@ -1569,6 +1601,36 @@ mod tests {
             .with(fmt_layer)
             .with(filter_layer)
             .init();
+    }
+
+    /// Join two sorted iterators into a single iterator that yields pairs of equal elements
+    ///
+    /// The input iterators must be sorted in ascending order. If there is no pair for an element
+    /// from one of the iterators, the corresponding element in the pair will be `None`.
+    struct Join<I: Iterator>(Peekable<I>, Peekable<I>);
+
+    impl<T, I: Iterator<Item = T>> Join<I> {
+        fn new(a: I, b: I) -> Self {
+            Self(a.peekable(), b.peekable())
+        }
+    }
+
+    impl<T: Ord, I: Iterator<Item = T>> Iterator for Join<I> {
+        type Item = (Option<T>, Option<T>);
+
+        fn next(&mut self) -> Option<Self::Item> {
+            let Join(a_iter, b_iter) = self;
+            match (a_iter.peek(), b_iter.peek()) {
+                (Some(a), Some(b)) => match a.cmp(b) {
+                    Ordering::Less => Some((a_iter.next(), None)),
+                    Ordering::Equal => Some((a_iter.next(), b_iter.next())),
+                    Ordering::Greater => Some((None, b_iter.next())),
+                },
+                (Some(_), None) => Some((a_iter.next(), None)),
+                (None, Some(_)) => Some((None, b_iter.next())),
+                (None, None) => None,
+            }
+        }
     }
 
     // #[cfg(not(miri))]
