@@ -1608,7 +1608,7 @@ mod tests {
             .init();
     }
 
-    // #[cfg(not(miri))]
+    #[cfg(not(miri))]
     mod proptests {
         use super::*;
         use pmem::page::PagePool;
