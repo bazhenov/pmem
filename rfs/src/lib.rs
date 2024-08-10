@@ -217,7 +217,7 @@ impl Filesystem {
         FileMeta::from(node, &self.tx)
     }
 
-    pub fn changes_from<'a>(&'a self, other: &'a Self) -> impl Iterator<Item = Changed> + 'a {
+    pub fn changes_from<'a>(&'a self, other: &'a Self) -> impl Iterator<Item = Change> + 'a {
         let a = other.do_readdir(&other.get_root().unwrap());
         let b = self.do_readdir(&self.get_root().unwrap());
         Changes {
@@ -469,13 +469,13 @@ impl Iterator for ReadDir<'_> {
 }
 
 #[derive(Clone)]
-pub struct Changed {
+pub struct Change {
     path: Rc<PathBuf>,
     entry: FileMeta,
     kind: ChangeKind,
 }
 
-impl Changed {
+impl Change {
     fn deleted(path: &Rc<PathBuf>, entry: FileMeta) -> Self {
         let path = Rc::clone(path);
         Self {
@@ -494,17 +494,8 @@ impl Changed {
         }
     }
 
-    fn updated(path: &Rc<PathBuf>, entry: FileMeta) -> Self {
-        let path = Rc::clone(path);
-        Self {
-            path,
-            entry,
-            kind: ChangeKind::Updated,
-        }
-    }
-
     #[cfg(test)]
-    fn take_if_added(self) -> Option<Changed> {
+    fn take_if_added(self) -> Option<Change> {
         match self.kind {
             ChangeKind::Added => Some(self),
             _ => None,
@@ -512,7 +503,7 @@ impl Changed {
     }
 
     #[cfg(test)]
-    fn take_if_deleted(self) -> Option<Changed> {
+    fn take_if_deleted(self) -> Option<Change> {
         match self.kind {
             ChangeKind::Deleted => Some(self),
             _ => None,
@@ -527,24 +518,14 @@ pub enum ChangeKind {
     Updated,
 }
 
-macro_rules! transpose_unwrap {
-    ($expr:expr) => {
-        match $expr {
-            Some(Err(e)) => return Some(Err(e)),
-            Some(Ok(val)) => Some(val),
-            None => None,
-        }
-    };
-}
-
 pub struct Changes<'a> {
     a_fs: &'a Filesystem,
     b_fs: &'a Filesystem,
 
-    /// Stack of [`ReadDir`] iterators. Each pair of iterators corresponds to the same directory in
+    /// Stack of joined [`ReadDir`] iterators. Each iterator corresponds to the same directory in
     /// two filesystems.
     ///
-    /// Each time we encounter a directory, we push two iterators to the stack. Thus effectively
+    /// Each time we encounter a new directory, we push [`Join`] of two iterators to the stack. Thus effectively
     /// we are implementing a depth-first search of the directory tree.
     stack: Vec<Join<ReadDir<'a>>>,
     path: Rc<PathBuf>,
@@ -555,7 +536,7 @@ impl<'a> Changes<'a> {
     ///
     /// If one of the directories is None, it means that the directory does not exist in the
     /// corresponding filesystem. Syntatic empty iterator is created in this case. It will
-    /// effectively emits no entries and the mail loop will emit added/deleted changes
+    /// effectively emits no entries and the join loop will emit added/deleted changes
     /// depending on which filesystem has the directory.
     fn push_to_stack(&mut self, dir_a: Option<&FileMeta>, dir_b: Option<&FileMeta>) {
         assert!(
@@ -584,95 +565,81 @@ impl<'a> Changes<'a> {
 }
 
 impl<'a> Iterator for Changes<'a> {
-    type Item = Changed;
+    type Item = Change;
 
     fn next(&mut self) -> Option<Self::Item> {
         while !self.stack.is_empty() {
             let join = self.stack.last_mut().unwrap();
-            // println!(
-            //     "Comparing: {:?} <=> {:?}",
-            //     a.map(FileMeta::name),
-            //     b.map(FileMeta::name)
-            // );
 
-            let next_yielded_item = if let Some((dir_a, dir_b)) = join.next() {
-                match (dir_a, dir_b) {
-                    (Some(a), None) => {
-                        // All items in B have been exhausted, all remaining items in A are deleted
+            let next_changed_item = match join.next() {
+                Some(Joined::Left(a)) => {
+                    // All items in B have been exhausted, all remaining items in A are deleted
+                    let path = Rc::clone(&self.path);
+                    if a.is_directory() {
+                        self.push_to_stack(Some(&a), None);
+                        Rc::make_mut(&mut self.path).push(a.name());
+                    }
+                    Change::deleted(&path, a)
+                }
+
+                Some(Joined::Right(b)) => {
+                    // All items in A have been exhausted, all remaining items in B are added
+                    let path = Rc::clone(&self.path);
+                    if b.is_directory() {
+                        self.push_to_stack(None, Some(&b));
+                        Rc::make_mut(&mut self.path).push(b.name());
+                    }
+                    Change::added(&path, b)
+                }
+
+                Some(Joined::Both(a, b)) => match a.name().cmp(b.name()) {
+                    Ordering::Less => {
+                        // A has an item that B does not have, it means it was deleted in B
                         let path = Rc::clone(&self.path);
                         if a.is_directory() {
-                            // println!("Pushing {} to stack", a.name());
                             self.push_to_stack(Some(&a), None);
                             Rc::make_mut(&mut self.path).push(a.name());
                         }
-                        Changed::deleted(&path, a)
+                        Change::deleted(&path, a)
                     }
 
-                    (None, Some(b)) => {
-                        // All items in A have been exhausted, all remaining items in B are added
+                    Ordering::Greater => {
+                        // B has an item that A does not have, it means it was added in B
                         let path = Rc::clone(&self.path);
                         if b.is_directory() {
-                            // println!("Pushing {} to stack", b.name());
                             self.push_to_stack(None, Some(&b));
                             Rc::make_mut(&mut self.path).push(b.name());
                         }
-                        Changed::added(&path, b)
+                        Change::added(&path, b)
                     }
 
-                    (Some(a), Some(b)) => match a.name().cmp(b.name()) {
-                        Ordering::Less => {
-                            // A has an item that B does not have, it means it was deleted in B
-                            let path = Rc::clone(&self.path);
-                            if a.is_directory() {
-                                // println!("Pushing {} to stack", a.name());
-                                self.push_to_stack(Some(&a), None);
-                                Rc::make_mut(&mut self.path).push(a.name());
-                            }
-                            Changed::deleted(&path, a)
+                    Ordering::Equal if a.node_type == b.node_type => {
+                        // Both A and B have the same item, inspecting children if it's a directory
+                        if a.node_type == NodeType::Directory {
+                            self.push_to_stack(Some(&a), Some(&b));
+                            Rc::make_mut(&mut self.path).push(a.name());
                         }
+                        continue;
+                    }
 
-                        Ordering::Greater => {
-                            // B has an item that A does not have, it means it was added in B
-                            let path = Rc::clone(&self.path);
-                            if b.is_directory() {
-                                // println!("Pushing {} to stack", b.name());
-                                self.push_to_stack(None, Some(&b));
-                                Rc::make_mut(&mut self.path).push(b.name());
-                            }
-                            Changed::added(&path, b)
-                        }
+                    Ordering::Equal => {
+                        // here we have a situation when both A and B has changed. A has been
+                        // removed and B with the same name has been added.
+                        // We can't return two changes at once here, so we returning only one change
+                        // and we rely on the fact that the next call to next() will return another change
+                        // because it was not removed from peekable iterator.
+                        Change::deleted(&self.path, a)
+                    }
+                },
 
-                        Ordering::Equal if a.node_type == b.node_type => {
-                            // Both A and B have the same item, inspecting children if it's a directory
-                            if a.node_type == NodeType::Directory {
-                                // println!("Pushing {} to stack", a.name());
-                                self.push_to_stack(Some(&a), Some(&b));
-                                Rc::make_mut(&mut self.path).push(a.name());
-                            }
-                            continue;
-                        }
-
-                        Ordering::Equal => {
-                            // here we have a situation when both A and B has changed. A has been
-                            // removed and B with the same name has been added.
-                            // We can't return two changes at once here, so we returning only one change
-                            // and we rely on the fact that the next call to next() will return another change
-                            // because it was not removed from peekable iterator.
-                            Changed::deleted(&self.path, a)
-                        }
-                    },
-
-                    // Join emits items until at least one of the iterators has any items,
-                    // so this state is not possible
-                    (None, None) => unreachable!(),
+                None => {
+                    // Both directories are exhausted, popping the stack
+                    self.stack.pop();
+                    Rc::make_mut(&mut self.path).pop();
+                    continue;
                 }
-            } else {
-                // Both directories are exhausted, popping the stack
-                self.stack.pop();
-                Rc::make_mut(&mut self.path).pop();
-                continue;
             };
-            return Some(next_yielded_item);
+            return Some(next_changed_item);
         }
         None
     }
@@ -1009,21 +976,30 @@ impl<T, I: Iterator<Item = T>> Join<I> {
 }
 
 impl<T: Ord, I: Iterator<Item = T>> Iterator for Join<I> {
-    type Item = (Option<T>, Option<T>);
+    type Item = Joined<T>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let Join(a_iter, b_iter) = self;
         match (a_iter.peek(), b_iter.peek()) {
             (Some(a), Some(b)) => match a.cmp(b) {
-                Ordering::Less => Some((a_iter.next(), None)),
-                Ordering::Equal => Some((a_iter.next(), b_iter.next())),
-                Ordering::Greater => Some((None, b_iter.next())),
+                Ordering::Less => Some(Joined::Left(a_iter.next().unwrap())),
+                Ordering::Equal => {
+                    Some(Joined::Both(a_iter.next().unwrap(), b_iter.next().unwrap()))
+                }
+                Ordering::Greater => Some(Joined::Right(b_iter.next().unwrap())),
             },
-            (Some(_), None) => Some((a_iter.next(), None)),
-            (None, Some(_)) => Some((None, b_iter.next())),
+            (Some(_), None) => Some(Joined::Left(a_iter.next().unwrap())),
+            (None, Some(_)) => Some(Joined::Right(b_iter.next().unwrap())),
             (None, None) => None,
         }
     }
+}
+
+#[derive(Debug, PartialEq)]
+enum Joined<T: PartialEq> {
+    Left(T),
+    Right(T),
+    Both(T, T),
 }
 
 #[cfg(test)]
@@ -1385,21 +1361,6 @@ mod tests {
     }
 
     #[test]
-    fn regression() -> Result<()> {
-        let (mut fs, _) = create_fs();
-
-        fs.create_dirs("/hotel")?;
-        println!("{:?}", FsTree(&fs));
-        fs.create_dirs("/alpha")?;
-        println!("{:?}", FsTree(&fs));
-
-        fs.find("/alpha")?;
-        fs.find("/hotel")?;
-
-        Ok(())
-    }
-
-    #[test]
     #[cfg_attr(miri, ignore)]
     #[should_panic(expected = "NoSpaceLeft")]
     fn no_space_left() {
@@ -1442,11 +1403,11 @@ mod tests {
         assert_eq!(
             entries,
             vec![
-                (Some(1), None),
-                (None, Some(3)),
-                (Some(4), Some(4)),
-                (Some(5), None),
-                (None, Some(6)),
+                Joined::Left(1),
+                Joined::Right(3),
+                Joined::Both(4, 4),
+                Joined::Left(5),
+                Joined::Right(6),
             ]
         );
     }
@@ -1467,16 +1428,16 @@ mod tests {
     /// Returns the changes to the `target` full filesystem from the `base` filesystem.
     ///
     /// The changes are returned as a tuple of `(added, deleted)` files.
-    fn fs_changes(base: &Filesystem, target: &Filesystem) -> (Vec<Changed>, Vec<Changed>) {
-        let changes = target.changes_from(&base).collect::<Vec<_>>();
+    fn fs_changes(base: &Filesystem, target: &Filesystem) -> (Vec<Change>, Vec<Change>) {
+        let changes = target.changes_from(base).collect::<Vec<_>>();
         let deleted = changes
             .clone()
             .into_iter()
-            .filter_map(Changed::take_if_deleted)
+            .filter_map(Change::take_if_deleted)
             .collect::<Vec<_>>();
         let added = changes
             .into_iter()
-            .filter_map(Changed::take_if_added)
+            .filter_map(Change::take_if_added)
             .collect::<Vec<_>>();
         (added, deleted)
     }
@@ -1735,7 +1696,7 @@ mod tests {
                     let file_name = path.file_name().unwrap().to_str().unwrap();
 
                     let dir = fs.create_dirs(dir_path)?;
-                    fs.create_file(&dir, &file_name)?;
+                    fs.create_file(&dir, file_name)?;
                     fs.find(path.to_str().unwrap())?;
                 }
             }
@@ -1749,11 +1710,9 @@ mod tests {
                 // - A and B - actions that are applied to FS A and FS B respectively
                 // - common - actions that are applied to both FS
 
-                // println!("----------------");
-
-                let (a_directories, a_files) = collect_directories_and_files(a.iter())?;
+                let (_a_directories, _a_files) = collect_directories_and_files(a.iter())?;
                 let (b_directories, b_files) = collect_directories_and_files(b.iter())?;
-                let (common_directories, common_files) = collect_directories_and_files(common.iter())?;
+                let (_common_directories, _common_files) = collect_directories_and_files(common.iter())?;
 
                 let (mut fs_a, _) = create_fs();
                 let (mut fs_b, _) = create_fs();
@@ -1761,26 +1720,24 @@ mod tests {
                 apply_fs_actions(&mut fs_a, a.iter().chain(common.iter()))?;
                 apply_fs_actions(&mut fs_b, b.iter().chain(common.iter()))?;
 
-                let (added, deleted) = fs_changes(&fs_a, &fs_b);
+                let (added, _deleted) = fs_changes(&fs_a, &fs_b);
                 let mut added_paths = HashSet::new();
 
                 for item in added {
                     let mut path = Rc::unwrap_or_clone(item.path);
 
                     path.push(item.entry.name());
-                    // println!("ACTUAL {:?}", path.display());
                     added_paths.insert(path);
                 }
 
                 let expected_added = b_files.union(&b_directories).cloned().collect::<HashSet<_>>();
                 let mut expected = HashSet::new();
+                // TODO: requires some attention in refactoring
                 for path in expected_added {
-                    // println!("EXPECTED {:?}", path.display());
                     let mut path = path.as_path();
                     expected.insert(path.to_path_buf());
                     while let Some(parent) = path.parent() {
                         if parent != Path::new("/") {
-                            // println!("EXPECTED {:?}", parent.display());
                             expected.insert(parent.to_path_buf());
                         }
                         path = parent
@@ -1792,7 +1749,6 @@ mod tests {
                     "\nFS A:\n {:?}\nFS B:\n {:?}",
                     FsTree(&fs_a),
                     FsTree(&fs_b));
-                // println!("{:?}", added_paths);
 
             }
         }
