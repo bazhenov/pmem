@@ -8,6 +8,7 @@ use std::{
     convert::Into,
     fmt,
     io::{self, Error, ErrorKind, Read, Seek, SeekFrom, Write},
+    iter::Peekable,
     ops::{Deref, DerefMut},
     path::{self, Component, Path, PathBuf},
     rc::Rc,
@@ -173,20 +174,17 @@ impl Filesystem {
     ///
     /// Returns:
     /// - [ErrorKind::NotFound] if the directory does not exist
-    pub fn readdir<'a>(
-        &'a self,
-        dir: &FileMeta,
-    ) -> Result<impl Iterator<Item = Result<FileMeta>> + 'a> {
+    pub fn readdir<'a>(&'a self, dir: &FileMeta) -> impl Iterator<Item = FileMeta> + 'a {
         self.do_readdir(dir)
     }
 
-    fn do_readdir(&self, dir: &FileMeta) -> Result<ReadDir> {
-        let parent = self.lookup_inode(dir)?;
+    fn do_readdir(&self, dir: &FileMeta) -> ReadDir {
+        let parent = self.lookup_inode(dir).unwrap();
 
-        Ok(ReadDir {
+        ReadDir {
             fs: self,
             next: parent.children,
-        })
+        }
     }
 
     /// Creates a directory and all its parents
@@ -219,22 +217,14 @@ impl Filesystem {
         FileMeta::from(node, &self.tx)
     }
 
-    pub fn changes_from<'a>(
-        &'a self,
-        other: &'a Self,
-    ) -> Result<impl Iterator<Item = Result<Changed>> + 'a> {
-        Ok(Changes {
+    pub fn changes_from<'a>(&'a self, other: &'a Self) -> impl Iterator<Item = Changed> + 'a {
+        Changes {
             _a: other,
             _b: self,
-            _a_nodes: vec![other.get_root()?],
-            _b_nodes: vec![self.get_root()?],
-            readdir_a: other.do_readdir(&other.get_root()?)?,
-            readdir_b: self.do_readdir(&self.get_root()?)?,
-            cur_a: None,
-            cur_b: None,
+            readdir_a: vec![other.do_readdir(&other.get_root().unwrap()).peekable()],
+            readdir_b: vec![self.do_readdir(&self.get_root().unwrap()).peekable()],
             path: Rc::new(PathBuf::from("/")),
-            buf: Vec::new(),
-        })
+        }
     }
 
     pub fn finish(self) -> Transaction {
@@ -460,18 +450,20 @@ struct ReadDir<'a> {
     next: Option<Ptr<FNode>>,
 }
 
+impl<'a> ReadDir<'a> {
+    fn empty(fs: &'a Filesystem) -> Self {
+        Self { fs, next: None }
+    }
+}
+
 impl Iterator for ReadDir<'_> {
-    type Item = Result<FileMeta>;
+    type Item = FileMeta;
 
     fn next(&mut self) -> Option<Self::Item> {
         let node = self.next.take()?;
-        match self.fs.tx.lookup(node) {
-            Ok(child) => {
-                self.next = child.next;
-                Some(FileMeta::from(child, &self.fs.tx))
-            }
-            Err(e) => Some(Err(e.into())),
-        }
+        let child = self.fs.tx.lookup(node).unwrap();
+        self.next = child.next;
+        Some(FileMeta::from(child, &self.fs.tx).unwrap())
     }
 }
 
@@ -547,55 +539,103 @@ macro_rules! transpose_unwrap {
 pub struct Changes<'a> {
     _a: &'a Filesystem,
     _b: &'a Filesystem,
-    _a_nodes: Vec<FileMeta>,
-    _b_nodes: Vec<FileMeta>,
-    readdir_a: ReadDir<'a>,
-    readdir_b: ReadDir<'a>,
-    buf: Vec<Changed>,
-
-    cur_a: Option<Result<FileMeta>>,
-    cur_b: Option<Result<FileMeta>>,
-
+    readdir_a: Vec<Peekable<ReadDir<'a>>>,
+    readdir_b: Vec<Peekable<ReadDir<'a>>>,
     path: Rc<PathBuf>,
 }
 
 impl<'a> Iterator for Changes<'a> {
-    type Item = Result<Changed>;
+    type Item = Changed;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(item) = self.buf.pop() {
-            return Some(Ok(item));
-        }
+        while !self.readdir_a.is_empty() && !self.readdir_b.is_empty() {
+            let readdir_a = self.readdir_a.last_mut().unwrap();
+            let readdir_b = self.readdir_b.last_mut().unwrap();
+            let a = readdir_a.peek();
+            let b = readdir_b.peek();
 
-        let a = self.cur_a.take().or_else(|| self.readdir_a.next());
-        let b = self.cur_b.take().or_else(|| self.readdir_b.next());
+            println!(
+                "Comparing: {:?} <=> {:?}",
+                a.map(FileMeta::name),
+                b.map(FileMeta::name)
+            );
 
-        let a = transpose_unwrap!(a);
-        let b = transpose_unwrap!(b);
-
-        match (a, b) {
-            (None, None) => None,
-            (Some(a), None) => Some(Ok(Changed::deleted(&self.path, a))),
-            (None, Some(b)) => Some(Ok(Changed::added(&self.path, b))),
-            (Some(a), Some(b)) => match a.name().cmp(b.name()) {
-                Ordering::Less => {
-                    self.cur_b = Some(Ok(b));
-                    Some(Ok(Changed::deleted(&self.path, a)))
+            match (a, b) {
+                (None, None) => {
+                    // current directory is exhausted
+                    self.readdir_a.pop();
+                    self.readdir_b.pop();
+                    Rc::make_mut(&mut self.path).pop();
                 }
-                Ordering::Greater => {
-                    self.cur_a = Some(Ok(a));
-                    Some(Ok(Changed::added(&self.path, b)))
-                }
-                Ordering::Equal => {
-                    if a.node_type == b.node_type {
-                        None
-                    } else {
-                        self.buf.push(Changed::deleted(&self.path, a));
-                        Some(Ok(Changed::added(&self.path, b)))
+                (Some(_), None) => {
+                    let a = readdir_a.next().unwrap();
+                    let path = Rc::clone(&self.path);
+                    if a.is_directory() {
+                        // println!("Pushing {} to stack", a.name());
+                        self.readdir_a.push(self._a.do_readdir(&a).peekable());
+                        self.readdir_b.push(ReadDir::empty(self._b).peekable());
+                        Rc::make_mut(&mut self.path).push(a.name());
                     }
+                    return Some(Changed::deleted(&path, a));
                 }
-            },
+                (None, Some(_)) => {
+                    let b = readdir_b.next().unwrap();
+                    let path = Rc::clone(&self.path);
+                    if b.is_directory() {
+                        // println!("Pushing {} to stack", b.name());
+                        self.readdir_a.push(ReadDir::empty(self._a).peekable());
+                        self.readdir_b.push(self._b.do_readdir(&b).peekable());
+                        Rc::make_mut(&mut self.path).push(b.name());
+                    }
+                    return Some(Changed::added(&path, b));
+                }
+                (Some(a), Some(b)) => match a.name().cmp(b.name()) {
+                    Ordering::Less => {
+                        let a = readdir_a.next().unwrap();
+                        let path = Rc::clone(&self.path);
+                        if a.is_directory() {
+                            // println!("Pushing {} to stack", a.name());
+                            self.readdir_a.push(self._a.do_readdir(&a).peekable());
+                            self.readdir_b.push(ReadDir::empty(self._b).peekable());
+                            Rc::make_mut(&mut self.path).push(a.name());
+                        }
+                        return Some(Changed::deleted(&path, a));
+                    }
+                    Ordering::Greater => {
+                        let b = readdir_b.next().unwrap();
+                        let path = Rc::clone(&self.path);
+                        if b.is_directory() {
+                            // println!("Pushing {} to stack", b.name());
+                            self.readdir_a.push(ReadDir::empty(self._a).peekable());
+                            self.readdir_b.push(self._b.do_readdir(&b).peekable());
+                            Rc::make_mut(&mut self.path).push(b.name());
+                        }
+                        return Some(Changed::added(&path, b));
+                    }
+                    Ordering::Equal => {
+                        if a.node_type == b.node_type {
+                            let a = readdir_a.next().unwrap();
+                            let b = readdir_b.next().unwrap();
+                            if a.node_type == NodeType::Directory {
+                                // println!("Pushing {} to stack", a.name());
+                                self.readdir_a.push(self._a.do_readdir(&a).peekable());
+                                self.readdir_b.push(self._b.do_readdir(&b).peekable());
+                                Rc::make_mut(&mut self.path).push(a.name());
+                            }
+                        } else {
+                            // here we have a situation when both A and B has changed. A has been
+                            // removed and B with the same name has been added.
+                            // We can't return two changes at once here, so we returning only one change
+                            // and we rely on the fact that the next call to next() will return another change
+                            // because it was not removed from peekable iterator.
+                            let a = readdir_a.next().unwrap();
+                            return Some(Changed::deleted(&self.path, a));
+                        }
+                    }
+                },
+            }
         }
+        None
     }
 }
 
@@ -1118,7 +1158,7 @@ mod tests {
         let bin = fs.create_dir(&root, "bin")?;
         let swap = fs.create_file(&root, "swap")?;
 
-        let children = fs.readdir(&root)?.collect::<Result<Vec<_>>>()?;
+        let children = fs.readdir(&root).collect::<Vec<_>>();
 
         // All children should be present
         assert!(children.contains(&etc), "Root should contains etc");
@@ -1144,7 +1184,7 @@ mod tests {
         let bin = fs.create_file(&root, "bin")?;
         let swap = fs.create_file(&root, "swap")?;
 
-        let children = fs.readdir(&root)?.collect::<Result<Vec<_>>>()?;
+        let children = fs.readdir(&root).collect::<Vec<_>>();
 
         // All children should be present
         assert!(children.contains(&etc), "Root should contains etc");
@@ -1171,7 +1211,7 @@ mod tests {
         let fs_a = Filesystem::open(mem.start_at(lsn_a)?);
         let fs_b = Filesystem::open(mem.start_at(lsn_b)?);
 
-        let (added, deleted) = fs_changes(&fs_a, &fs_b)?;
+        let (added, deleted) = fs_changes(&fs_a, &fs_b);
 
         assert_eq!(added.len(), 1);
         assert_eq!(added[0].entry.name(), "bin");
@@ -1325,8 +1365,8 @@ mod tests {
     /// Returns the changes to the `target` full filesystem from the `base` filesystem.
     ///
     /// The changes are returned as a tuple of `(added, deleted)` files.
-    fn fs_changes(base: &Filesystem, target: &Filesystem) -> Result<(Vec<Changed>, Vec<Changed>)> {
-        let changes = target.changes_from(&base)?.collect::<Result<Vec<_>>>()?;
+    fn fs_changes(base: &Filesystem, target: &Filesystem) -> (Vec<Changed>, Vec<Changed>) {
+        let changes = target.changes_from(&base).collect::<Vec<_>>();
         let deleted = changes
             .clone()
             .into_iter()
@@ -1336,7 +1376,7 @@ mod tests {
             .into_iter()
             .filter_map(Changed::take_if_added)
             .collect::<Vec<_>>();
-        Ok((added, deleted))
+        (added, deleted)
     }
 
     fn mkdirs(fs: &mut Filesystem, directories: &[&str]) {
@@ -1427,9 +1467,8 @@ mod tests {
                 dir: &FileMeta,
                 is_last_vec: &mut Vec<bool>,
             ) -> fmt::Result {
-                let mut children = fs.readdir(dir).unwrap().peekable();
+                let mut children = fs.readdir(dir).peekable();
                 while let Some(child) = children.next() {
-                    let child = child.unwrap();
                     let is_last = children.peek().is_none();
 
                     let node_type = match child.node_type {
@@ -1601,14 +1640,14 @@ mod tests {
 
             #[test]
             fn can_detect_changes_on_fs(
-                a in any_fs_actions_uniq(Some("a."), 1..20),
-                b in any_fs_actions_uniq(Some("b."), 1..20),
+                a in any_fs_actions_uniq(Some("a-"), 1..20),
+                b in any_fs_actions_uniq(Some("b-"), 1..20),
                 common in any_fs_actions_uniq(None, 1..20)) {
-
                 // We have 3 disjoint sets of actions:
-                // 1. a - actions that are applied to fs_a
-                // 2. b - actions that are applied to fs_b
-                // 3. common - actions that are applied to both fs_a and fs_b
+                // - A and B - actions that are applied to FS A and FS B respectively
+                // - common - actions that are applied to both FS
+
+                // println!("----------------");
 
                 let (a_directories, a_files) = collect_directories_and_files(a.iter())?;
                 let (b_directories, b_files) = collect_directories_and_files(b.iter())?;
@@ -1617,31 +1656,42 @@ mod tests {
                 let (mut fs_a, _) = create_fs();
                 let (mut fs_b, _) = create_fs();
 
-                apply_fs_actions(&mut fs_a, common.iter())?;
-                apply_fs_actions(&mut fs_b, common.iter())?;
+                apply_fs_actions(&mut fs_a, a.iter().chain(common.iter()))?;
+                apply_fs_actions(&mut fs_b, b.iter().chain(common.iter()))?;
 
-                apply_fs_actions(&mut fs_a, a.iter())?;
-                apply_fs_actions(&mut fs_b, b.iter())?;
-
-                let (added, deleted) = fs_changes(&fs_a, &fs_b)?;
+                let (added, deleted) = fs_changes(&fs_a, &fs_b);
                 let mut added_paths = HashSet::new();
+
                 for item in added {
                     let mut path = Rc::unwrap_or_clone(item.path);
+
                     path.push(item.entry.name());
+                    // println!("ACTUAL {:?}", path.display());
                     added_paths.insert(path);
                 }
+
                 let expected_added = b_files.union(&b_directories).cloned().collect::<HashSet<_>>();
-                prop_assert_eq!(added_paths, expected_added,
+                let mut expected = HashSet::new();
+                for path in expected_added {
+                    // println!("EXPECTED {:?}", path.display());
+                    let mut path = path.as_path();
+                    expected.insert(path.to_path_buf());
+                    while let Some(parent) = path.parent() {
+                        if parent != Path::new("/") {
+                            // println!("EXPECTED {:?}", parent.display());
+                            expected.insert(parent.to_path_buf());
+                        }
+                        path = parent
+                    }
+                }
+
+
+                prop_assert_eq!(added_paths, expected,
                     "\nFS A:\n {:?}\nFS B:\n {:?}",
                     FsTree(&fs_a),
                     FsTree(&fs_b));
                 // println!("{:?}", added_paths);
 
-            }
-
-            #[test]
-            fn foo(p in any_fs_actions_uniq(Some("1."), 1..10)) {
-                println!("{:?}", p);
             }
         }
 
@@ -1664,16 +1714,9 @@ mod tests {
             prop_oneof![from_end, from_start, from_current].prop_map(WriteOperation::Seek)
         }
 
-        fn any_fs_action(prefix: Option<&str>) -> impl Strategy<Value = FsAction> + '_ {
-            prop_oneof![
-                any_path(prefix).prop_map(FsAction::CreateFile),
-                any_path(prefix).prop_map(FsAction::CreateDirectory),
-            ]
-        }
-
         fn any_action_type(path: PathBuf) -> impl Strategy<Value = FsAction> {
             prop_oneof![
-                Just(FsAction::CreateFile(path.clone())),
+                Just(FsAction::CreateFile(path.with_extension("txt"))),
                 Just(FsAction::CreateDirectory(path.clone())),
             ]
         }
