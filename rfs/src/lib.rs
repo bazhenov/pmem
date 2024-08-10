@@ -535,7 +535,7 @@ impl<'a> Changes<'a> {
     /// Adds two directories to the stack
     ///
     /// If one of the directories is None, it means that the directory does not exist in the
-    /// corresponding filesystem. Syntatic empty iterator is created in this case. It will
+    /// corresponding filesystem. Syntactic empty iterator is created in this case. It will
     /// effectively emits no entries and the join loop will emit added/deleted changes
     /// depending on which filesystem has the directory.
     fn push_to_stack(&mut self, dir_a: Option<&FileMeta>, dir_b: Option<&FileMeta>) {
