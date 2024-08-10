@@ -10,6 +10,7 @@ use std::{
     io::{self, Error, ErrorKind, Read, Seek, SeekFrom, Write},
     ops::{Deref, DerefMut},
     path::{self, Component, Path, PathBuf},
+    rc::Rc,
 };
 use tracing::{instrument, trace};
 
@@ -197,14 +198,21 @@ impl Filesystem {
                 return Err(ErrorKind::InvalidInput.into());
             };
 
-            node = if node.children.is_none() {
+            node = if let Some(first_child) = node.children {
+                let new_child = self
+                    .create_child(first_child, name.to_str().unwrap(), NodeType::Directory)?
+                    .unwrap_or_else(|found_dir| found_dir);
+                // Update the directory FNode if the new child is the first in the list
+                if new_child.next == Some(first_child) {
+                    node.children = Some(new_child.ptr());
+                    self.tx.update(&node)?;
+                }
+                new_child
+            } else {
                 let new_node = self.write_fsnode(name.to_str().unwrap(), NodeType::Directory)?;
                 node.children = Some(new_node.ptr());
                 self.tx.update(&node)?;
                 new_node
-            } else {
-                self.create_child(node.ptr(), name.to_str().unwrap(), NodeType::Directory)?
-                    .unwrap_or_else(|found_dir| found_dir)
             }
         }
 
@@ -214,7 +222,7 @@ impl Filesystem {
     pub fn changes_from<'a>(
         &'a self,
         other: &'a Self,
-    ) -> Result<impl Iterator<Item = Result<Change>> + 'a> {
+    ) -> Result<impl Iterator<Item = Result<Changed>> + 'a> {
         Ok(Changes {
             _a: other,
             _b: self,
@@ -224,6 +232,8 @@ impl Filesystem {
             readdir_b: self.do_readdir(&self.get_root()?)?,
             cur_a: None,
             cur_b: None,
+            path: Rc::new(PathBuf::from("/")),
+            buf: Vec::new(),
         })
     }
 
@@ -465,30 +475,63 @@ impl Iterator for ReadDir<'_> {
     }
 }
 
-#[cfg_attr(test, derive(Debug))]
 #[derive(Clone)]
-pub enum Change {
-    Added(FileMeta),
-    Deleted(FileMeta),
-    Updated(FileMeta),
+pub struct Changed {
+    path: Rc<PathBuf>,
+    entry: FileMeta,
+    kind: ChangeKind,
 }
 
-impl Change {
+impl Changed {
+    fn deleted(path: &Rc<PathBuf>, entry: FileMeta) -> Self {
+        let path = Rc::clone(path);
+        Self {
+            path,
+            entry,
+            kind: ChangeKind::Deleted,
+        }
+    }
+
+    fn added(path: &Rc<PathBuf>, entry: FileMeta) -> Self {
+        let path = Rc::clone(path);
+        Self {
+            path,
+            entry,
+            kind: ChangeKind::Added,
+        }
+    }
+
+    fn updated(path: &Rc<PathBuf>, entry: FileMeta) -> Self {
+        let path = Rc::clone(path);
+        Self {
+            path,
+            entry,
+            kind: ChangeKind::Updated,
+        }
+    }
+
     #[cfg(test)]
-    fn take_if_added(self) -> Option<FileMeta> {
-        match self {
-            Change::Added(meta) => Some(meta),
+    fn take_if_added(self) -> Option<Changed> {
+        match self.kind {
+            ChangeKind::Added => Some(self),
             _ => None,
         }
     }
 
     #[cfg(test)]
-    fn take_if_deleted(self) -> Option<FileMeta> {
-        match self {
-            Change::Deleted(meta) => Some(meta),
+    fn take_if_deleted(self) -> Option<Changed> {
+        match self.kind {
+            ChangeKind::Deleted => Some(self),
             _ => None,
         }
     }
+}
+
+#[derive(Clone, Copy)]
+pub enum ChangeKind {
+    Added,
+    Deleted,
+    Updated,
 }
 
 macro_rules! transpose_unwrap {
@@ -508,15 +551,22 @@ pub struct Changes<'a> {
     _b_nodes: Vec<FileMeta>,
     readdir_a: ReadDir<'a>,
     readdir_b: ReadDir<'a>,
+    buf: Vec<Changed>,
 
     cur_a: Option<Result<FileMeta>>,
     cur_b: Option<Result<FileMeta>>,
+
+    path: Rc<PathBuf>,
 }
 
 impl<'a> Iterator for Changes<'a> {
-    type Item = Result<Change>;
+    type Item = Result<Changed>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if let Some(item) = self.buf.pop() {
+            return Some(Ok(item));
+        }
+
         let a = self.cur_a.take().or_else(|| self.readdir_a.next());
         let b = self.cur_b.take().or_else(|| self.readdir_b.next());
 
@@ -525,18 +575,25 @@ impl<'a> Iterator for Changes<'a> {
 
         match (a, b) {
             (None, None) => None,
-            (Some(a), None) => Some(Ok(Change::Deleted(a))),
-            (None, Some(b)) => Some(Ok(Change::Added(b))),
+            (Some(a), None) => Some(Ok(Changed::deleted(&self.path, a))),
+            (None, Some(b)) => Some(Ok(Changed::added(&self.path, b))),
             (Some(a), Some(b)) => match a.name().cmp(b.name()) {
                 Ordering::Less => {
                     self.cur_b = Some(Ok(b));
-                    Some(Ok(Change::Deleted(a)))
+                    Some(Ok(Changed::deleted(&self.path, a)))
                 }
                 Ordering::Greater => {
                     self.cur_a = Some(Ok(a));
-                    Some(Ok(Change::Added(b)))
+                    Some(Ok(Changed::added(&self.path, b)))
                 }
-                Ordering::Equal => todo!(),
+                Ordering::Equal => {
+                    if a.node_type == b.node_type {
+                        None
+                    } else {
+                        self.buf.push(Changed::deleted(&self.path, a));
+                        Some(Ok(Changed::added(&self.path, b)))
+                    }
+                }
             },
         }
     }
@@ -851,7 +908,7 @@ mod tests {
     use super::*;
     use fmt::Debug;
     use pmem::Memory;
-    use std::fs;
+    use std::{collections::HashSet, fs};
 
     macro_rules! assert_not_exists {
         ($fs:expr, $name:expr) => {
@@ -928,6 +985,17 @@ mod tests {
         let node = fs.find("/usr/bin")?;
         assert_eq!(node.name(), "bin");
         assert!(node.is_directory());
+
+        Ok(())
+    }
+
+    #[test]
+    fn check_creating_already_existing_directories() -> Result<()> {
+        let (mut fs, _) = create_fs();
+
+        fs.create_dirs("/usr/bin")?;
+        fs.create_dirs("/usr/bin")?;
+        fs.create_dirs("/")?;
 
         Ok(())
     }
@@ -1103,34 +1171,17 @@ mod tests {
         let fs_a = Filesystem::open(mem.start_at(lsn_a)?);
         let fs_b = Filesystem::open(mem.start_at(lsn_b)?);
 
-        let (added, deleted) = collect_changes(fs_b, fs_a)?;
+        let (added, deleted) = fs_changes(&fs_a, &fs_b)?;
 
         assert_eq!(added.len(), 1);
-        assert_eq!(added[0].name(), "bin");
-        assert!(added[0].is_directory());
+        assert_eq!(added[0].entry.name(), "bin");
+        assert!(added[0].entry.is_directory());
 
         assert_eq!(deleted.len(), 1);
-        assert_eq!(deleted[0].name(), "etc");
-        assert!(deleted[0].is_directory());
+        assert_eq!(deleted[0].entry.name(), "etc");
+        assert!(deleted[0].entry.is_directory());
 
         Ok(())
-    }
-
-    fn collect_changes(
-        fs_b: Filesystem,
-        fs_a: Filesystem,
-    ) -> Result<(Vec<FileMeta>, Vec<FileMeta>)> {
-        let changes = fs_b.changes_from(&fs_a)?.collect::<Result<Vec<_>>>()?;
-        let deleted = changes
-            .clone()
-            .into_iter()
-            .filter_map(Change::take_if_deleted)
-            .collect::<Vec<_>>();
-        let added = changes
-            .into_iter()
-            .filter_map(Change::take_if_added)
-            .collect::<Vec<_>>();
-        Ok((added, deleted))
     }
 
     #[test]
@@ -1211,6 +1262,21 @@ mod tests {
     }
 
     #[test]
+    fn regression() -> Result<()> {
+        let (mut fs, _) = create_fs();
+
+        fs.create_dirs("/hotel")?;
+        println!("{:?}", FsTree(&fs));
+        fs.create_dirs("/alpha")?;
+        println!("{:?}", FsTree(&fs));
+
+        fs.find("/alpha")?;
+        fs.find("/hotel")?;
+
+        Ok(())
+    }
+
+    #[test]
     #[cfg_attr(miri, ignore)]
     #[should_panic(expected = "NoSpaceLeft")]
     fn no_space_left() {
@@ -1256,6 +1322,23 @@ mod tests {
         }
     }
 
+    /// Returns the changes to the `target` full filesystem from the `base` filesystem.
+    ///
+    /// The changes are returned as a tuple of `(added, deleted)` files.
+    fn fs_changes(base: &Filesystem, target: &Filesystem) -> Result<(Vec<Changed>, Vec<Changed>)> {
+        let changes = target.changes_from(&base)?.collect::<Result<Vec<_>>>()?;
+        let deleted = changes
+            .clone()
+            .into_iter()
+            .filter_map(Changed::take_if_deleted)
+            .collect::<Vec<_>>();
+        let added = changes
+            .into_iter()
+            .filter_map(Changed::take_if_added)
+            .collect::<Vec<_>>();
+        Ok((added, deleted))
+    }
+
     fn mkdirs(fs: &mut Filesystem, directories: &[&str]) {
         for path in directories {
             fs.create_dirs(path).unwrap();
@@ -1278,153 +1361,58 @@ mod tests {
         (Filesystem::allocate(tx), mem)
     }
 
-    //#[cfg(not(miri))]
-    mod proptests {
-        use super::*;
-        use pmem::page::PagePool;
-        use proptest::{collection::vec, prelude::*, prop_oneof, proptest, strategy::Strategy};
-        use std::fs;
-        use tempfile::TempDir;
-
-        #[derive(Debug)]
-        enum WriteOperation {
-            Write(Vec<u8>),
-            Seek(SeekFrom),
-        }
-
-        proptest! {
-            #![proptest_config(ProptestConfig {
-                cases: 1000,
-                ..ProptestConfig::default()
-            })]
-
-            #[test]
-            fn can_write_file(ops in vec(any_write_operation(), 0..10)) {
-                let mem = Memory::new(PagePool::new(1024 * 1024));
-                let mut fs = Filesystem::allocate(mem.start());
-
-                let tmp_dir = TempDir::new().unwrap();
-                let root = fs.get_root().unwrap();
-                let file = fs.create_file(&root, "file.txt").unwrap();
-                let shadow_file_path = tmp_dir.path().join("file.txt");
-
-                let mut file = fs.open_file(&file).unwrap();
-                let mut shadow_file = fs::File::create_new(shadow_file_path).unwrap();
-
-                for op in ops {
-                    match op {
-                        WriteOperation::Write(data) => {
-                            file.write_all(&data).unwrap();
-                            shadow_file.write_all(&data).unwrap();
-                        }
-                        WriteOperation::Seek(seek) => {
-                            let seek = adjust_seek(seek, &mut shadow_file)?;
-                            let pos_a = file.seek(seek).unwrap();
-                            let pos_b = shadow_file.seek(seek).unwrap();
-                            prop_assert_eq!(pos_a, pos_b, "Seek positions differs");
-                        }
-                    }
-                }
-                file.flush().unwrap();
-                shadow_file.flush().unwrap();
-
-                let pos_a = file.seek(SeekFrom::Start(0)).unwrap();
-                let pos_b = shadow_file.seek(SeekFrom::Start(0)).unwrap();
-                prop_assert_eq!(pos_a, 0, "Seek is not at the beginning");
-                prop_assert_eq!(pos_b, 0, "Seek is not at the beginning");
-
-                let mut file_buf = vec![];
-                file.read_to_end(&mut file_buf).unwrap();
-
-                let mut shadow_file_buf = vec![];
-                shadow_file.read_to_end(&mut shadow_file_buf).unwrap();
-
-                prop_assert_eq!(file_buf, shadow_file_buf);
-            }
-
-            #[test]
-            fn can_create_directories_and_files(actions in vec(any_fs_action(), 1..20)) {
-                let (mut fs, _) = create_fs();
-                apply_fs_actions(&mut fs, actions.iter()).unwrap();
-
-                println!("-------------");
-                println!("{:?}", FsTree(&fs));
-            }
-        }
-
-        fn any_write_operation() -> impl Strategy<Value = WriteOperation> {
-            prop_oneof![any_write(), any_seek()]
-        }
-
-        fn any_write() -> impl Strategy<Value = WriteOperation> {
-            vec(any::<u8>(), 0..10).prop_map(WriteOperation::Write)
-        }
-
-        fn any_seek() -> impl Strategy<Value = WriteOperation> {
-            const MAX_SEEK: usize = BLOCK_SIZE * INDIRECT_BLOCKS;
-            let seek_range = -10i64 * BLOCK_SIZE as i64..10 * BLOCK_SIZE as i64;
-
-            let from_end = seek_range.clone().prop_map(SeekFrom::End);
-            let from_start = (0u64..MAX_SEEK as u64).prop_map(SeekFrom::Start);
-            let from_current = seek_range.prop_map(SeekFrom::Current);
-
-            prop_oneof![from_end, from_start, from_current].prop_map(WriteOperation::Seek)
-        }
-
-        fn any_fs_action() -> impl Strategy<Value = FsAction> {
-            prop_oneof![
-                any_file_name().prop_map(FsAction::CreateFile),
-                any_file_name().prop_map(FsAction::CreateDirectory),
-                Just(FsAction::GoToParent),
-            ]
-        }
-
-        fn any_file_name() -> impl Strategy<Value = String> {
-            "[0-9a-f]{8}"
-        }
-    }
-
     /// A filesystem action that can be applied to a filesystem
     ///
     /// See [`apply_fs_actions`] for more information
     #[derive(Debug, Clone)]
     enum FsAction {
-        CreateFile(String),
-        CreateDirectory(String),
-        GoToParent,
+        CreateFile(PathBuf),
+        CreateDirectory(PathBuf),
     }
 
-    /// Applies a sequence of filesystem actions to the filesystem
-    ///
-    /// Note that [`FsAction::CreateDirectory`] and [`FsAction::CreateFile`] actions are interpreted
-    /// in a way that they are relative to the current working directory which is changed by
-    /// [`FsAction::CreateDirectory`]. It creates directory and changes cwd to it The [`FsAction::GoToParent`]
-    /// action is used to go back to the parent directory
     fn apply_fs_actions<'a>(
         fs: &mut Filesystem,
         actions: impl Iterator<Item = &'a FsAction>,
     ) -> Result<()> {
-        let mut cwd = PathBuf::from("/");
-
         for action in actions {
-            let parent = fs.find(cwd.to_str().unwrap())?;
-            assert!(parent.node_type == NodeType::Directory);
-
             match action {
-                FsAction::CreateDirectory(name) => {
-                    fs.create_dir(&parent, name)?;
-                    cwd.push(name);
+                FsAction::CreateDirectory(path) => {
+                    fs.create_dirs(path.to_str().unwrap())?;
                 }
-                FsAction::CreateFile(name) => {
-                    fs.create_file(&parent, name)?;
-                }
-                FsAction::GoToParent => {
-                    cwd.pop();
+                FsAction::CreateFile(path) => {
+                    let file_name = path.file_name().unwrap().to_str().unwrap();
+                    let dir_name = path.parent().unwrap().to_str().unwrap();
+                    fs.create_dirs(dir_name)?;
+                    let dir = fs.find(dir_name)?;
+                    fs.create_file(&dir, file_name)?;
                 }
             }
         }
 
         Ok(())
+    }
+
+    // Converts a sequence of filesystem actions to a set of directories and files that should be created
+    // in order to apply the actions
+    fn collect_directories_and_files<'a>(
+        actions: impl Iterator<Item = &'a FsAction>,
+    ) -> Result<(HashSet<PathBuf>, HashSet<PathBuf>)> {
+        let mut cwd = PathBuf::from("/");
+        let mut directories = HashSet::new();
+        let mut files = HashSet::new();
+
+        for action in actions {
+            match action {
+                FsAction::CreateDirectory(name) => {
+                    cwd.push(name);
+                    directories.insert(cwd.clone());
+                }
+                FsAction::CreateFile(name) => {
+                    files.insert(cwd.join(name));
+                }
+            }
+        }
+        Ok((directories, files))
     }
 
     // Helper structure that represents the filesystem as a tree in a form of Debug format
@@ -1516,5 +1504,207 @@ mod tests {
             .with(fmt_layer)
             .with(filter_layer)
             .init();
+    }
+
+    // #[cfg(not(miri))]
+    mod proptests {
+        use super::*;
+        use pmem::page::PagePool;
+        use prop::collection::hash_set;
+        use proptest::{collection::vec, prelude::*, prop_oneof, proptest, strategy::Strategy};
+        use std::{fs, ops::Range};
+        use tempfile::TempDir;
+
+        #[derive(Debug)]
+        enum WriteOperation {
+            Write(Vec<u8>),
+            Seek(SeekFrom),
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig {
+                cases: 1000,
+                ..ProptestConfig::default()
+            })]
+
+            #[test]
+            fn can_write_file(ops in vec(any_write_operation(), 0..10)) {
+                let mem = Memory::new(PagePool::new(1024 * 1024));
+                let mut fs = Filesystem::allocate(mem.start());
+
+                let tmp_dir = TempDir::new().unwrap();
+                let root = fs.get_root().unwrap();
+                let file = fs.create_file(&root, "file.txt").unwrap();
+                let shadow_file_path = tmp_dir.path().join("file.txt");
+
+                let mut file = fs.open_file(&file).unwrap();
+                let mut shadow_file = fs::File::create_new(shadow_file_path).unwrap();
+
+                for op in ops {
+                    match op {
+                        WriteOperation::Write(data) => {
+                            file.write_all(&data).unwrap();
+                            shadow_file.write_all(&data).unwrap();
+                        }
+                        WriteOperation::Seek(seek) => {
+                            let seek = adjust_seek(seek, &mut shadow_file)?;
+                            let pos_a = file.seek(seek).unwrap();
+                            let pos_b = shadow_file.seek(seek).unwrap();
+                            prop_assert_eq!(pos_a, pos_b, "Seek positions differs");
+                        }
+                    }
+                }
+                file.flush().unwrap();
+                shadow_file.flush().unwrap();
+
+                let pos_a = file.seek(SeekFrom::Start(0)).unwrap();
+                let pos_b = shadow_file.seek(SeekFrom::Start(0)).unwrap();
+                prop_assert_eq!(pos_a, 0, "Seek is not at the beginning");
+                prop_assert_eq!(pos_b, 0, "Seek is not at the beginning");
+
+                let mut file_buf = vec![];
+                file.read_to_end(&mut file_buf).unwrap();
+
+                let mut shadow_file_buf = vec![];
+                shadow_file.read_to_end(&mut shadow_file_buf).unwrap();
+
+                prop_assert_eq!(file_buf, shadow_file_buf);
+            }
+
+            #[test]
+            fn created_directory_can_be_found(paths in vec(any_path(None), 1..10)) {
+                let (mut fs, _) = create_fs();
+
+                for path in paths.iter() {
+                    let path = path.to_str().unwrap();
+                    fs.create_dirs(path)?;
+                    fs.find(path)?;
+                }
+            }
+
+            #[test]
+            fn created_file_can_be_found(paths in hash_set(any_path(None), 1..10)) {
+                let (mut fs, _) = create_fs();
+
+                for path in paths.into_iter() {
+                    // Adding file extension to make sure file names will not collide with directory names
+                    let path = path.with_extension("txt");
+
+                    let dir_path = path.parent().unwrap().to_str().unwrap();
+                    let file_name = path.file_name().unwrap().to_str().unwrap();
+
+                    let dir = fs.create_dirs(dir_path)?;
+                    fs.create_file(&dir, &file_name)?;
+                    fs.find(path.to_str().unwrap())?;
+                }
+            }
+
+            #[test]
+            fn can_detect_changes_on_fs(
+                a in any_fs_actions_uniq(Some("a."), 1..20),
+                b in any_fs_actions_uniq(Some("b."), 1..20),
+                common in any_fs_actions_uniq(None, 1..20)) {
+
+                // We have 3 disjoint sets of actions:
+                // 1. a - actions that are applied to fs_a
+                // 2. b - actions that are applied to fs_b
+                // 3. common - actions that are applied to both fs_a and fs_b
+
+                let (a_directories, a_files) = collect_directories_and_files(a.iter())?;
+                let (b_directories, b_files) = collect_directories_and_files(b.iter())?;
+                let (common_directories, common_files) = collect_directories_and_files(common.iter())?;
+
+                let (mut fs_a, _) = create_fs();
+                let (mut fs_b, _) = create_fs();
+
+                apply_fs_actions(&mut fs_a, common.iter())?;
+                apply_fs_actions(&mut fs_b, common.iter())?;
+
+                apply_fs_actions(&mut fs_a, a.iter())?;
+                apply_fs_actions(&mut fs_b, b.iter())?;
+
+                let (added, deleted) = fs_changes(&fs_a, &fs_b)?;
+                let mut added_paths = HashSet::new();
+                for item in added {
+                    let mut path = Rc::unwrap_or_clone(item.path);
+                    path.push(item.entry.name());
+                    added_paths.insert(path);
+                }
+                let expected_added = b_files.union(&b_directories).cloned().collect::<HashSet<_>>();
+                prop_assert_eq!(added_paths, expected_added,
+                    "\nFS A:\n {:?}\nFS B:\n {:?}",
+                    FsTree(&fs_a),
+                    FsTree(&fs_b));
+                // println!("{:?}", added_paths);
+
+            }
+
+            #[test]
+            fn foo(p in any_fs_actions_uniq(Some("1."), 1..10)) {
+                println!("{:?}", p);
+            }
+        }
+
+        fn any_write_operation() -> impl Strategy<Value = WriteOperation> {
+            prop_oneof![any_write(), any_seek()]
+        }
+
+        fn any_write() -> impl Strategy<Value = WriteOperation> {
+            vec(any::<u8>(), 0..10).prop_map(WriteOperation::Write)
+        }
+
+        fn any_seek() -> impl Strategy<Value = WriteOperation> {
+            const MAX_SEEK: usize = BLOCK_SIZE * INDIRECT_BLOCKS;
+            let seek_range = -10i64 * BLOCK_SIZE as i64..10 * BLOCK_SIZE as i64;
+
+            let from_end = seek_range.clone().prop_map(SeekFrom::End);
+            let from_start = (0u64..MAX_SEEK as u64).prop_map(SeekFrom::Start);
+            let from_current = seek_range.prop_map(SeekFrom::Current);
+
+            prop_oneof![from_end, from_start, from_current].prop_map(WriteOperation::Seek)
+        }
+
+        fn any_fs_action(prefix: Option<&str>) -> impl Strategy<Value = FsAction> + '_ {
+            prop_oneof![
+                any_path(prefix).prop_map(FsAction::CreateFile),
+                any_path(prefix).prop_map(FsAction::CreateDirectory),
+            ]
+        }
+
+        fn any_action_type(path: PathBuf) -> impl Strategy<Value = FsAction> {
+            prop_oneof![
+                Just(FsAction::CreateFile(path.clone())),
+                Just(FsAction::CreateDirectory(path.clone())),
+            ]
+        }
+
+        fn any_fs_actions_uniq(
+            prefix: Option<&str>,
+            range: Range<usize>,
+        ) -> impl Strategy<Value = Vec<FsAction>> + '_ {
+            hash_set(any_path(prefix), range).prop_flat_map(any_action_each)
+        }
+
+        fn any_action_each(
+            paths: impl IntoIterator<Item = PathBuf>,
+        ) -> impl Strategy<Value = Vec<FsAction>> {
+            paths.into_iter().map(any_action_type).collect::<Vec<_>>()
+        }
+
+        fn any_path(prefix: Option<&str>) -> impl Strategy<Value = PathBuf> + '_ {
+            vec(any_file_name(prefix), 1..3)
+                .prop_map(|c| format!("/{}", c.join("/")))
+                .prop_map(PathBuf::from)
+        }
+
+        fn any_file_name(prefix: Option<&str>) -> impl Strategy<Value = String> + '_ {
+            let prefix = prefix.unwrap_or_default();
+            prop_oneof![
+                "alfa", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india",
+                "juliett", "kilo", "lima", "mike", "november", "oscar", "papa", "quebec", "romeo",
+                "sierra", "tango", "uniform", "victor", "whiskey", "x-ray", "yankee", "zulu"
+            ]
+            .prop_map(move |s| format!("{}{}", prefix, s))
+        }
     }
 }
