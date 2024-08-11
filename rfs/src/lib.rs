@@ -1446,7 +1446,12 @@ mod tests {
     /// - `/a`
     fn all_intermediate_paths(path: impl AsRef<Path>) -> impl Iterator<Item = PathBuf> {
         let path = path.as_ref();
+
+        // On windows we can't use `path.is_absolute()` because only paths starting with a drive
+        // letter are considered absolute.
+        #[cfg(unix)]
         debug_assert!(path.is_absolute(), "Path must be absolute");
+
         let mut next = Some(path.to_path_buf());
         std::iter::from_fn(move || {
             let path = next.take().filter(|p| p != Path::new("/"))?;
