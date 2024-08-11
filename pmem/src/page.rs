@@ -1017,7 +1017,6 @@ mod tests {
                 Write(0, vec![0, 1, 2, 3, 4, 5]),
             );
 
-            // TODO replace with proptests
             assert_merged(
                 Write(3, vec![3, 4, 5]),
                 Write(0, vec![0, 1, 2]),
@@ -1293,7 +1292,7 @@ mod tests {
             }
 
             #[test]
-            fn connected_patches_are_adjacent_after_normalization((a, b) in patches::any_connected_pair()) {
+            fn connected_patches_are_adjacent_after_normalization((a, b) in patches::connected()) {
                 for p in a.normalize(b).to_vec().windows(2) {
                     prop_assert!(p[0].adjacent(p[1]), "Patches must be adjacent: {:?}, {:?}", p[0],p[1]);
                 }
@@ -1393,7 +1392,7 @@ mod tests {
                 ]
             }
 
-            pub(super) fn any_connected_pair() -> impl Strategy<Value = (Patch, Patch)> {
+            pub(super) fn connected() -> impl Strategy<Value = (Patch, Patch)> {
                 prop_oneof![
                     adjacent(),
                     overlapped(),

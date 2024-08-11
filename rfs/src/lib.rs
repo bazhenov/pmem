@@ -721,7 +721,6 @@ impl<'a> Write for File<'a> {
     #[instrument(level = "trace", skip(self, buf), fields(buf.len = buf.len(), pos=self.pos), ret)]
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         // user can seek after the end of file and write there, so we use self.pos here
-        // TODO what we right after the end of file, should we extend the file?
         if self.pos + buf.len() as u64 > self.meta.size {
             // there is not enough space in the file, we need to allocate more blocks
             let current_blocks = blocks_required(self.meta.size);
@@ -1434,7 +1433,7 @@ mod tests {
         assert_eq!(paths, expected);
     }
 
-    /// Iterates over all intermediate paths of the given path exluding the root.
+    /// Iterates over all intermediate paths of the given path excluding the root.
     ///
     /// For example, for the path `/a/b/c` it will return (in no particular order):
     /// - `/a/b/c`
@@ -1666,41 +1665,41 @@ mod tests {
                 let mem = Memory::new(PagePool::new(1024 * 1024));
                 let mut fs = Filesystem::allocate(mem.start());
 
-                let tmp_dir = TempDir::new().unwrap();
-                let root = fs.get_root().unwrap();
-                let file = fs.create_file(&root, "file.txt").unwrap();
+                let tmp_dir = TempDir::new()?;
+                let root = fs.get_root()?;
+                let file = fs.create_file(&root, "file.txt")?;
                 let shadow_file_path = tmp_dir.path().join("file.txt");
 
-                let mut file = fs.open_file(&file).unwrap();
-                let mut shadow_file = fs::File::create_new(shadow_file_path).unwrap();
+                let mut file = fs.open_file(&file)?;
+                let mut shadow_file = fs::File::create_new(shadow_file_path)?;
 
                 for op in ops {
                     match op {
                         WriteOperation::Write(data) => {
-                            file.write_all(&data).unwrap();
-                            shadow_file.write_all(&data).unwrap();
+                            file.write_all(&data)?;
+                            shadow_file.write_all(&data)?;
                         }
                         WriteOperation::Seek(seek) => {
                             let seek = adjust_seek(seek, &mut shadow_file)?;
-                            let pos_a = file.seek(seek).unwrap();
-                            let pos_b = shadow_file.seek(seek).unwrap();
+                            let pos_a = file.seek(seek)?;
+                            let pos_b = shadow_file.seek(seek)?;
                             prop_assert_eq!(pos_a, pos_b, "Seek positions differs");
                         }
                     }
                 }
-                file.flush().unwrap();
-                shadow_file.flush().unwrap();
+                file.flush()?;
+                shadow_file.flush()?;
 
-                let pos_a = file.seek(SeekFrom::Start(0)).unwrap();
-                let pos_b = shadow_file.seek(SeekFrom::Start(0)).unwrap();
+                let pos_a = file.seek(SeekFrom::Start(0))?;
+                let pos_b = shadow_file.seek(SeekFrom::Start(0))?;
                 prop_assert_eq!(pos_a, 0, "Seek is not at the beginning");
                 prop_assert_eq!(pos_b, 0, "Seek is not at the beginning");
 
                 let mut file_buf = vec![];
-                file.read_to_end(&mut file_buf).unwrap();
+                file.read_to_end(&mut file_buf)?;
 
                 let mut shadow_file_buf = vec![];
-                shadow_file.read_to_end(&mut shadow_file_buf).unwrap();
+                shadow_file.read_to_end(&mut shadow_file_buf)?;
 
                 prop_assert_eq!(file_buf, shadow_file_buf);
             }
