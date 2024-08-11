@@ -32,7 +32,7 @@ jobs:
           cat /dev/null > target/benchmark.txt
           target/benchmarks/page --color=never compare baseline-branch/target/benchmarks/page \
             -v -t 1 --fail-threshold 10 | tee -a target/benchmark.txt
-          target/benchmarks/page --color=never compare baseline-branch/target/benchmarks/page \
+          target/benchmarks/rfs --color=never compare baseline-branch/target/benchmarks/rfs \
             -v -t 1 --fail-threshold 10 | tee -a target/benchmark.txt
 
       - uses: actions/upload-artifact@v3
