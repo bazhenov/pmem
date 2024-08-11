@@ -977,10 +977,10 @@ impl fmt::Debug for Str {
     }
 }
 
-/// Join two sorted iterators into a single iterator that yields pairs of equal elements
+/// Join two sorted iterators into a single iterator of type [`Joined<T>`] on the same elements.
 ///
-/// The input iterators must be sorted in ascending order. If there is no pair for an element
-/// from one of the iterators, the corresponding element in the pair will be `None`.
+/// The input iterators must be sorted in ascending order. Emits [`Joined::Left`], [`Joined::Right`]
+/// or [`Joined::Both`] depending on which iterarots has the element present.
 struct Join<I: Iterator>(Peekable<I>, Peekable<I>);
 
 impl<T, I: Iterator<Item = T>> Join<I> {
@@ -1409,6 +1409,8 @@ mod tests {
 
     #[test]
     fn check_join_iterator() {
+        use Joined::*;
+
         let a = vec![1, 4, 5];
         let b = vec![3, 4, 6];
 
@@ -1416,13 +1418,7 @@ mod tests {
 
         assert_eq!(
             entries,
-            vec![
-                Joined::Left(1),
-                Joined::Right(3),
-                Joined::Both(4, 4),
-                Joined::Left(5),
-                Joined::Right(6),
-            ]
+            vec![Left(1), Right(3), Both(4, 4), Left(5), Right(6),]
         );
     }
 
@@ -1552,8 +1548,8 @@ mod tests {
         Ok(())
     }
 
-    // Helper structure that represents the filesystem as a tree in a form of Debug format
-    // (eg. "{:?}" in print! macro will print the tree structure of the filesystem)
+    /// Helper structure that represents the filesystem as a tree in a form of [`Debug`] format
+    /// (eg. `{:?}` in print! macro will print the tree structure of the filesystem)
     struct FsTree<'a>(&'a Filesystem);
 
     impl<'a> fmt::Debug for FsTree<'a> {
