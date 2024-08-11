@@ -470,8 +470,11 @@ impl Iterator for ReadDir<'_> {
 
 #[derive(Clone)]
 pub struct Change {
+    #[allow(unused)]
     path: Rc<PathBuf>,
+    #[allow(unused)]
     entry: FileMeta,
+    #[allow(unused)]
     kind: ChangeKind,
 }
 
@@ -492,6 +495,13 @@ impl Change {
             entry,
             kind: ChangeKind::Added,
         }
+    }
+
+    #[cfg(test)]
+    fn into_path(self) -> PathBuf {
+        let mut path = Rc::unwrap_or_clone(self.path);
+        path.push(self.entry.name());
+        path
     }
 
     #[cfg(test)]
@@ -1412,6 +1422,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn check_intermediate_paths() {
+        let path = PathBuf::from("/a/b/c/");
+
+        let paths = all_intermediate_paths(&path).collect::<HashSet<_>>();
+        let mut expected = HashSet::new();
+        expected.insert(PathBuf::from("/a"));
+        expected.insert(PathBuf::from("/a/b"));
+        expected.insert(PathBuf::from("/a/b/c"));
+        assert_eq!(paths, expected);
+    }
+
+    /// Iterates over all intermediate paths of the given path exluding the root.
+    ///
+    /// For example, for the path `/a/b/c` it will return (in no particular order):
+    /// - `/a/b/c`
+    /// - `/a/b`
+    /// - `/a`
+    fn all_intermediate_paths(path: impl AsRef<Path>) -> impl Iterator<Item = PathBuf> {
+        let path = path.as_ref();
+        debug_assert!(path.is_absolute(), "Path must be absolute");
+        let mut next = Some(path.to_path_buf());
+        std::iter::from_fn(move || {
+            let path = next.take().filter(|p| p != Path::new("/"))?;
+            next = path.parent().map(Path::to_path_buf);
+            Some(path)
+        })
+    }
+
     fn assert_uniq_and_sorted<T: Ord + Debug>(mut iter: impl Iterator<Item = T>) {
         let mut prev = iter.next();
         while let (Some(a), Some(b)) = (prev, iter.next()) {
@@ -1473,6 +1512,15 @@ mod tests {
         CreateDirectory(PathBuf),
     }
 
+    impl FsAction {
+        fn path(&self) -> &PathBuf {
+            match self {
+                FsAction::CreateFile(path) => path,
+                FsAction::CreateDirectory(path) => path,
+            }
+        }
+    }
+
     fn apply_fs_actions<'a>(
         fs: &mut Filesystem,
         actions: impl Iterator<Item = &'a FsAction>,
@@ -1493,29 +1541,6 @@ mod tests {
         }
 
         Ok(())
-    }
-
-    // Converts a sequence of filesystem actions to a set of directories and files that should be created
-    // in order to apply the actions
-    fn collect_directories_and_files<'a>(
-        actions: impl Iterator<Item = &'a FsAction>,
-    ) -> Result<(HashSet<PathBuf>, HashSet<PathBuf>)> {
-        let mut cwd = PathBuf::from("/");
-        let mut directories = HashSet::new();
-        let mut files = HashSet::new();
-
-        for action in actions {
-            match action {
-                FsAction::CreateDirectory(name) => {
-                    cwd.push(name);
-                    directories.insert(cwd.clone());
-                }
-                FsAction::CreateFile(name) => {
-                    files.insert(cwd.join(name));
-                }
-            }
-        }
-        Ok((directories, files))
     }
 
     // Helper structure that represents the filesystem as a tree in a form of Debug format
@@ -1623,6 +1648,13 @@ mod tests {
             Seek(SeekFrom),
         }
 
+        /// Random strings used to generate file and directory names
+        const NATO_ALPHABET: [&str; 26] = [
+            "alfa", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india",
+            "juliett", "kilo", "lima", "mike", "november", "oscar", "papa", "quebec", "romeo",
+            "sierra", "tango", "uniform", "victor", "whiskey", "x-ray", "yankee", "zulu",
+        ];
+
         proptest! {
             #![proptest_config(ProptestConfig {
                 cases: 1000,
@@ -1703,16 +1735,13 @@ mod tests {
 
             #[test]
             fn can_detect_changes_on_fs(
-                a in any_fs_actions_uniq(Some("a-"), 1..20),
-                b in any_fs_actions_uniq(Some("b-"), 1..20),
-                common in any_fs_actions_uniq(None, 1..20)) {
+                a in any_fs_actions_uniq(Some("a-"), 1..10),
+                b in any_fs_actions_uniq(Some("b-"), 1..10),
+                common in any_fs_actions_uniq(None, 1..10)
+            ) {
                 // We have 3 disjoint sets of actions:
                 // - A and B - actions that are applied to FS A and FS B respectively
                 // - common - actions that are applied to both FS
-
-                let (_a_directories, _a_files) = collect_directories_and_files(a.iter())?;
-                let (b_directories, b_files) = collect_directories_and_files(b.iter())?;
-                let (_common_directories, _common_files) = collect_directories_and_files(common.iter())?;
 
                 let (mut fs_a, _) = create_fs();
                 let (mut fs_b, _) = create_fs();
@@ -1720,32 +1749,26 @@ mod tests {
                 apply_fs_actions(&mut fs_a, a.iter().chain(common.iter()))?;
                 apply_fs_actions(&mut fs_b, b.iter().chain(common.iter()))?;
 
-                let (added, _deleted) = fs_changes(&fs_a, &fs_b);
-                let mut added_paths = HashSet::new();
+                let (added, deleted) = fs_changes(&fs_a, &fs_b);
 
-                for item in added {
-                    let mut path = Rc::unwrap_or_clone(item.path);
+                let added = added.into_iter().map(Change::into_path).collect::<HashSet<_>>();
+                let added_expected = b.iter()
+                    .map(FsAction::path)
+                    .flat_map(all_intermediate_paths)
+                    .collect::<HashSet<_>>();
 
-                    path.push(item.entry.name());
-                    added_paths.insert(path);
-                }
+                prop_assert_eq!(added, added_expected,
+                    "\nFS A:\n {:?}\nFS B:\n {:?}",
+                    FsTree(&fs_a),
+                    FsTree(&fs_b));
 
-                let expected_added = b_files.union(&b_directories).cloned().collect::<HashSet<_>>();
-                let mut expected = HashSet::new();
-                // TODO: requires some attention in refactoring
-                for path in expected_added {
-                    let mut path = path.as_path();
-                    expected.insert(path.to_path_buf());
-                    while let Some(parent) = path.parent() {
-                        if parent != Path::new("/") {
-                            expected.insert(parent.to_path_buf());
-                        }
-                        path = parent
-                    }
-                }
+                let deleted = deleted.into_iter().map(Change::into_path).collect::<HashSet<_>>();
+                let deleted_expected = a.iter()
+                    .map(FsAction::path)
+                    .flat_map(all_intermediate_paths)
+                    .collect::<HashSet<_>>();
 
-
-                prop_assert_eq!(added_paths, expected,
+                prop_assert_eq!(deleted, deleted_expected,
                     "\nFS A:\n {:?}\nFS B:\n {:?}",
                     FsTree(&fs_a),
                     FsTree(&fs_b));
@@ -1793,19 +1816,15 @@ mod tests {
         }
 
         fn any_path(prefix: Option<&str>) -> impl Strategy<Value = PathBuf> + '_ {
-            vec(any_file_name(prefix), 1..3)
+            vec(any_file_name(prefix), 3)
                 .prop_map(|c| format!("/{}", c.join("/")))
                 .prop_map(PathBuf::from)
         }
 
         fn any_file_name(prefix: Option<&str>) -> impl Strategy<Value = String> + '_ {
-            let prefix = prefix.unwrap_or_default();
-            prop_oneof![
-                "alfa", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india",
-                "juliett", "kilo", "lima", "mike", "november", "oscar", "papa", "quebec", "romeo",
-                "sierra", "tango", "uniform", "victor", "whiskey", "x-ray", "yankee", "zulu"
-            ]
-            .prop_map(move |s| format!("{}{}", prefix, s))
+            (0..NATO_ALPHABET.len())
+                .prop_map(|i| NATO_ALPHABET[i])
+                .prop_map(move |s| format!("{}{}", prefix.unwrap_or_default(), s))
         }
     }
 }
