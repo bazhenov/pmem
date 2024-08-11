@@ -1,7 +1,4 @@
-use pmem::{
-    page::{PagePool, PAGE_SIZE},
-    Memory,
-};
+use pmem::{page::PagePool, Memory};
 use rand::{rngs::SmallRng, seq::SliceRandom, Rng, SeedableRng};
 use rfs::{FileMeta, Filesystem};
 use std::io::{Read, Seek, SeekFrom, Write};
