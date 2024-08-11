@@ -142,7 +142,8 @@ fn create_deep_tree(fs: &mut Filesystem, parent: &FileMeta, level: u64, names: &
 }
 
 fn create_fs() -> Filesystem {
-    let mem = Memory::new(PagePool::new(2usize.pow(32) / PAGE_SIZE)); // 4GiB
+    let pool = PagePool::with_capacity(2usize.pow(32)); // 4GiB
+    let mem = Memory::new(pool);
     Filesystem::allocate(mem.start())
 }
 

@@ -5,7 +5,7 @@
 //! $ mkdir mnt
 //! $ mount -t nfs -o nolocks,vers=3,tcp,port=11111,mountport=11111,soft 127.0.0.1:/ mnt/
 //! ```
-use crate::{FileMeta, Filesystem, NodeType};
+use crate::{Change, FileMeta, Filesystem, NodeType};
 use async_trait::async_trait;
 use nfsserve::{
     nfs::{
@@ -14,22 +14,67 @@ use nfsserve::{
     },
     vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities},
 };
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use pmem::Memory;
+use std::{
+    io::{self, Read, Seek, SeekFrom, Write},
+    mem,
+    ops::{Deref, DerefMut},
+    sync::Arc,
+};
 use tokio::sync::Mutex;
 use tracing::instrument;
 
 pub struct RFS {
-    fs: Mutex<Filesystem>,
+    state: Arc<Mutex<RfsState>>,
     root_id: fileid3,
 }
 
+pub struct RfsState {
+    fs: Filesystem,
+    mem: Memory,
+}
+
+impl RfsState {
+    pub async fn commit_and_get_changes(&mut self) -> Vec<Change> {
+        let mut prev_fs = Filesystem::open(self.mem.start());
+
+        let changes = self.fs.changes_from(&prev_fs).collect::<Vec<_>>();
+        mem::swap(&mut self.fs, &mut prev_fs);
+        let tx = prev_fs.finish();
+        self.mem.commit(tx);
+        self.fs = Filesystem::open(self.mem.start());
+
+        changes
+    }
+}
+
+impl Deref for RfsState {
+    type Target = Filesystem;
+
+    fn deref(&self) -> &Self::Target {
+        &self.fs
+    }
+}
+
+impl DerefMut for RfsState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.fs
+    }
+}
+
 impl RFS {
-    pub fn new(fs: Filesystem) -> RFS {
+    pub fn new(mem: Memory) -> RFS {
+        let fs = Filesystem::open(mem.start());
         let root = fs.get_root().unwrap();
+        let state = RfsState { fs, mem };
         RFS {
-            fs: Mutex::new(fs),
+            state: Arc::new(Mutex::new(state)),
             root_id: root.fid,
         }
+    }
+
+    pub fn state_handle(&self) -> Arc<Mutex<RfsState>> {
+        self.state.clone()
     }
 }
 
@@ -47,7 +92,7 @@ impl NFSFileSystem for RFS {
 
     #[instrument(level = "trace", skip(self, data), fields(data.len = data.len()), err(Debug, level = "warn"))]
     async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
-        let mut fs = self.fs.lock().await;
+        let mut fs = self.state.lock().await;
 
         let meta = fs.lookup_by_id(id).map_err(io_to_nfs_error)?;
         let mut file = fs.open_file(&meta).map_err(io_to_nfs_error)?;
@@ -68,7 +113,7 @@ impl NFSFileSystem for RFS {
         filename: &filename3,
         _attr: sattr3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
-        let mut fs = self.fs.lock().await;
+        let mut fs = self.state.lock().await;
         let dir = fs.lookup_by_id(dirid).map_err(io_to_nfs_error)?;
         let new_file = fs
             .create_file(&dir, to_string(filename))
@@ -82,7 +127,7 @@ impl NFSFileSystem for RFS {
         dirid: fileid3,
         filename: &filename3,
     ) -> Result<fileid3, nfsstat3> {
-        let mut fs = self.fs.lock().await;
+        let mut fs = self.state.lock().await;
         let dir = fs.lookup_by_id(dirid).map_err(io_to_nfs_error)?;
         let new_file = fs
             .create_file(&dir, to_string(filename))
@@ -92,7 +137,7 @@ impl NFSFileSystem for RFS {
 
     #[instrument(level = "trace", skip(self))]
     async fn lookup(&self, dirid: fileid3, filename: &filename3) -> Result<fileid3, nfsstat3> {
-        let fs = self.fs.lock().await;
+        let fs = self.state.lock().await;
         let filename = to_string(filename);
         let dir = fs.lookup_by_id(dirid).map_err(io_to_nfs_error)?;
         let result = fs.lookup(&dir, filename).map_err(io_to_nfs_error)?;
@@ -101,15 +146,14 @@ impl NFSFileSystem for RFS {
 
     #[instrument(level = "trace", skip(self))]
     async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3> {
-        let fs = self.fs.lock().await;
+        let fs = self.state.lock().await;
         let entry = fs.lookup_by_id(id).map_err(io_to_nfs_error)?;
         Ok(create_fattr(&entry))
     }
 
     #[instrument(level = "trace", skip(self), err(Debug, level = "warn"))]
     async fn setattr(&self, id: fileid3, _setattr: sattr3) -> Result<fattr3, nfsstat3> {
-        let fs = self.fs.lock().await;
-
+        let fs = self.state.lock().await;
         let file = fs.lookup_by_id(id).map_err(io_to_nfs_error)?;
 
         Ok(create_fattr(&file))
@@ -122,7 +166,7 @@ impl NFSFileSystem for RFS {
         offset: u64,
         count: u32,
     ) -> Result<(Vec<u8>, bool), nfsstat3> {
-        let mut fs = self.fs.lock().await;
+        let mut fs = self.state.lock().await;
 
         let entry = fs.lookup_by_id(id).map_err(io_to_nfs_error)?;
         if entry.node_type != NodeType::File {
@@ -145,31 +189,24 @@ impl NFSFileSystem for RFS {
         start_after: fileid3,
         max_entries: usize,
     ) -> Result<ReadDirResult, nfsstat3> {
-        let fs = self.fs.lock().await;
+        let fs = self.state.lock().await;
 
         let dir = fs.lookup_by_id(dirid).map_err(io_to_nfs_error)?;
 
-        let mut children = fs.readdir(&dir).collect::<Vec<_>>();
-        let start_idx = start_after as usize;
-        if start_idx >= children.len() {
-            return Ok(ReadDirResult {
-                entries: vec![],
-                end: true,
-            });
-        }
-        let end_idx = (start_idx + max_entries).min(children.len());
-        let entries = children
-            .drain(start_idx..end_idx)
+        let entries = fs
+            .readdir(&dir)
+            .skip(start_after as usize)
+            .take(max_entries)
             .map(to_dir_entry)
             .collect::<Vec<_>>();
-        let end = end_idx <= children.len();
+        let end = entries.len() < max_entries;
         Ok(ReadDirResult { entries, end })
     }
 
     #[instrument(level = "trace", skip(self), err(Debug, level = "warn"))]
     #[allow(unused)]
     async fn remove(&self, dirid: fileid3, filename: &filename3) -> Result<(), nfsstat3> {
-        let mut fs = self.fs.lock().await;
+        let mut fs = self.state.lock().await;
         let dir_meta = fs.lookup_by_id(dirid).map_err(io_to_nfs_error)?;
         fs.delete(&dir_meta, to_string(filename))
             .map_err(io_to_nfs_error)
@@ -194,7 +231,7 @@ impl NFSFileSystem for RFS {
         dirid: fileid3,
         dirname: &filename3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
-        let mut fs = self.fs.lock().await;
+        let mut fs = self.state.lock().await;
 
         let parent = fs.lookup_by_id(dirid).map_err(io_to_nfs_error)?;
         let name = String::from_utf8(dirname.0.clone())

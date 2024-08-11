@@ -1,7 +1,7 @@
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use pmem::{page::PagePool, Memory};
-use rfs::{nfs::RFS, Filesystem};
-use std::io;
+use rfs::{nfs::RFS, ChangeKind, Filesystem};
+use std::io::{self, Write};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 const HOSTPORT: u32 = 11111;
@@ -16,11 +16,42 @@ async fn main() {
         .with(filter_layer)
         .init();
 
-    let pool = PagePool::new(1024);
-    let mem = Memory::new(pool);
-    let fs = Filesystem::allocate(mem.start());
-    let listener = NFSTcpListener::bind(&format!("127.0.0.1:{HOSTPORT}"), RFS::new(fs))
+    let pool = PagePool::with_capacity(100 * 1024 * 1024);
+    let mut mem = Memory::new(pool);
+    let tx = Filesystem::allocate(mem.start()).finish();
+    mem.commit(tx);
+
+    let rfs = RFS::new(mem);
+    let state = rfs.state_handle();
+    let listener = NFSTcpListener::bind(&format!("127.0.0.1:{HOSTPORT}"), rfs)
         .await
         .unwrap();
-    listener.handle_forever().await.unwrap();
+
+    tokio::spawn(async move { listener.handle_forever().await });
+
+    loop {
+        print!("> ");
+        io::stdout().flush().unwrap();
+        let mut cmd = String::new();
+        io::stdin().read_line(&mut cmd).unwrap();
+
+        if cmd.trim() == "exit" {
+            break;
+        } else if cmd.trim() == "commit" {
+            let changes = {
+                let mut s = state.lock().await;
+                s.commit_and_get_changes().await
+            };
+            for change in changes {
+                let marker = match change.kind() {
+                    ChangeKind::Add => "A",
+                    ChangeKind::Delete => "D",
+                    ChangeKind::Update => "M",
+                };
+                println!("{} {}", marker, change.into_path().display());
+            }
+        } else {
+            println!("Unknown command: {}", cmd)
+        }
+    }
 }

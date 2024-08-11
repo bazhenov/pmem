@@ -360,7 +360,8 @@ impl PagePool {
     /// Constructs a new `PagePool` with a specified number of pages.
     ///
     /// This function initializes a `PagePool` instance with an empty set of patches and
-    /// a given number of pages.
+    /// a given number of pages. See [`Self::with_capacity`] for creating a pool with a specified
+    /// capacity in bytes.
     ///
     /// # Arguments
     ///
@@ -376,6 +377,11 @@ impl PagePool {
         Self {
             latest: Arc::new(snapshot),
         }
+    }
+
+    pub fn with_capacity(bytes: usize) -> Self {
+        let pages = bytes / PAGE_SIZE;
+        Self::new(pages)
     }
 
     /// Takes a snapshot of the current state of the `PagePool`.

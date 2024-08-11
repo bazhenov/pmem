@@ -466,6 +466,8 @@ impl Iterator for ReadDir<'_> {
         self.next = child.next;
         Some(FileMeta::from(child, &self.fs.tx).unwrap())
     }
+
+    // TODO implement `nth()` method so skip() can be implemented in efficient way
 }
 
 #[derive(Clone)]
@@ -484,7 +486,7 @@ impl Change {
         Self {
             path,
             entry,
-            kind: ChangeKind::Deleted,
+            kind: ChangeKind::Delete,
         }
     }
 
@@ -493,21 +495,24 @@ impl Change {
         Self {
             path,
             entry,
-            kind: ChangeKind::Added,
+            kind: ChangeKind::Add,
         }
     }
 
-    #[cfg(test)]
-    fn into_path(self) -> PathBuf {
+    pub fn into_path(self) -> PathBuf {
         let mut path = Rc::unwrap_or_clone(self.path);
         path.push(self.entry.name());
         path
     }
 
+    pub fn kind(&self) -> ChangeKind {
+        self.kind
+    }
+
     #[cfg(test)]
     fn take_if_added(self) -> Option<Change> {
         match self.kind {
-            ChangeKind::Added => Some(self),
+            ChangeKind::Add => Some(self),
             _ => None,
         }
     }
@@ -515,7 +520,7 @@ impl Change {
     #[cfg(test)]
     fn take_if_deleted(self) -> Option<Change> {
         match self.kind {
-            ChangeKind::Deleted => Some(self),
+            ChangeKind::Delete => Some(self),
             _ => None,
         }
     }
@@ -523,9 +528,9 @@ impl Change {
 
 #[derive(Clone, Copy)]
 pub enum ChangeKind {
-    Added,
-    Deleted,
-    Updated,
+    Add,
+    Delete,
+    Update,
 }
 
 pub struct Changes<'a> {
