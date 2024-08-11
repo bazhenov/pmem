@@ -380,7 +380,7 @@ impl PagePool {
     }
 
     pub fn with_capacity(bytes: usize) -> Self {
-        let pages = bytes / PAGE_SIZE;
+        let pages = (bytes + PAGE_SIZE) / PAGE_SIZE;
         Self::new(pages)
     }
 
