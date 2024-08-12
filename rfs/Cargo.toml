@@ -20,5 +20,5 @@ rand = { workspace = true, features = ["small_rng"] }
 tango-bench = { workspace = true }
 
 [[bench]]
-name = "rfs"
+name = "rfs-bench"
 harness = false

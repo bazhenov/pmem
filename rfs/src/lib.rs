@@ -4,11 +4,14 @@ use pmem::{
 };
 use pmem_derive::Record;
 use std::{
+    cmp::Ordering,
     convert::Into,
     fmt,
     io::{self, Error, ErrorKind, Read, Seek, SeekFrom, Write},
+    iter::Peekable,
     ops::{Deref, DerefMut},
     path::{self, Component, Path, PathBuf},
+    rc::Rc,
 };
 use tracing::{instrument, trace};
 
@@ -107,9 +110,16 @@ impl Filesystem {
 
         let mut dir = self.lookup_inode(dir)?;
         let file_info = if let Some(children) = dir.children {
-            self.create_child(children, file_name, NodeType::File)?
+            let child = self
+                .create_child(children, file_name, NodeType::File)?
                 .ok()
-                .ok_or(ErrorKind::AlreadyExists)?
+                .ok_or(ErrorKind::AlreadyExists)?;
+            // Update the parent directory if the new child is the first in the list
+            if child.next == Some(children) {
+                dir.children = Some(child.ptr());
+                self.tx.update(&dir)?;
+            }
+            child
         } else {
             let new_node = self.write_fsnode(file_name, NodeType::File)?;
             dir.children = Some(new_node.ptr());
@@ -140,9 +150,16 @@ impl Filesystem {
         let mut parent = self.lookup_inode(parent)?;
 
         let directory_inode = if let Some(first_child) = parent.children {
-            self.create_child(first_child, name.as_ref(), NodeType::Directory)?
+            let new_child = self
+                .create_child(first_child, name.as_ref(), NodeType::Directory)?
                 .ok()
-                .ok_or(ErrorKind::AlreadyExists)?
+                .ok_or(ErrorKind::AlreadyExists)?;
+            // Update the parent directory if the new child is the first in the list
+            if new_child.next == Some(first_child) {
+                parent.children = Some(new_child.ptr());
+                self.tx.update(&parent)?;
+            }
+            new_child
         } else {
             let dir_inode = self.write_fsnode(name.as_ref(), NodeType::Directory)?;
             parent.children = Some(dir_inode.ptr());
@@ -157,20 +174,16 @@ impl Filesystem {
     ///
     /// Returns:
     /// - [ErrorKind::NotFound] if the directory does not exist
-    pub fn readdir(&self, dir: &FileMeta) -> Result<Vec<FileMeta>> {
-        let parent = self.lookup_inode(dir)?;
+    pub fn readdir<'a>(&'a self, dir: &FileMeta) -> impl Iterator<Item = FileMeta> + 'a {
+        self.do_readdir(dir)
+    }
 
-        if let Some(children) = parent.children {
-            let mut result = vec![];
-            let mut current_node = Some(children);
-            while let Some(node) = current_node {
-                let child = self.tx.lookup(node)?;
-                current_node = child.next;
-                result.push(FileMeta::from(child, &self.tx)?);
-            }
-            Ok(result)
-        } else {
-            Ok(vec![])
+    fn do_readdir(&self, dir: &FileMeta) -> ReadDir {
+        let parent = self.lookup_inode(dir).unwrap();
+
+        ReadDir {
+            fs: self,
+            next: parent.children,
         }
     }
 
@@ -183,18 +196,40 @@ impl Filesystem {
                 return Err(ErrorKind::InvalidInput.into());
             };
 
-            node = if node.children.is_none() {
+            node = if let Some(first_child) = node.children {
+                let new_child = self
+                    .create_child(first_child, name.to_str().unwrap(), NodeType::Directory)?
+                    .unwrap_or_else(|found_dir| found_dir);
+                // Update the directory FNode if the new child is the first in the list
+                if new_child.next == Some(first_child) {
+                    node.children = Some(new_child.ptr());
+                    self.tx.update(&node)?;
+                }
+                new_child
+            } else {
                 let new_node = self.write_fsnode(name.to_str().unwrap(), NodeType::Directory)?;
                 node.children = Some(new_node.ptr());
                 self.tx.update(&node)?;
                 new_node
-            } else {
-                self.create_child(node.ptr(), name.to_str().unwrap(), NodeType::Directory)?
-                    .unwrap_or_else(|found_dir| found_dir)
             }
         }
 
         FileMeta::from(node, &self.tx)
+    }
+
+    pub fn changes_from<'a>(&'a self, other: &'a Self) -> impl Iterator<Item = Change> + 'a {
+        let a = other.do_readdir(&other.get_root().unwrap());
+        let b = self.do_readdir(&self.get_root().unwrap());
+        Changes {
+            a_fs: other,
+            b_fs: self,
+            stack: vec![Join::new(a, b)],
+            path: Rc::new(PathBuf::from("/")),
+        }
+    }
+
+    pub fn finish(self) -> Transaction {
+        self.tx
     }
 
     fn get_root_handle(&self) -> Handle<FNode> {
@@ -241,28 +276,37 @@ impl Filesystem {
         Err(ErrorKind::NotFound.into())
     }
 
-    /// Returns `Ok(child)` if it was found otherwise create new [FileInfo] and returns `Err(new_child)`
+    /// Returns `Ok(child)` if it was created successfully otherwise returns existing child: `Err(child)`
     fn create_child(
         &mut self,
         start_node: Ptr<FNode>,
         name: &str,
         node_type: NodeType,
     ) -> Result<CreateResult> {
-        let mut prev_node = start_node;
+        let mut prev_node = None;
         let mut cur_node = Some(start_node);
         while let Some(node) = cur_node {
-            let value = self.tx.lookup(node)?;
-            let child_name = value.name(&self.tx)?;
-            if name == child_name.as_str() {
-                return Ok(CreateResult::Err(value));
+            let node = self.tx.lookup(node)?;
+            let child_name = node.name(&self.tx)?;
+            match child_name.as_str().cmp(name) {
+                Ordering::Equal => return Ok(CreateResult::Err(node)),
+                Ordering::Greater => break,
+                Ordering::Less => {
+                    prev_node = cur_node;
+                    cur_node = node.next;
+                }
             }
-            prev_node = node;
-            cur_node = value.next;
         }
-        let new_node = self.write_fsnode(name, node_type)?;
-        let mut prev_node = self.tx.lookup(prev_node)?;
-        prev_node.next = Some(new_node.ptr());
-        self.tx.update(&prev_node)?;
+
+        let mut new_node = self.write_fsnode(name, node_type)?;
+        new_node.next = cur_node;
+        self.tx.update(&new_node)?;
+
+        if let Some(prev_node) = prev_node {
+            let mut prev_node = self.tx.lookup(prev_node)?;
+            prev_node.next = Some(new_node.ptr());
+            self.tx.update(&prev_node)?;
+        }
 
         Ok(CreateResult::Ok(new_node))
     }
@@ -401,6 +445,221 @@ impl<'a> File<'a> {
     }
 }
 
+/// Iteaor over the directory entries. Created by [`Filesystem::readdir`]
+struct ReadDir<'a> {
+    fs: &'a Filesystem,
+    next: Option<Ptr<FNode>>,
+}
+
+impl<'a> ReadDir<'a> {
+    fn empty(fs: &'a Filesystem) -> Self {
+        Self { fs, next: None }
+    }
+}
+
+impl Iterator for ReadDir<'_> {
+    type Item = FileMeta;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let node = self.next.take()?;
+        let child = self.fs.tx.lookup(node).unwrap();
+        self.next = child.next;
+        Some(FileMeta::from(child, &self.fs.tx).unwrap())
+    }
+
+    // TODO implement `nth()` method so skip() can be implemented in efficient way
+}
+
+#[derive(Clone)]
+pub struct Change {
+    #[allow(unused)]
+    path: Rc<PathBuf>,
+    #[allow(unused)]
+    entry: FileMeta,
+    #[allow(unused)]
+    kind: ChangeKind,
+}
+
+impl Change {
+    fn deleted(path: &Rc<PathBuf>, entry: FileMeta) -> Self {
+        let path = Rc::clone(path);
+        Self {
+            path,
+            entry,
+            kind: ChangeKind::Delete,
+        }
+    }
+
+    fn added(path: &Rc<PathBuf>, entry: FileMeta) -> Self {
+        let path = Rc::clone(path);
+        Self {
+            path,
+            entry,
+            kind: ChangeKind::Add,
+        }
+    }
+
+    pub fn into_path(self) -> PathBuf {
+        let mut path = Rc::unwrap_or_clone(self.path);
+        path.push(self.entry.name());
+        path
+    }
+
+    pub fn kind(&self) -> ChangeKind {
+        self.kind
+    }
+
+    #[cfg(test)]
+    fn take_if_added(self) -> Option<Change> {
+        match self.kind {
+            ChangeKind::Add => Some(self),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn take_if_deleted(self) -> Option<Change> {
+        match self.kind {
+            ChangeKind::Delete => Some(self),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum ChangeKind {
+    Add,
+    Delete,
+    Update,
+}
+
+pub struct Changes<'a> {
+    a_fs: &'a Filesystem,
+    b_fs: &'a Filesystem,
+
+    /// Stack of joined [`ReadDir`] iterators. Each iterator corresponds to the same directory in
+    /// two filesystems.
+    ///
+    /// Each time we encounter a new directory, we push [`Join`] of two iterators to the stack. Thus effectively
+    /// we are implementing a depth-first search of the directory tree.
+    stack: Vec<Join<ReadDir<'a>>>,
+    path: Rc<PathBuf>,
+}
+
+impl<'a> Changes<'a> {
+    /// Adds two directories to the stack
+    ///
+    /// If one of the directories is None, it means that the directory does not exist in the
+    /// corresponding filesystem. Syntactic empty iterator is created in this case. It will
+    /// effectively emits no entries and the join loop will emit added/deleted changes
+    /// depending on which filesystem has the directory.
+    fn push_to_stack(&mut self, dir_a: Option<&FileMeta>, dir_b: Option<&FileMeta>) {
+        assert!(
+            dir_a.is_some() || dir_b.is_some(),
+            "At least one directory must be present"
+        );
+        if dir_a.is_some() && dir_b.is_some() {
+            let dir_a = dir_a.unwrap();
+            let dir_b = dir_b.unwrap();
+            debug_assert!(
+                dir_a.name == dir_b.name,
+                "Directories must have the same name. {:?} != {:?}",
+                dir_a,
+                dir_b,
+            );
+        }
+
+        let dir_a = dir_a
+            .map(|dir| self.a_fs.do_readdir(dir))
+            .unwrap_or(ReadDir::empty(self.a_fs));
+        let dir_b = dir_b
+            .map(|dir| self.b_fs.do_readdir(dir))
+            .unwrap_or(ReadDir::empty(self.b_fs));
+        self.stack.push(Join::new(dir_a, dir_b));
+    }
+}
+
+impl<'a> Iterator for Changes<'a> {
+    type Item = Change;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while !self.stack.is_empty() {
+            let join = self.stack.last_mut().unwrap();
+
+            let next_changed_item = match join.next() {
+                Some(Joined::Left(a)) => {
+                    // All items in B have been exhausted, all remaining items in A are deleted
+                    let path = Rc::clone(&self.path);
+                    if a.is_directory() {
+                        self.push_to_stack(Some(&a), None);
+                        Rc::make_mut(&mut self.path).push(a.name());
+                    }
+                    Change::deleted(&path, a)
+                }
+
+                Some(Joined::Right(b)) => {
+                    // All items in A have been exhausted, all remaining items in B are added
+                    let path = Rc::clone(&self.path);
+                    if b.is_directory() {
+                        self.push_to_stack(None, Some(&b));
+                        Rc::make_mut(&mut self.path).push(b.name());
+                    }
+                    Change::added(&path, b)
+                }
+
+                Some(Joined::Both(a, b)) => match a.name().cmp(b.name()) {
+                    Ordering::Less => {
+                        // A has an item that B does not have, it means it was deleted in B
+                        let path = Rc::clone(&self.path);
+                        if a.is_directory() {
+                            self.push_to_stack(Some(&a), None);
+                            Rc::make_mut(&mut self.path).push(a.name());
+                        }
+                        Change::deleted(&path, a)
+                    }
+
+                    Ordering::Greater => {
+                        // B has an item that A does not have, it means it was added in B
+                        let path = Rc::clone(&self.path);
+                        if b.is_directory() {
+                            self.push_to_stack(None, Some(&b));
+                            Rc::make_mut(&mut self.path).push(b.name());
+                        }
+                        Change::added(&path, b)
+                    }
+
+                    Ordering::Equal if a.node_type == b.node_type => {
+                        // Both A and B have the same item, inspecting children if it's a directory
+                        if a.node_type == NodeType::Directory {
+                            self.push_to_stack(Some(&a), Some(&b));
+                            Rc::make_mut(&mut self.path).push(a.name());
+                        }
+                        continue;
+                    }
+
+                    Ordering::Equal => {
+                        // here we have a situation when both A and B has changed. A has been
+                        // removed and B with the same name has been added.
+                        // We can't return two changes at once here, so we returning only one change
+                        // and we rely on the fact that the next call to next() will return another change
+                        // because it was not removed from peekable iterator.
+                        Change::deleted(&self.path, a)
+                    }
+                },
+
+                None => {
+                    // Both directories are exhausted, popping the stack
+                    self.stack.pop();
+                    Rc::make_mut(&mut self.path).pop();
+                    continue;
+                }
+            };
+            return Some(next_changed_item);
+        }
+        None
+    }
+}
+
 fn make_sure_data_block_exists(
     tx: &mut Transaction,
     ptr: &mut Option<Ptr<DataBlock>>,
@@ -467,7 +726,6 @@ impl<'a> Write for File<'a> {
     #[instrument(level = "trace", skip(self, buf), fields(buf.len = buf.len(), pos=self.pos), ret)]
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         // user can seek after the end of file and write there, so we use self.pos here
-        // TODO what we right after the end of file, should we extend the file?
         if self.pos + buf.len() as u64 > self.meta.size {
             // there is not enough space in the file, we need to allocate more blocks
             let current_blocks = blocks_required(self.meta.size);
@@ -546,7 +804,7 @@ pub struct FileMeta {
 
 impl FileMeta {
     fn from(file_info: Handle<FNode>, tx: &Transaction) -> Result<Self> {
-        let name = file_info.name(&tx)?;
+        let name = file_info.name(tx)?;
         Ok(FileMeta {
             name,
             fid: u64::from(file_info.ptr().unwrap_addr()),
@@ -554,7 +812,35 @@ impl FileMeta {
             node_type: file_info.node_type,
         })
     }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[allow(unused)]
+    fn is_directory(&self) -> bool {
+        self.node_type == NodeType::Directory
+    }
+
+    #[allow(unused)]
+    fn is_file(&self) -> bool {
+        self.node_type == NodeType::File
+    }
 }
+
+impl Ord for FileMeta {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.name.cmp(&other.name)
+    }
+}
+
+impl PartialOrd for FileMeta {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Eq for FileMeta {}
 
 #[derive(Clone, Debug, Record)]
 struct FNode {
@@ -691,33 +977,86 @@ impl fmt::Debug for Str {
     }
 }
 
+/// Join two sorted iterators into a single iterator of type [`Joined<T>`] on the same elements.
+///
+/// The input iterators must be sorted in ascending order. Emits [`Joined::Left`], [`Joined::Right`]
+/// or [`Joined::Both`] depending on which iterarots has the element present.
+struct Join<I: Iterator>(Peekable<I>, Peekable<I>);
+
+impl<T, I: Iterator<Item = T>> Join<I> {
+    fn new(a: I, b: I) -> Self {
+        Self(a.peekable(), b.peekable())
+    }
+}
+
+impl<T: Ord, I: Iterator<Item = T>> Iterator for Join<I> {
+    type Item = Joined<T>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let Join(a_iter, b_iter) = self;
+        match (a_iter.peek(), b_iter.peek()) {
+            (Some(a), Some(b)) => match a.cmp(b) {
+                Ordering::Less => Some(Joined::Left(a_iter.next().unwrap())),
+                Ordering::Equal => {
+                    Some(Joined::Both(a_iter.next().unwrap(), b_iter.next().unwrap()))
+                }
+                Ordering::Greater => Some(Joined::Right(b_iter.next().unwrap())),
+            },
+            (Some(_), None) => Some(Joined::Left(a_iter.next().unwrap())),
+            (None, Some(_)) => Some(Joined::Right(b_iter.next().unwrap())),
+            (None, None) => None,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum Joined<T: PartialEq> {
+    Left(T),
+    Right(T),
+    Both(T, T),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fmt::Debug;
     use pmem::Memory;
-    use std::fs;
+    use std::{collections::HashSet, fs};
 
-    macro_rules! assert_missing {
+    macro_rules! assert_not_exists {
         ($fs:expr, $name:expr) => {
-            let Some(ErrorKind::NotFound) = $fs.find($name).map_err(|e| e.kind()).err() else {
-                panic!("{} should be missing", $name);
-            };
+            match $fs.find($name).map_err(|e| e.kind()) {
+                Ok(_) => panic!("{} should not exists", $name),
+                Err(ErrorKind::NotFound) => (),
+                e @ Err(..) => panic!("find() failed: {:?}", e),
+            }
+        };
+    }
+
+    macro_rules! assert_exists {
+        ($fs:expr, $name:expr) => {
+            if let Err(e) = $fs.find($name) {
+                match e.kind() {
+                    ErrorKind::NotFound => panic!("{} should exists", $name),
+                    _ => panic!("find() failed: {:?}", e),
+                }
+            }
         };
     }
 
     #[test]
     fn check_root() -> Result<()> {
-        let fs = create_fs();
+        let (fs, _) = create_fs();
 
         let root = fs.get_root()?;
-        assert_eq!(root.name, "/");
-        assert_eq!(root.node_type, NodeType::Directory);
+        assert_eq!(root.name(), "/");
+        assert!(root.is_directory());
         Ok(())
     }
 
     #[test]
     fn check_find_should_return_none_if_dir_is_missing() -> Result<()> {
-        let fs = create_fs();
+        let (fs, _) = create_fs();
 
         let node = fs.find("/foo");
         let Some(ErrorKind::NotFound) = node.map_err(|e| e.kind()).err() else {
@@ -728,89 +1067,98 @@ mod tests {
 
     #[test]
     fn check_lookup_dir() -> Result<()> {
-        let mut fs = create_fs();
+        let (mut fs, _) = create_fs();
 
         fs.create_dirs("/etc")?;
-        let root = fs.get_root()?;
-        let _ = fs.lookup(&root, "etc")?;
+        assert_exists!(fs, "/etc");
         Ok(())
     }
 
     #[test]
-    fn check_creating_directories() -> Result<()> {
-        let mut fs = create_fs();
+    fn can_create_directories() -> Result<()> {
+        let (mut fs, _) = create_fs();
 
         let root = fs.get_root()?;
         fs.create_dir(&root, "etc")?;
-        let _ = fs.lookup(&root, "etc")?;
+        assert_exists!(fs, "/etc");
 
         let node = fs.find("/etc")?;
-        assert_eq!(node.name, "etc");
-        assert_eq!(node.node_type, NodeType::Directory);
+        assert_eq!(node.name(), "etc");
+        assert!(node.is_directory());
 
         Ok(())
     }
 
     #[test]
     fn check_creating_multiple_directories() -> Result<()> {
-        let mut fs = create_fs();
+        let (mut fs, _) = create_fs();
 
         fs.create_dirs("/usr/bin")?;
 
         let node = fs.find("/usr/bin")?;
-        assert_eq!(node.name, "bin");
-        assert_eq!(node.node_type, NodeType::Directory);
+        assert_eq!(node.name(), "bin");
+        assert!(node.is_directory());
+
+        Ok(())
+    }
+
+    #[test]
+    fn check_creating_already_existing_directories() -> Result<()> {
+        let (mut fs, _) = create_fs();
+
+        fs.create_dirs("/usr/bin")?;
+        fs.create_dirs("/usr/bin")?;
+        fs.create_dirs("/")?;
 
         Ok(())
     }
 
     #[test]
     fn can_delete_directory() -> Result<()> {
-        let mut fs = create_fs();
+        let (mut fs, _) = create_fs();
 
         let root = fs.get_root()?;
         fs.create_dir(&root, "usr")?;
         fs.delete(&root, "usr")?;
 
-        assert_missing!(fs, "/usr");
+        assert_not_exists!(fs, "/usr");
         Ok(())
     }
 
     #[test]
     fn can_delete_file() -> Result<()> {
-        let mut fs = create_fs();
+        let (mut fs, _) = create_fs();
 
         let root = fs.get_root()?;
         fs.create_file(&root, "swap")?;
         fs.delete(&root, "swap")?;
 
-        assert_missing!(fs, "/swap");
+        assert_not_exists!(fs, "/swap");
 
         Ok(())
     }
 
     #[test]
     fn can_remove_several_items() -> Result<()> {
-        let mut fs = create_fs();
+        let (mut fs, _) = create_fs();
 
         let root = fs.get_root()?;
-        fs.create_dir(&root, "etc")?;
-        fs.create_file(&root, "swap")?;
+        mkdirs(&mut fs, &["/etc/"]);
+        mkfiles(&mut fs, &["/swap"]);
 
         fs.delete(&root, "etc")?;
-        assert_missing!(fs, "/etc");
-
-        let _ = fs.lookup(&root, "swap")?;
+        assert_not_exists!(fs, "/etc");
+        assert_exists!(fs, "/swap");
 
         fs.delete(&root, "swap")?;
-        assert_missing!(fs, "/swap");
+        assert_not_exists!(fs, "/swap");
 
         Ok(())
     }
 
     #[test]
     fn check_each_fs_entry_has_its_own_id() -> Result<()> {
-        let mut fs = create_fs();
+        let (mut fs, _) = create_fs();
 
         fs.create_dirs("/usr/lib/bin")?;
 
@@ -826,18 +1174,18 @@ mod tests {
         assert!(lib.fid < bin.fid);
 
         let bin_ref = fs.lookup_by_id(bin.fid)?;
-        assert_eq!(bin.name, bin_ref.name);
+        assert_eq!(bin.name(), bin_ref.name());
 
         Ok(())
     }
 
     #[test]
     fn create_file() -> Result<()> {
-        let mut fs = create_fs();
+        let (mut fs, _) = create_fs();
 
         let root = fs.get_root()?;
         let meta = fs.create_file(&root, "file.txt")?;
-        let _ = fs.lookup(&root, "file.txt")?;
+        assert_exists!(fs, "/file.txt");
 
         let mut file = fs.open_file(&meta)?;
         let expected_content = "Hello world";
@@ -858,7 +1206,7 @@ mod tests {
 
     #[test]
     fn write_file_partially() -> Result<()> {
-        let mut fs = create_fs();
+        let (mut fs, _) = create_fs();
 
         let root = fs.get_root()?;
         let file = fs.create_file(&root, "file.txt")?;
@@ -875,27 +1223,83 @@ mod tests {
     }
 
     #[test]
-    fn readdir() -> Result<()> {
-        let mut fs = create_fs();
-
+    fn readdir_directories() -> Result<()> {
+        let (mut fs, _) = create_fs();
         let root = fs.get_root()?;
 
         let etc = fs.create_dir(&root, "etc")?;
         let bin = fs.create_dir(&root, "bin")?;
         let swap = fs.create_file(&root, "swap")?;
 
-        let children = fs.readdir(&root)?;
+        let children = fs.readdir(&root).collect::<Vec<_>>();
 
+        // All children should be present
         assert!(children.contains(&etc), "Root should contains etc");
         assert!(children.contains(&bin), "Root should contains bin");
         assert!(children.contains(&swap), "Root should contains spawn");
+
+        // The children should be sorted by name
+        assert!(children[0] == bin);
+        assert!(children[1] == etc);
+        assert!(children[2] == swap);
+
+        Ok(())
+    }
+
+    #[test]
+    fn readdir_files() -> Result<()> {
+        // At the moment we need to test the same logic for files, because there is
+        // duplicate in implementation that should go away after migration to BTree
+        let (mut fs, _) = create_fs();
+        let root = fs.get_root()?;
+
+        let etc = fs.create_file(&root, "etc")?;
+        let bin = fs.create_file(&root, "bin")?;
+        let swap = fs.create_file(&root, "swap")?;
+
+        let children = fs.readdir(&root).collect::<Vec<_>>();
+
+        // All children should be present
+        assert!(children.contains(&etc), "Root should contains etc");
+        assert!(children.contains(&bin), "Root should contains bin");
+        assert!(children.contains(&swap), "Root should contains spawn");
+
+        // The children should be sorted by name
+        assert_uniq_and_sorted(children.iter().map(|meta| meta.name()));
+
+        Ok(())
+    }
+
+    #[test]
+    fn detect_changes() -> Result<()> {
+        let (mut fs_a, mut mem) = create_fs();
+        mkdirs(&mut fs_a, &["/etc"]);
+        let lsn_a = mem.commit(fs_a.finish());
+
+        let mut fs_b = Filesystem::open(mem.start_at(lsn_a)?);
+        fs_b.delete(&fs_b.get_root().unwrap(), "etc").unwrap();
+        mkdirs(&mut fs_b, &["/bin"]);
+        let lsn_b = mem.commit(fs_b.finish());
+
+        let fs_a = Filesystem::open(mem.start_at(lsn_a)?);
+        let fs_b = Filesystem::open(mem.start_at(lsn_b)?);
+
+        let (added, deleted) = fs_changes(&fs_a, &fs_b);
+
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0].entry.name(), "bin");
+        assert!(added[0].entry.is_directory());
+
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].entry.name(), "etc");
+        assert!(deleted[0].entry.is_directory());
 
         Ok(())
     }
 
     #[test]
     fn write_direct_blocks() -> Result<()> {
-        let mut fs = create_fs();
+        let (mut fs, _) = create_fs();
         let root = fs.get_root()?;
         let file_meta = fs.create_file(&root, "file.txt")?;
 
@@ -903,14 +1307,14 @@ mod tests {
         write_file(&mut fs, &file_meta, &data, None)?;
         let read_data = read_file(fs, file_meta, BLOCK_SIZE * 2, None)?;
 
-        assert_eq!(&read_data, &data); // Check initial data
+        assert_eq!(&read_data, &data);
 
         Ok(())
     }
 
     #[test]
     fn write_indirect_blocks() -> Result<()> {
-        let mut fs = create_fs();
+        let (mut fs, _) = create_fs();
         let root = fs.get_root()?;
         let meta = fs.create_file(&root, "file.txt")?;
 
@@ -926,7 +1330,7 @@ mod tests {
 
     #[test]
     fn write_double_indirect_blocks() -> Result<()> {
-        let mut fs = create_fs();
+        let (mut fs, _) = create_fs();
         let root = fs.get_root()?;
         let meta = fs.create_file(&root, "file.txt")?;
 
@@ -978,7 +1382,7 @@ mod tests {
         // we need to write 64Kib (1 page in PagePool) / 17984 = 4 files.
         const MAX_FILE_SIZE: usize = BLOCK_SIZE * LAST_DOUBLE_INDIRECT_BLOCK;
 
-        let mut fs = create_fs();
+        let (mut fs, _) = create_fs();
         let root = fs.get_root().unwrap();
 
         let pos = Some(SeekFrom::Start((MAX_FILE_SIZE - 1) as u64));
@@ -1003,93 +1407,189 @@ mod tests {
         assert_eq!(block_idx(BLOCK_SIZE as u64 + 1), 1);
     }
 
-    fn create_fs() -> Filesystem {
-        let mem = Memory::default();
-        Filesystem::allocate(mem.start())
+    #[test]
+    fn check_join_iterator() {
+        use Joined::*;
+
+        let a = vec![1, 4, 5];
+        let b = vec![3, 4, 6];
+
+        let entries = Join::new(a.into_iter(), b.into_iter()).collect::<Vec<_>>();
+
+        assert_eq!(
+            entries,
+            vec![Left(1), Right(3), Both(4, 4), Left(5), Right(6),]
+        );
     }
 
-    #[cfg(not(miri))]
-    mod proptests {
-        use super::*;
-        use pmem::page::PagePool;
-        use proptest::{collection::vec, prelude::*, prop_oneof, proptest, strategy::Strategy};
-        use std::fs;
-        use tempfile::TempDir;
+    #[test]
+    fn check_intermediate_paths() {
+        let path = PathBuf::from("/a/b/c/");
 
-        #[derive(Debug)]
-        enum WriteOperation {
-            Write(Vec<u8>),
-            Seek(SeekFrom),
+        let paths = all_intermediate_paths(&path).collect::<HashSet<_>>();
+        let mut expected = HashSet::new();
+        expected.insert(PathBuf::from("/a"));
+        expected.insert(PathBuf::from("/a/b"));
+        expected.insert(PathBuf::from("/a/b/c"));
+        assert_eq!(paths, expected);
+    }
+
+    /// Iterates over all intermediate paths of the given path excluding the root.
+    ///
+    /// For example, for the path `/a/b/c` it will return (in no particular order):
+    /// - `/a/b/c`
+    /// - `/a/b`
+    /// - `/a`
+    fn all_intermediate_paths(path: impl AsRef<Path>) -> impl Iterator<Item = PathBuf> {
+        let path = path.as_ref();
+
+        // On windows we can't use `path.is_absolute()` because only paths starting with a drive
+        // letter are considered absolute.
+        #[cfg(unix)]
+        debug_assert!(path.is_absolute(), "Path must be absolute");
+
+        let mut next = Some(path.to_path_buf());
+        std::iter::from_fn(move || {
+            let path = next.take().filter(|p| p != Path::new("/"))?;
+            next = path.parent().map(Path::to_path_buf);
+            Some(path)
+        })
+    }
+
+    fn assert_uniq_and_sorted<T: Ord + Debug>(mut iter: impl Iterator<Item = T>) {
+        let mut prev = iter.next();
+        while let (Some(a), Some(b)) = (prev, iter.next()) {
+            assert!(
+                a < b,
+                "Items are not sorted (a >= b)\n A: {:?}\n B: {:?}",
+                a,
+                b
+            );
+            prev = Some(b);
         }
+    }
 
-        proptest! {
-            #![proptest_config(ProptestConfig {
-                cases: 1000,
-                ..ProptestConfig::default()
-            })]
+    /// Returns the changes to the `target` full filesystem from the `base` filesystem.
+    ///
+    /// The changes are returned as a tuple of `(added, deleted)` files.
+    fn fs_changes(base: &Filesystem, target: &Filesystem) -> (Vec<Change>, Vec<Change>) {
+        let changes = target.changes_from(base).collect::<Vec<_>>();
+        let deleted = changes
+            .clone()
+            .into_iter()
+            .filter_map(Change::take_if_deleted)
+            .collect::<Vec<_>>();
+        let added = changes
+            .into_iter()
+            .filter_map(Change::take_if_added)
+            .collect::<Vec<_>>();
+        (added, deleted)
+    }
 
-            #[test]
-            fn can_write_file(ops in vec(any_write_operation(), 0..10)) {
-                let mem = Memory::new(PagePool::new(1024 * 1024));
-                let mut fs = Filesystem::allocate(mem.start());
+    fn mkdirs(fs: &mut Filesystem, directories: &[&str]) {
+        for path in directories {
+            fs.create_dirs(path).unwrap();
+        }
+    }
 
-                let tmp_dir = TempDir::new().unwrap();
-                let root = fs.get_root().unwrap();
-                let file = fs.create_file(&root, "file.txt").unwrap();
-                let shadow_file_path = tmp_dir.path().join("file.txt");
+    fn mkfiles(fs: &mut Filesystem, files: &[&str]) {
+        for path in files {
+            let parent = PathBuf::from(path);
+            let file_name = parent.file_name().unwrap().to_str().unwrap();
+            let dir_name = parent.parent().unwrap().to_str().unwrap();
+            let dir_meta = fs.create_dirs(dir_name).unwrap();
+            fs.create_file(&dir_meta, file_name).unwrap();
+        }
+    }
 
-                let mut file = fs.open_file(&file).unwrap();
-                let mut shadow_file = fs::File::create_new(shadow_file_path).unwrap();
+    fn create_fs() -> (Filesystem, Memory) {
+        let mem = Memory::default();
+        let tx = mem.start();
+        (Filesystem::allocate(tx), mem)
+    }
 
-                for op in ops {
-                    match op {
-                        WriteOperation::Write(data) => {
-                            file.write_all(&data).unwrap();
-                            shadow_file.write_all(&data).unwrap();
-                        }
-                        WriteOperation::Seek(seek) => {
-                            let seek = adjust_seek(seek, &mut shadow_file)?;
-                            let pos_a = file.seek(seek).unwrap();
-                            let pos_b = shadow_file.seek(seek).unwrap();
-                            prop_assert_eq!(pos_a, pos_b, "Seek positions differs");
-                        }
-                    }
+    /// A filesystem action that can be applied to a filesystem
+    ///
+    /// See [`apply_fs_actions`] for more information
+    #[derive(Debug, Clone)]
+    enum FsAction {
+        CreateFile(PathBuf),
+        CreateDirectory(PathBuf),
+    }
+
+    impl FsAction {
+        fn path(&self) -> &PathBuf {
+            match self {
+                FsAction::CreateFile(path) => path,
+                FsAction::CreateDirectory(path) => path,
+            }
+        }
+    }
+
+    fn apply_fs_actions<'a>(
+        fs: &mut Filesystem,
+        actions: impl Iterator<Item = &'a FsAction>,
+    ) -> Result<()> {
+        for action in actions {
+            match action {
+                FsAction::CreateDirectory(path) => {
+                    fs.create_dirs(path.to_str().unwrap())?;
                 }
-                file.flush().unwrap();
-                shadow_file.flush().unwrap();
-
-                let pos_a = file.seek(SeekFrom::Start(0)).unwrap();
-                let pos_b = shadow_file.seek(SeekFrom::Start(0)).unwrap();
-                prop_assert_eq!(pos_a, 0, "Seek is not at the beginning");
-                prop_assert_eq!(pos_b, 0, "Seek is not at the beginning");
-
-                let mut file_buf = vec![];
-                file.read_to_end(&mut file_buf).unwrap();
-
-                let mut shadow_file_buf = vec![];
-                shadow_file.read_to_end(&mut shadow_file_buf).unwrap();
-
-                prop_assert_eq!(file_buf, shadow_file_buf);
+                FsAction::CreateFile(path) => {
+                    let file_name = path.file_name().unwrap().to_str().unwrap();
+                    let dir_name = path.parent().unwrap().to_str().unwrap();
+                    fs.create_dirs(dir_name)?;
+                    let dir = fs.find(dir_name)?;
+                    fs.create_file(&dir, file_name)?;
+                }
             }
         }
 
-        fn any_write_operation() -> impl Strategy<Value = WriteOperation> {
-            prop_oneof![any_write(), any_seek()]
-        }
+        Ok(())
+    }
 
-        fn any_write() -> impl Strategy<Value = WriteOperation> {
-            vec(any::<u8>(), 0..10).prop_map(WriteOperation::Write)
-        }
+    /// Helper structure that represents the filesystem as a tree in a form of [`Debug`] format
+    /// (eg. `{:?}` in print! macro will print the tree structure of the filesystem)
+    struct FsTree<'a>(&'a Filesystem);
 
-        fn any_seek() -> impl Strategy<Value = WriteOperation> {
-            const MAX_SEEK: usize = BLOCK_SIZE * INDIRECT_BLOCKS;
-            let seek_range = -10i64 * BLOCK_SIZE as i64..10 * BLOCK_SIZE as i64;
+    impl<'a> fmt::Debug for FsTree<'a> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            fn do_print(
+                f: &mut fmt::Formatter<'_>,
+                fs: &Filesystem,
+                dir: &FileMeta,
+                is_last_vec: &mut Vec<bool>,
+            ) -> fmt::Result {
+                let mut children = fs.readdir(dir).peekable();
+                while let Some(child) = children.next() {
+                    let is_last = children.peek().is_none();
 
-            let from_end = seek_range.clone().prop_map(SeekFrom::End);
-            let from_start = (0u64..MAX_SEEK as u64).prop_map(SeekFrom::Start);
-            let from_current = seek_range.prop_map(SeekFrom::Current);
+                    let node_type = match child.node_type {
+                        NodeType::Directory => "/",
+                        NodeType::File => "",
+                    };
+                    let marker = if is_last { "└─" } else { "├─" };
+                    for is_last in &*is_last_vec {
+                        if *is_last {
+                            write!(f, "   ")?;
+                        } else {
+                            write!(f, " │ ")?;
+                        }
+                    }
+                    writeln!(f, " {} {}{}", marker, child.name, node_type)?;
+                    if child.is_directory() {
+                        is_last_vec.push(is_last);
+                        do_print(f, fs, &child, is_last_vec)?;
+                        is_last_vec.pop();
+                    }
+                }
+                Ok(())
+            }
 
-            prop_oneof![from_end, from_start, from_current].prop_map(WriteOperation::Seek)
+            writeln!(f, " /")?;
+            let fs = self.0;
+            do_print(f, fs, &fs.get_root().unwrap(), &mut vec![])?;
+            Ok(())
         }
     }
 
@@ -1136,5 +1636,200 @@ mod tests {
             .with(fmt_layer)
             .with(filter_layer)
             .init();
+    }
+
+    #[cfg(not(miri))]
+    mod proptests {
+        use super::*;
+        use pmem::page::PagePool;
+        use prop::collection::hash_set;
+        use proptest::{collection::vec, prelude::*, prop_oneof, proptest, strategy::Strategy};
+        use std::{fs, ops::Range};
+        use tempfile::TempDir;
+
+        #[derive(Debug)]
+        enum WriteOperation {
+            Write(Vec<u8>),
+            Seek(SeekFrom),
+        }
+
+        /// Random strings used to generate file and directory names
+        const NATO_ALPHABET: [&str; 26] = [
+            "alfa", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india",
+            "juliett", "kilo", "lima", "mike", "november", "oscar", "papa", "quebec", "romeo",
+            "sierra", "tango", "uniform", "victor", "whiskey", "x-ray", "yankee", "zulu",
+        ];
+
+        proptest! {
+            #![proptest_config(ProptestConfig {
+                cases: 1000,
+                ..ProptestConfig::default()
+            })]
+
+            #[test]
+            fn can_write_file(ops in vec(any_write_operation(), 0..10)) {
+                let mem = Memory::new(PagePool::new(1024 * 1024));
+                let mut fs = Filesystem::allocate(mem.start());
+
+                let tmp_dir = TempDir::new()?;
+                let root = fs.get_root()?;
+                let file = fs.create_file(&root, "file.txt")?;
+                let shadow_file_path = tmp_dir.path().join("file.txt");
+
+                let mut file = fs.open_file(&file)?;
+                let mut shadow_file = fs::File::create_new(shadow_file_path)?;
+
+                for op in ops {
+                    match op {
+                        WriteOperation::Write(data) => {
+                            file.write_all(&data)?;
+                            shadow_file.write_all(&data)?;
+                        }
+                        WriteOperation::Seek(seek) => {
+                            let seek = adjust_seek(seek, &mut shadow_file)?;
+                            let pos_a = file.seek(seek)?;
+                            let pos_b = shadow_file.seek(seek)?;
+                            prop_assert_eq!(pos_a, pos_b, "Seek positions differs");
+                        }
+                    }
+                }
+                file.flush()?;
+                shadow_file.flush()?;
+
+                let pos_a = file.seek(SeekFrom::Start(0))?;
+                let pos_b = shadow_file.seek(SeekFrom::Start(0))?;
+                prop_assert_eq!(pos_a, 0, "Seek is not at the beginning");
+                prop_assert_eq!(pos_b, 0, "Seek is not at the beginning");
+
+                let mut file_buf = vec![];
+                file.read_to_end(&mut file_buf)?;
+
+                let mut shadow_file_buf = vec![];
+                shadow_file.read_to_end(&mut shadow_file_buf)?;
+
+                prop_assert_eq!(file_buf, shadow_file_buf);
+            }
+
+            #[test]
+            fn created_directory_can_be_found(paths in vec(any_path(None), 1..10)) {
+                let (mut fs, _) = create_fs();
+
+                for path in paths.iter() {
+                    let path = path.to_str().unwrap();
+                    fs.create_dirs(path)?;
+                    fs.find(path)?;
+                }
+            }
+
+            #[test]
+            fn created_file_can_be_found(paths in hash_set(any_path(None), 1..10)) {
+                let (mut fs, _) = create_fs();
+
+                for path in paths.into_iter() {
+                    // Adding file extension to make sure file names will not collide with directory names
+                    let path = path.with_extension("txt");
+
+                    let dir_path = path.parent().unwrap().to_str().unwrap();
+                    let file_name = path.file_name().unwrap().to_str().unwrap();
+
+                    let dir = fs.create_dirs(dir_path)?;
+                    fs.create_file(&dir, file_name)?;
+                    fs.find(path.to_str().unwrap())?;
+                }
+            }
+
+            #[test]
+            fn can_detect_changes_on_fs(
+                a in any_fs_actions_uniq(Some("a-"), 1..10),
+                b in any_fs_actions_uniq(Some("b-"), 1..10),
+                common in any_fs_actions_uniq(None, 1..10)
+            ) {
+                // We have 3 disjoint sets of actions:
+                // - A and B - actions that are applied to FS A and FS B respectively
+                // - common - actions that are applied to both FS
+
+                let (mut fs_a, _) = create_fs();
+                let (mut fs_b, _) = create_fs();
+
+                apply_fs_actions(&mut fs_a, a.iter().chain(common.iter()))?;
+                apply_fs_actions(&mut fs_b, b.iter().chain(common.iter()))?;
+
+                let (added, deleted) = fs_changes(&fs_a, &fs_b);
+
+                let added = added.into_iter().map(Change::into_path).collect::<HashSet<_>>();
+                let added_expected = b.iter()
+                    .map(FsAction::path)
+                    .flat_map(all_intermediate_paths)
+                    .collect::<HashSet<_>>();
+
+                prop_assert_eq!(added, added_expected,
+                    "\nFS A:\n {:?}\nFS B:\n {:?}",
+                    FsTree(&fs_a),
+                    FsTree(&fs_b));
+
+                let deleted = deleted.into_iter().map(Change::into_path).collect::<HashSet<_>>();
+                let deleted_expected = a.iter()
+                    .map(FsAction::path)
+                    .flat_map(all_intermediate_paths)
+                    .collect::<HashSet<_>>();
+
+                prop_assert_eq!(deleted, deleted_expected,
+                    "\nFS A:\n {:?}\nFS B:\n {:?}",
+                    FsTree(&fs_a),
+                    FsTree(&fs_b));
+
+            }
+        }
+
+        fn any_write_operation() -> impl Strategy<Value = WriteOperation> {
+            prop_oneof![any_write(), any_seek()]
+        }
+
+        fn any_write() -> impl Strategy<Value = WriteOperation> {
+            vec(any::<u8>(), 0..10).prop_map(WriteOperation::Write)
+        }
+
+        fn any_seek() -> impl Strategy<Value = WriteOperation> {
+            const MAX_SEEK: usize = BLOCK_SIZE * INDIRECT_BLOCKS;
+            let seek_range = -10i64 * BLOCK_SIZE as i64..10 * BLOCK_SIZE as i64;
+
+            let from_end = seek_range.clone().prop_map(SeekFrom::End);
+            let from_start = (0u64..MAX_SEEK as u64).prop_map(SeekFrom::Start);
+            let from_current = seek_range.prop_map(SeekFrom::Current);
+
+            prop_oneof![from_end, from_start, from_current].prop_map(WriteOperation::Seek)
+        }
+
+        fn any_action_type(path: PathBuf) -> impl Strategy<Value = FsAction> {
+            prop_oneof![
+                Just(FsAction::CreateFile(path.with_extension("txt"))),
+                Just(FsAction::CreateDirectory(path.clone())),
+            ]
+        }
+
+        fn any_fs_actions_uniq(
+            prefix: Option<&str>,
+            range: Range<usize>,
+        ) -> impl Strategy<Value = Vec<FsAction>> + '_ {
+            hash_set(any_path(prefix), range).prop_flat_map(any_action_each)
+        }
+
+        fn any_action_each(
+            paths: impl IntoIterator<Item = PathBuf>,
+        ) -> impl Strategy<Value = Vec<FsAction>> {
+            paths.into_iter().map(any_action_type).collect::<Vec<_>>()
+        }
+
+        fn any_path(prefix: Option<&str>) -> impl Strategy<Value = PathBuf> + '_ {
+            vec(any_file_name(prefix), 3)
+                .prop_map(|c| format!("/{}", c.join("/")))
+                .prop_map(PathBuf::from)
+        }
+
+        fn any_file_name(prefix: Option<&str>) -> impl Strategy<Value = String> + '_ {
+            (0..NATO_ALPHABET.len())
+                .prop_map(|i| NATO_ALPHABET[i])
+                .prop_map(move |s| format!("{}{}", prefix.unwrap_or_default(), s))
+        }
     }
 }

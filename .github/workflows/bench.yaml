@@ -27,8 +27,9 @@ jobs:
         run: |
           set -eo pipefail
 
+          cat /dev/null > target/benchmark.txt
           target/benchmarks/page --color=never compare baseline-branch/target/benchmarks/page \
-            -v -t 1 --fail-threshold 10 | tee target/benchmark.txt
+            -v -t 1 --fail-threshold 10 | tee -a target/benchmark.txt
 
       - uses: actions/upload-artifact@v3
         with:

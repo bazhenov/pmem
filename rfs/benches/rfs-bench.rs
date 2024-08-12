@@ -1,7 +1,4 @@
-use pmem::{
-    page::{PagePool, PAGE_SIZE},
-    Memory,
-};
+use pmem::{page::PagePool, Memory};
 use rand::{rngs::SmallRng, seq::SliceRandom, Rng, SeedableRng};
 use rfs::{FileMeta, Filesystem};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -110,6 +107,7 @@ fn create_test_file(fs: &mut Filesystem, file_size: u64) -> FileMeta {
 }
 
 fn navigate_directories(b: Bencher) -> Box<dyn Sampler> {
+    // TODO: How to create this setup only once?
     let mut rnd = SmallRng::seed_from_u64(b.seed);
     let mut fs = create_fs();
 
@@ -135,13 +133,14 @@ fn create_deep_tree(fs: &mut Filesystem, parent: &FileMeta, level: u64, names: &
         return;
     }
     for name in names {
-        let dir = fs.create_dir(&parent, &name).unwrap();
+        let dir = fs.create_dir(parent, name).unwrap();
         create_deep_tree(fs, &dir, level - 1, names);
     }
 }
 
 fn create_fs() -> Filesystem {
-    let mem = Memory::new(PagePool::new(2usize.pow(32) / PAGE_SIZE)); // 4GiB
+    let pool = PagePool::with_capacity(2usize.pow(32)); // 4GiB
+    let mem = Memory::new(pool);
     Filesystem::allocate(mem.start())
 }
 
