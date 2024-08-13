@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 thiserror = { workspace = true }
 pmem-derive = { workspace = true }
+arc-swap = "1.7.1"
 
 [dev-dependencies]
 fatfs = "0.3.6"

@@ -55,6 +55,8 @@
 
 use std::{borrow::Cow, ops::Range, sync::Arc};
 
+use arc_swap::{access::Access, ArcSwap};
+
 pub const PAGE_SIZE: usize = 1 << 16; // 64Kib
 pub type Addr = u32;
 pub type PageOffset = u32;
@@ -353,7 +355,7 @@ pub enum Error {
 /// can represent a state in the history of changes.
 #[derive(Default)]
 pub struct PagePool {
-    latest: Arc<CommittedSnapshot>,
+    latest: Arc<ArcSwap<CommittedSnapshot>>,
 }
 
 impl PagePool {
@@ -375,7 +377,7 @@ impl PagePool {
             lsn: 1,
         };
         Self {
-            latest: Arc::new(snapshot),
+            latest: Arc::new(ArcSwap::new(Arc::new(snapshot))),
         }
     }
 
@@ -409,16 +411,18 @@ impl PagePool {
     ///
     /// [`commit`]: Self::commit
     pub fn snapshot(&self) -> Snapshot {
+        let base = self.latest.load_full();
+        let pages = base.pages;
         Snapshot {
             patches: vec![],
-            base: Arc::clone(&self.latest),
-            pages: self.latest.pages,
+            base,
+            pages,
         }
     }
 
     /// Returns a snapshot of the page pool at a specific LSN **or newer**.
     pub fn snapshot_at(&self, lsn: u64) -> Result<Snapshot, Error> {
-        let latest = &self.latest;
+        let latest = ArcSwap::load(&self.latest);
         let base = latest
             .find_at_lsn(lsn)
             .ok_or(Error::NoSnapshot(lsn, latest.lsn))?;
@@ -443,19 +447,25 @@ impl PagePool {
     ///
     /// * `snapshot` - A snapshot containing modifications to commit to the page pool.
     pub fn commit(&mut self, snapshot: Snapshot) -> u64 {
+        let latest = ArcSwap::load(&self.latest);
         assert!(
-            Arc::ptr_eq(&self.latest, &snapshot.base),
+            Arc::ptr_eq(&latest, &snapshot.base),
             "Proposed snapshot is not linear"
         );
-        let lsn = self.latest.lsn + 1;
+        let lsn = latest.lsn + 1;
 
-        self.latest = Arc::new(CommittedSnapshot {
+        let new_snapshot = Arc::new(CommittedSnapshot {
             patches: snapshot.patches,
-            base: Some(Arc::clone(&self.latest)),
+            base: Some(Arc::clone(&latest)),
             pages: snapshot.pages,
             lsn,
         });
+        self.latest.store(new_snapshot);
         lsn
+    }
+
+    pub fn commit_notificaton(&self) -> CommitNotification {
+        CommitNotification
     }
 
     #[cfg(test)]
@@ -464,10 +474,12 @@ impl PagePool {
         let mut buffer = vec![0; len];
         #[allow(clippy::single_range_in_vec_init)]
         let mut buf_ranges = vec![0..len];
-        self.latest.read_to_buf(addr, &mut buffer, &mut buf_ranges);
+        ArcSwap::load(&self.latest).read_to_buf(addr, &mut buffer, &mut buf_ranges);
         Cow::Owned(buffer)
     }
 }
+
+struct CommitNotification;
 
 /// Represents a committed snapshot of a page pool.
 ///
@@ -1011,6 +1023,21 @@ mod tests {
             .unwrap();
     }
 
+    #[test]
+    fn can_get_notifications_about_commit() {
+        let mut pool = PagePool::new(1);
+        let notification = pool.commit_notificaton();
+
+        thread::spawn(move || {
+            let mut snapshot = pool.snapshot();
+            snapshot.write(0, [1]);
+            pool.commit(snapshot);
+        });
+
+        // notification.recv().unwrap();
+        // let mut snapshot = pool.snapshot();
+    }
+
     mod patch {
         use super::*;
         use Patch::*;
@@ -1539,15 +1566,16 @@ mod tests {
 
     impl From<&str> for PagePool {
         fn from(value: &str) -> Self {
-            let page = Arc::new(CommittedSnapshot::from(value.as_bytes()));
-            PagePool { latest: page }
+            Self::from(value.as_bytes())
         }
     }
 
     impl From<&[u8]> for PagePool {
         fn from(value: &[u8]) -> Self {
-            let page = Arc::new(CommittedSnapshot::from(value));
-            PagePool { latest: page }
+            let page = ArcSwap::new(Arc::new(CommittedSnapshot::from(value)));
+            PagePool {
+                latest: Arc::new(page),
+            }
         }
     }
 
