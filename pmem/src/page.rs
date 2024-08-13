@@ -53,9 +53,9 @@
 //! overhead, making it perfectly valid and cost-effective to create a snapshot even when the intention is only to
 //! read data without any modifications.
 
-use std::{borrow::Cow, ops::Range, sync::Arc};
-
 use arc_swap::{access::Access, ArcSwap};
+use std::{borrow::Cow, ops::Range, sync::Arc};
+use tokio::sync::Notify;
 
 pub const PAGE_SIZE: usize = 1 << 16; // 64Kib
 pub type Addr = u32;
@@ -356,6 +356,7 @@ pub enum Error {
 #[derive(Default)]
 pub struct PagePool {
     latest: Arc<ArcSwap<CommittedSnapshot>>,
+    notify: Arc<Notify>,
 }
 
 impl PagePool {
@@ -378,6 +379,15 @@ impl PagePool {
         };
         Self {
             latest: Arc::new(ArcSwap::new(Arc::new(snapshot))),
+            notify: Arc::new(Notify::new()),
+        }
+    }
+
+    #[cfg(test)]
+    fn from_snapshot(snapshot: CommittedSnapshot) -> Self {
+        Self {
+            latest: Arc::new(ArcSwap::new(Arc::new(snapshot))),
+            notify: Arc::new(Notify::new()),
         }
     }
 
@@ -461,11 +471,17 @@ impl PagePool {
             lsn,
         });
         self.latest.store(new_snapshot);
+        self.notify.notify_waiters();
         lsn
     }
 
     pub fn commit_notificaton(&self) -> CommitNotification {
-        CommitNotification
+        let snapshot = self.latest.clone();
+        CommitNotification {
+            last_seen_lsn: ArcSwap::load(&snapshot).lsn,
+            notify: self.notify.clone(),
+            snapshot,
+        }
     }
 
     #[cfg(test)]
@@ -479,7 +495,31 @@ impl PagePool {
     }
 }
 
-struct CommitNotification;
+struct CommitNotification {
+    snapshot: Arc<ArcSwap<CommittedSnapshot>>,
+    last_seen_lsn: u64,
+    notify: Arc<Notify>,
+}
+
+impl CommitNotification {
+    /// Blocks until next snapshot is available and returns it
+    ///
+    /// The next snapshot is the one that is the most recent at the time this method is called.
+    /// It might be several snapshots ahead of the last seen snapshot. All intermediate snapshots
+    /// can be seen by using [`CommitNotification::find_at_lsn()`]
+    pub async fn next_snapshot(&mut self) -> Arc<CommittedSnapshot> {
+        let future = self.notify.notified();
+        // Be carefult here to prevent race.
+        // First you need to create `Notified` future, then check if the new snapshot is already in place.
+        // Then wait for new snapshots.
+        if ArcSwap::load(&self.snapshot).lsn <= self.last_seen_lsn {
+            future.await;
+        }
+        let snapshot = self.snapshot.load_full();
+        self.last_seen_lsn = snapshot.lsn;
+        snapshot
+    }
+}
 
 /// Represents a committed snapshot of a page pool.
 ///
@@ -615,6 +655,10 @@ impl Snapshot {
 
     pub fn valid_range(&self, addr: Addr, len: usize) -> bool {
         is_valid_ptr(addr, len, self.pages)
+    }
+
+    pub fn lsn(&self) -> u64 {
+        self.base.lsn
     }
 
     #[cfg(test)]
@@ -1023,10 +1067,12 @@ mod tests {
             .unwrap();
     }
 
-    #[test]
-    fn can_get_notifications_about_commit() {
+    #[tokio::test]
+    async fn can_get_notifications_about_commit() {
         let mut pool = PagePool::new(1);
-        let notification = pool.commit_notificaton();
+        let mut n1 = pool.commit_notificaton();
+        let mut n2 = pool.commit_notificaton();
+        let current_lsn = pool.snapshot().lsn();
 
         thread::spawn(move || {
             let mut snapshot = pool.snapshot();
@@ -1034,8 +1080,15 @@ mod tests {
             pool.commit(snapshot);
         });
 
-        // notification.recv().unwrap();
-        // let mut snapshot = pool.snapshot();
+        let lsn2 = tokio::spawn(async move { n2.next_snapshot().await.lsn })
+            .await
+            .unwrap();
+        let lsn1 = tokio::spawn(async move { n1.next_snapshot().await.lsn })
+            .await
+            .unwrap();
+
+        assert_eq!(lsn1, current_lsn + 1);
+        assert_eq!(lsn2, current_lsn + 1);
     }
 
     mod patch {
@@ -1572,10 +1625,7 @@ mod tests {
 
     impl From<&[u8]> for PagePool {
         fn from(value: &[u8]) -> Self {
-            let page = ArcSwap::new(Arc::new(CommittedSnapshot::from(value)));
-            PagePool {
-                latest: Arc::new(page),
-            }
+            PagePool::from_snapshot(CommittedSnapshot::from(value))
         }
     }
 
