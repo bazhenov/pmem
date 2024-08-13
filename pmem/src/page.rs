@@ -447,7 +447,7 @@ impl PagePool {
     ///
     /// * `snapshot` - A snapshot containing modifications to commit to the page pool.
     pub fn commit(&mut self, snapshot: Snapshot) -> u64 {
-        let latest = ArcSwap::load(&self.latest);
+        let latest = self.latest.load_full();
         assert!(
             Arc::ptr_eq(&latest, &snapshot.base),
             "Proposed snapshot is not linear"
@@ -456,7 +456,7 @@ impl PagePool {
 
         let new_snapshot = Arc::new(CommittedSnapshot {
             patches: snapshot.patches,
-            base: Some(Arc::clone(&latest)),
+            base: Some(latest),
             pages: snapshot.pages,
             lsn,
         });
