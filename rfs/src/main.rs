@@ -1,5 +1,5 @@
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
-use pmem::{page::PagePool, Memory};
+use pmem::page::PagePool;
 use rfs::{nfs::RFS, ChangeKind, Filesystem};
 use std::io::{self, Write};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -17,8 +17,7 @@ async fn main() {
         .init();
 
     let mut pool = PagePool::with_capacity(100 * 1024 * 1024);
-    let mem = Memory::new(pool.snapshot());
-    let tx = Filesystem::allocate(mem).finish();
+    let tx = Filesystem::allocate(pool.snapshot()).finish();
     pool.commit(tx);
 
     let rfs = RFS::new(pool.snapshot());

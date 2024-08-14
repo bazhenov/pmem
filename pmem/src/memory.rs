@@ -1,4 +1,4 @@
-use crate::page::{Addr, PageOffset, PagePool, Snapshot, TxRead, TxWrite};
+use crate::page::{Addr, PageOffset, Snapshot, TxRead, TxWrite};
 use pmem_derive::Record;
 use std::{
     any::type_name,
@@ -55,16 +55,38 @@ pub struct Memory<S> {
     next_addr: PageOffset,
 }
 
+#[derive(Record)]
+struct MemoryInfoBlock {
+    next_addr: Addr,
+}
+
+impl Memory<Snapshot> {
+    #[cfg(test)]
+    fn new() -> Self {
+        let pool = crate::page::PagePool::default();
+        Self::init(pool.snapshot())
+    }
+}
+
 impl<S: TxRead> Memory<S> {
-    pub fn new(snapshot: S) -> Self {
-        Self {
+    pub fn open(snapshot: S) -> Self {
+        let ptr = Ptr::<MemoryInfoBlock>::from_addr(START_ADDR).unwrap();
+        let mut mem = Self {
             snapshot,
-            next_addr: START_ADDR,
-        }
+            next_addr: 0,
+        };
+
+        let memory_info = mem.lookup(ptr).unwrap();
+        assert!(
+            memory_info.next_addr > 0,
+            "Invalid memory info block. Maybe you forgot to call Memory::init()?"
+        );
+        mem.next_addr = memory_info.next_addr;
+        mem
     }
 
     pub fn read_super_block<T: Record>(&self) -> Result<Handle<T>> {
-        let ptr = Ptr::from_addr(START_ADDR).unwrap();
+        let ptr = Ptr::from_addr(START_ADDR + MemoryInfoBlock::SIZE as PageOffset).unwrap();
         self.lookup(ptr)
     }
 
@@ -120,6 +142,18 @@ impl<S: TxRead> Memory<S> {
 }
 
 impl<S: TxWrite> Memory<S> {
+    pub fn init(snapshot: S) -> Self {
+        let next_addr = START_ADDR + MemoryInfoBlock::SIZE as PageOffset;
+        let memory_info = MemoryInfoBlock { next_addr };
+        let mut mem = Self {
+            snapshot,
+            next_addr,
+        };
+        let ptr = Ptr::from_addr(START_ADDR).unwrap();
+        mem.write_at(ptr, memory_info).unwrap();
+        mem
+    }
+
     fn do_write_bytes(&mut self, addr: Addr, bytes: impl Into<Vec<u8>>) {
         self.snapshot.write(addr, bytes)
     }
@@ -225,15 +259,11 @@ impl<S: TxWrite> Memory<S> {
 }
 
 impl From<Memory<Snapshot>> for Snapshot {
-    fn from(memory: Memory<Snapshot>) -> Self {
+    fn from(mut memory: Memory<Snapshot>) -> Self {
+        memory
+            .write_at(Ptr::from_addr(START_ADDR).unwrap(), memory.next_addr)
+            .unwrap();
         memory.snapshot
-    }
-}
-
-impl Default for Memory<Snapshot> {
-    fn default() -> Self {
-        let pool = PagePool::default();
-        Self::new(pool.snapshot())
     }
 }
 
@@ -520,7 +550,7 @@ mod tests {
 
     #[test]
     fn read_write_ptr() -> Result<()> {
-        let mut mem = Memory::default();
+        let mut mem = Memory::new();
 
         let value = Value(42);
         let handle = mem.write(value)?;
@@ -531,7 +561,7 @@ mod tests {
 
     #[test]
     fn read_write_slice() -> Result<()> {
-        let mut mem = Memory::default();
+        let mut mem = Memory::new();
 
         let value: &[u8] = &[0, 1, 2, 3, 4, 5];
         let slice = mem.write_slice(value)?;
@@ -542,7 +572,7 @@ mod tests {
 
     #[test]
     fn check_error() {
-        let mem = Memory::default();
+        let mem = Memory::new();
 
         #[derive(Debug, Record)]
         struct Data {
@@ -556,7 +586,7 @@ mod tests {
 
     #[test]
     fn reclaim() -> Result<()> {
-        let mut mem = Memory::default();
+        let mut mem = Memory::new();
 
         let handle = mem.write(Value(42))?;
         let ptr = handle.ptr();

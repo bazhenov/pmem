@@ -1,8 +1,13 @@
-use pmem::{memory, page::Snapshot, Handle, Memory, Ptr};
+use pmem::{
+    memory,
+    page::{PagePool, Snapshot},
+    Handle, Memory, Ptr,
+};
 use pmem_derive::Record;
 
 fn main() {
-    let memory = Memory::default();
+    let pool = PagePool::with_capacity(100 * 1024);
+    let memory = Memory::init(pool.snapshot());
 
     let mut list = LinkedList::allocate(memory);
     list.push_front(3);

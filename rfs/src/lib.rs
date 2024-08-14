@@ -32,7 +32,8 @@ pub struct VolumeInfo {
 }
 
 impl<S: TxRead> Filesystem<S> {
-    pub fn open(mem: Memory<S>) -> Self {
+    pub fn open(snapshot: S) -> Self {
+        let mem = Memory::open(snapshot);
         let volume = mem.read_super_block().unwrap();
         Self { volume, mem }
     }
@@ -156,7 +157,8 @@ impl<S: TxRead> Filesystem<S> {
 }
 
 impl<S: TxWrite> Filesystem<S> {
-    pub fn allocate(mut mem: Memory<S>) -> Self {
+    pub fn allocate(snapshot: S) -> Self {
+        let mut mem = Memory::init(snapshot);
         let super_block_ptr = mem.alloc::<VolumeInfo>().unwrap();
         let name = mem.write_slice("/".as_bytes()).unwrap();
         let root_entry = FNode {
@@ -1026,10 +1028,7 @@ enum Joined<T: PartialEq> {
 mod tests {
     use super::*;
     use fmt::Debug;
-    use pmem::{
-        page::{PagePool, Snapshot},
-        Memory,
-    };
+    use pmem::page::{PagePool, Snapshot};
     use std::{collections::HashSet, fs};
 
     macro_rules! assert_not_exists {
@@ -1285,16 +1284,15 @@ mod tests {
         mkdirs(&mut fs_a, &["/etc"]);
         let lsn_a = mem.commit(fs_a.finish());
 
-        let snapshot_a = mem.snapshot_at(lsn_a).unwrap();
-        let mut fs_b = Filesystem::open(Memory::new(snapshot_a));
+        let mut fs_b = Filesystem::open(mem.snapshot());
         fs_b.delete(&fs_b.get_root()?, "etc")?;
         mkdirs(&mut fs_b, &["/bin"]);
         let lsn_b = mem.commit(fs_b.finish());
 
         let snapshot_a = mem.snapshot_at(lsn_a).unwrap();
-        let fs_a = Filesystem::open(Memory::new(snapshot_a));
+        let fs_a = Filesystem::open(snapshot_a);
         let snapshot_b = mem.snapshot_at(lsn_b).unwrap();
-        let fs_b = Filesystem::open(Memory::new(snapshot_b));
+        let fs_b = Filesystem::open(snapshot_b);
 
         let (added, deleted) = fs_changes(&fs_a, &fs_b);
 
@@ -1519,8 +1517,7 @@ mod tests {
 
     fn create_fs() -> (Filesystem<Snapshot>, PagePool) {
         let page_pool = PagePool::default();
-        let mem = Memory::new(page_pool.snapshot());
-        (Filesystem::allocate(mem), page_pool)
+        (Filesystem::allocate(page_pool.snapshot()), page_pool)
     }
 
     /// A filesystem action that can be applied to a filesystem
@@ -1684,8 +1681,7 @@ mod tests {
             #[test]
             fn can_write_file(ops in vec(any_write_operation(), 0..10)) {
                 let pool = PagePool::new(1024 * 1024);
-                let mem = Memory::new(pool.snapshot());
-                let mut fs = Filesystem::allocate(mem);
+                let mut fs = Filesystem::allocate(pool.snapshot());
 
                 let tmp_dir = TempDir::new()?;
                 let root = fs.get_root()?;

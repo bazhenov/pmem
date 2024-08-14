@@ -1,7 +1,4 @@
-use pmem::{
-    page::{PagePool, TxWrite},
-    Memory,
-};
+use pmem::page::{PagePool, TxWrite};
 use rand::{rngs::SmallRng, seq::SliceRandom, Rng, SeedableRng};
 use rfs::{FileMeta, Filesystem};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -148,8 +145,7 @@ fn create_deep_tree(
 
 fn create_fs() -> Filesystem<impl TxWrite> {
     let pool = PagePool::with_capacity(2usize.pow(32)); // 4GiB
-    let mem = Memory::new(pool.snapshot());
-    Filesystem::allocate(mem)
+    Filesystem::allocate(pool.snapshot())
 }
 
 tango_benchmarks!(page_benchmarks());

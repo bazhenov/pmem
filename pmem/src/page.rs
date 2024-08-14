@@ -880,7 +880,7 @@ fn debug_assert_sorted_and_has_no_overlaps<T: MemRange>(ranges: &[T]) {
 fn split_ptr_checked(addr: Addr, len: usize, pages: u32) -> (PageNo, PageOffset) {
     assert!(
         is_valid_ptr(addr, len, pages),
-        "Address range 0x{:08x}-0x{:08x} is out of bounds. Max address 0x{:08x}",
+        "Address range is out of bounds 0x{:08x}-0x{:08x}. Max address 0x{:08x}",
         addr,
         addr + len as Addr,
         pages as u64 * PAGE_SIZE as u64
@@ -1029,7 +1029,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "address is out of bounds")]
+    #[should_panic(expected = "Address range is out of bounds")]
     fn page_pool_should_return_error_on_oob_read() {
         let mem = PagePool::default();
         let snapshot = mem.snapshot();
@@ -1041,7 +1041,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "address is out of bounds")]
+    #[should_panic(expected = "Address range is out of bounds")]
     fn page_pool_should_return_error_on_oob_write() {
         let mem = PagePool::default();
 
@@ -1067,6 +1067,9 @@ mod tests {
         snapshot.resize(2); // adding second page
         snapshot.write(page_b, bob);
         mem.commit(snapshot);
+
+        let snapshot = mem.snapshot();
+        assert!(snapshot.valid_range(page_b, bob.len()));
     }
 
     #[test]

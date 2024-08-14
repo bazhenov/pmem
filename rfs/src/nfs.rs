@@ -14,10 +14,7 @@ use nfsserve::{
     },
     vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities},
 };
-use pmem::{
-    page::{CommittedSnapshot, PagePool, Snapshot},
-    Memory,
-};
+use pmem::page::{CommittedSnapshot, PagePool, Snapshot};
 use std::{
     io::{self, Read, Seek, SeekFrom, Write},
     mem,
@@ -39,15 +36,15 @@ pub struct RfsState {
 
 impl RfsState {
     pub async fn commit_and_get_changes(&mut self, pool: &mut PagePool) -> Vec<Change> {
-        let prev_fs = Filesystem::open(Memory::new(Arc::clone(&self.prev_snapshot)));
+        let prev_fs = Filesystem::open(Arc::clone(&self.prev_snapshot));
 
         let changes = self.fs.changes_from(&prev_fs).collect::<Vec<_>>();
 
-        let mut sw_fs = Filesystem::open(Memory::new(pool.snapshot()));
+        let mut sw_fs = Filesystem::open(pool.snapshot());
         mem::swap(&mut self.fs, &mut sw_fs);
         pool.commit(sw_fs.finish());
         let new_snapshot = pool.snapshot();
-        self.fs = Filesystem::open(Memory::new(new_snapshot));
+        self.fs = Filesystem::open(new_snapshot);
 
         changes
     }
@@ -70,8 +67,7 @@ impl DerefMut for RfsState {
 impl RFS {
     pub fn new(snapshot: Snapshot) -> RFS {
         let prev_snapshot = snapshot.base();
-        let mem = Memory::new(snapshot);
-        let fs = Filesystem::open(mem);
+        let fs = Filesystem::open(snapshot);
         let root = fs.get_root().unwrap();
         let state = RfsState { fs, prev_snapshot };
         RFS {
