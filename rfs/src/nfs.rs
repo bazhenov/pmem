@@ -14,7 +14,10 @@ use nfsserve::{
     },
     vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities},
 };
-use pmem::Memory;
+use pmem::{
+    page::{CommittedSnapshot, PagePool, Snapshot},
+    Memory,
+};
 use std::{
     io::{self, Read, Seek, SeekFrom, Write},
     mem,
@@ -30,26 +33,28 @@ pub struct RFS {
 }
 
 pub struct RfsState {
-    fs: Filesystem,
-    mem: Memory,
+    fs: Filesystem<Snapshot>,
+    prev_snapshot: Arc<CommittedSnapshot>,
 }
 
 impl RfsState {
-    pub async fn commit_and_get_changes(&mut self) -> Vec<Change> {
-        let mut prev_fs = Filesystem::open(self.mem.start());
+    pub async fn commit_and_get_changes(&mut self, pool: &mut PagePool) -> Vec<Change> {
+        let prev_fs = Filesystem::open(Memory::new(Arc::clone(&self.prev_snapshot)));
 
         let changes = self.fs.changes_from(&prev_fs).collect::<Vec<_>>();
-        mem::swap(&mut self.fs, &mut prev_fs);
-        let tx = prev_fs.finish();
-        self.mem.commit(tx);
-        self.fs = Filesystem::open(self.mem.start());
+
+        let mut sw_fs = Filesystem::open(Memory::new(pool.snapshot()));
+        mem::swap(&mut self.fs, &mut sw_fs);
+        pool.commit(sw_fs.finish());
+        let new_snapshot = pool.snapshot();
+        self.fs = Filesystem::open(Memory::new(new_snapshot));
 
         changes
     }
 }
 
 impl Deref for RfsState {
-    type Target = Filesystem;
+    type Target = Filesystem<Snapshot>;
 
     fn deref(&self) -> &Self::Target {
         &self.fs
@@ -63,10 +68,12 @@ impl DerefMut for RfsState {
 }
 
 impl RFS {
-    pub fn new(mem: Memory) -> RFS {
-        let fs = Filesystem::open(mem.start());
+    pub fn new(snapshot: Snapshot) -> RFS {
+        let prev_snapshot = snapshot.base();
+        let mem = Memory::new(snapshot);
+        let fs = Filesystem::open(mem);
         let root = fs.get_root().unwrap();
-        let state = RfsState { fs, mem };
+        let state = RfsState { fs, prev_snapshot };
         RFS {
             state: Arc::new(Mutex::new(state)),
             root_id: root.fid,

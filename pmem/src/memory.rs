@@ -1,4 +1,4 @@
-use crate::page::{Addr, PageOffset, PagePool, Snapshot};
+use crate::page::{Addr, PageOffset, PagePool, Snapshot, TxRead, TxWrite};
 use pmem_derive::Record;
 use std::{
     any::type_name,
@@ -16,12 +16,6 @@ const START_ADDR: PageOffset = 4;
 
 /// The size of a header of each entity written to storage
 const SLICE_HEADER_SIZE: usize = mem::size_of::<u32>();
-
-pub struct Memory {
-    pool: PagePool,
-    next_addr: PageOffset,
-    seq: u32,
-}
 
 type Result<T> = std::result::Result<T, Error>;
 
@@ -56,57 +50,17 @@ impl From<Error> for io::Error {
     }
 }
 
-impl Memory {
-    pub fn new(pool: PagePool) -> Self {
+pub struct Memory<S> {
+    snapshot: S,
+    next_addr: PageOffset,
+}
+
+impl<S: TxRead> Memory<S> {
+    pub fn new(snapshot: S) -> Self {
         Self {
-            pool,
+            snapshot,
             next_addr: START_ADDR,
-            seq: 0,
         }
-    }
-    pub fn commit(&mut self, tx: Transaction) -> u64 {
-        assert!(tx.next_addr >= self.next_addr);
-        assert!(tx.seq == self.seq);
-        // Page should be committed first, because it's check for snapshot linearity
-        let lsn = self.pool.commit(tx.snapshot);
-        self.seq += 1;
-        self.next_addr = tx.next_addr;
-        lsn
-    }
-
-    pub fn start(&self) -> Transaction {
-        Transaction {
-            snapshot: self.pool.snapshot(),
-            next_addr: self.next_addr,
-            seq: self.seq,
-        }
-    }
-
-    // Start a transaction at a specific LSN or after
-    pub fn start_at(&self, lsn: u64) -> Result<Transaction> {
-        Ok(Transaction {
-            snapshot: self.pool.snapshot_at(lsn)?,
-            next_addr: self.next_addr,
-            seq: self.seq,
-        })
-    }
-}
-
-impl Default for Memory {
-    fn default() -> Self {
-        Self::new(PagePool::default())
-    }
-}
-
-pub struct Transaction {
-    snapshot: Snapshot,
-    next_addr: Addr,
-    seq: u32,
-}
-
-impl Transaction {
-    fn do_write_bytes(&mut self, addr: Addr, bytes: impl Into<Vec<u8>>) {
-        self.snapshot.write(addr, bytes)
     }
 
     pub fn read_super_block<T: Record>(&self) -> Result<Handle<T>> {
@@ -162,6 +116,12 @@ impl Transaction {
 
     fn read_uncommitted(&self, addr: PageOffset, len: usize) -> Cow<[u8]> {
         self.snapshot.read(addr, len)
+    }
+}
+
+impl<S: TxWrite> Memory<S> {
+    fn do_write_bytes(&mut self, addr: Addr, bytes: impl Into<Vec<u8>>) {
+        self.snapshot.write(addr, bytes)
     }
 
     fn alloc_space(&mut self, size: usize) -> Result<Addr> {
@@ -261,6 +221,19 @@ impl Transaction {
     pub fn reclaim<T>(&mut self, handle: Handle<T>) -> T {
         self.snapshot.reclaim(handle.addr, handle.size);
         handle.into_inner()
+    }
+}
+
+impl From<Memory<Snapshot>> for Snapshot {
+    fn from(memory: Memory<Snapshot>) -> Self {
+        memory.snapshot
+    }
+}
+
+impl Default for Memory<Snapshot> {
+    fn default() -> Self {
+        let pool = PagePool::default();
+        Self::new(pool.snapshot())
     }
 }
 
@@ -475,14 +448,6 @@ impl<T: NonZeroRecord> Record for Option<T> {
     }
 }
 
-pub trait Storable {
-    type Seed: Sized;
-
-    fn allocate(tx: Transaction) -> Self;
-    fn open(tx: Transaction, ptr: Ptr<Self::Seed>) -> Self;
-    fn finish(self) -> Transaction;
-}
-
 pub struct Handle<T> {
     addr: Addr,
     size: usize,
@@ -555,29 +520,29 @@ mod tests {
 
     #[test]
     fn read_write_ptr() -> Result<()> {
-        let (mut tx, _) = start();
+        let mut mem = Memory::default();
 
         let value = Value(42);
-        let handle = tx.write(value)?;
-        let value_copy = tx.read(handle.ptr())?;
+        let handle = mem.write(value)?;
+        let value_copy = mem.read(handle.ptr())?;
         assert_eq!(&value_copy, &*handle);
         Ok(())
     }
 
     #[test]
     fn read_write_slice() -> Result<()> {
-        let (mut tx, _) = start();
+        let mut mem = Memory::default();
 
         let value: &[u8] = &[0, 1, 2, 3, 4, 5];
-        let slice = tx.write_slice(value)?;
-        let value_copy = tx.read_slice(slice)?;
+        let slice = mem.write_slice(value)?;
+        let value_copy = mem.read_slice(slice)?;
         assert_eq!(value_copy, value);
         Ok(())
     }
 
     #[test]
     fn check_error() {
-        let (tx, _) = start();
+        let mem = Memory::default();
 
         #[derive(Debug, Record)]
         struct Data {
@@ -585,25 +550,20 @@ mod tests {
         }
 
         // reading from made up address
-        let value = tx.read(Ptr::<Data>::from_addr(0xFF).unwrap());
+        let value = mem.read(Ptr::<Data>::from_addr(0xFF).unwrap());
         assert!(value.is_err(), "Err should be generated");
     }
 
     #[test]
     fn reclaim() -> Result<()> {
-        let (mut tx, _) = start();
+        let mut mem = Memory::default();
 
-        let handle = tx.write(Value(42))?;
+        let handle = mem.write(Value(42))?;
         let ptr = handle.ptr();
-        tx.reclaim(handle);
-        let result = tx.read(ptr)?;
+        mem.reclaim(handle);
+        let result = mem.read(ptr)?;
         // should be zero, because we use zero-fill semantics
         assert_eq!(result, Value(0));
         Ok(())
-    }
-
-    fn start() -> (Transaction, Memory) {
-        let mem = Memory::default();
-        (mem.start(), mem)
     }
 }

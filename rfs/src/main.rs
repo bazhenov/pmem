@@ -16,12 +16,12 @@ async fn main() {
         .with(filter_layer)
         .init();
 
-    let pool = PagePool::with_capacity(100 * 1024 * 1024);
-    let mut mem = Memory::new(pool);
-    let tx = Filesystem::allocate(mem.start()).finish();
-    mem.commit(tx);
+    let mut pool = PagePool::with_capacity(100 * 1024 * 1024);
+    let mem = Memory::new(pool.snapshot());
+    let tx = Filesystem::allocate(mem).finish();
+    pool.commit(tx);
 
-    let rfs = RFS::new(mem);
+    let rfs = RFS::new(pool.snapshot());
     let state = rfs.state_handle();
     let listener = NFSTcpListener::bind(&format!("127.0.0.1:{HOSTPORT}"), rfs)
         .await
@@ -40,7 +40,7 @@ async fn main() {
         } else if cmd.trim() == "commit" {
             let changes = {
                 let mut s = state.lock().await;
-                s.commit_and_get_changes().await
+                s.commit_and_get_changes(&mut pool).await
             };
             for change in changes {
                 let marker = match change.kind() {

@@ -30,7 +30,7 @@
 //! ## Example
 //!
 //! ```rust
-//! use pmem::page::PagePool;
+//! use pmem::page::{PagePool, TxWrite};
 //!
 //! let mut pool = PagePool::new(5); // Initialize a pool with 5 pages
 //! let mut snapshot = pool.snapshot(); // Create a snapshot of the current state
@@ -53,7 +53,7 @@
 //! overhead, making it perfectly valid and cost-effective to create a snapshot even when the intention is only to
 //! read data without any modifications.
 
-use arc_swap::{access::Access, ArcSwap};
+use arc_swap::ArcSwap;
 use std::{borrow::Cow, ops::Range, sync::Arc};
 use tokio::sync::Notify;
 
@@ -343,7 +343,7 @@ pub enum Error {
 /// Basic usage:
 ///
 /// ```
-/// # use pmem::page::PagePool;
+/// # use pmem::page::{PagePool, TxWrite};
 /// let mut pool = PagePool::new(5);    // Initialize a pool with 5 pages
 /// let mut snapshot = pool.snapshot(); // Create a snapshot of the current state
 /// snapshot.write(0, &[0, 1, 2, 3]);   // Modify the snapshot
@@ -456,7 +456,8 @@ impl PagePool {
     /// # Arguments
     ///
     /// * `snapshot` - A snapshot containing modifications to commit to the page pool.
-    pub fn commit(&mut self, snapshot: Snapshot) -> u64 {
+    pub fn commit(&mut self, snapshot: impl Into<Snapshot>) -> u64 {
+        let snapshot = snapshot.into();
         let latest = self.latest.load_full();
         assert!(
             Arc::ptr_eq(&latest, &snapshot.base),
@@ -475,9 +476,9 @@ impl PagePool {
         lsn
     }
 
-    pub fn commit_notificaton(&self) -> CommitNotification {
+    pub fn commit_notify(&self) -> CommitNotify {
         let snapshot = self.latest.clone();
-        CommitNotification {
+        CommitNotify {
             last_seen_lsn: ArcSwap::load(&snapshot).lsn,
             notify: self.notify.clone(),
             snapshot,
@@ -495,13 +496,13 @@ impl PagePool {
     }
 }
 
-struct CommitNotification {
+pub struct CommitNotify {
     snapshot: Arc<ArcSwap<CommittedSnapshot>>,
     last_seen_lsn: u64,
     notify: Arc<Notify>,
 }
 
-impl CommitNotification {
+impl CommitNotify {
     /// Blocks until next snapshot is available and returns it
     ///
     /// The next snapshot is the one that is the most recent at the time this method is called.
@@ -519,6 +520,17 @@ impl CommitNotification {
         self.last_seen_lsn = snapshot.lsn;
         snapshot
     }
+}
+
+pub trait TxRead {
+    fn read(&self, addr: Addr, len: usize) -> Cow<[u8]>;
+    fn valid_range(&self, addr: Addr, len: usize) -> bool;
+    fn lsn(&self) -> u64;
+}
+
+pub trait TxWrite: TxRead {
+    fn write(&mut self, addr: Addr, bytes: impl Into<Vec<u8>>);
+    fn reclaim(&mut self, addr: Addr, len: usize);
 }
 
 /// Represents a committed snapshot of a page pool.
@@ -589,6 +601,27 @@ impl CommittedSnapshot {
     }
 }
 
+impl TxRead for Arc<CommittedSnapshot> {
+    fn read(&self, addr: Addr, len: usize) -> Cow<[u8]> {
+        split_ptr_checked(addr, len, self.pages);
+
+        let mut buf = vec![0; len];
+        #[allow(clippy::single_range_in_vec_init)]
+        let mut buf_ranges = vec![0..len];
+
+        self.read_to_buf(addr, &mut buf, &mut buf_ranges);
+        Cow::Owned(buf)
+    }
+
+    fn valid_range(&self, addr: Addr, len: usize) -> bool {
+        is_valid_ptr(addr, len, self.pages)
+    }
+
+    fn lsn(&self) -> u64 {
+        todo!()
+    }
+}
+
 impl Drop for CommittedSnapshot {
     /// Custom drop logic is necessary here to prevent a stack overflow that could
     /// occur due to recursive drop calls on a long chain of `Arc` references to base snapshot.
@@ -615,29 +648,22 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    pub fn write(&mut self, addr: Addr, bytes: impl Into<Vec<u8>>) {
-        let bytes = bytes.into();
-        split_ptr_checked(addr, bytes.len(), self.pages);
-
-        if !bytes.is_empty() {
-            push_patch(&mut self.patches, Patch::Write(addr, bytes))
-        }
+    pub fn base(&self) -> Arc<CommittedSnapshot> {
+        Arc::clone(&self.base)
     }
 
-    /// Frees the given segment of memory.
-    ///
-    /// Reclaim is guaranteed to follow zeroing semantics. The read operation from the corresponding segment
-    /// after reclaiming will return zeros.
-    ///
-    /// The main purpose of reclaim is to mark memory as not used, so it can be freed from persistent storage
-    /// after snapshot compaction.
-    pub fn reclaim(&mut self, addr: Addr, len: usize) {
-        if len > 0 {
-            push_patch(&mut self.patches, Patch::Reclaim(addr, len))
-        }
+    #[cfg(test)]
+    fn resize(&mut self, pages: usize) {
+        self.pages = pages as PageNo;
+    }
+}
+
+impl TxRead for Snapshot {
+    fn valid_range(&self, addr: Addr, len: usize) -> bool {
+        is_valid_ptr(addr, len, self.pages)
     }
 
-    pub fn read(&self, addr: Addr, len: usize) -> Cow<[u8]> {
+    fn read(&self, addr: Addr, len: usize) -> Cow<[u8]> {
         split_ptr_checked(addr, len, self.pages);
 
         let mut buf = vec![0; len];
@@ -653,17 +679,32 @@ impl Snapshot {
         Cow::Owned(buf)
     }
 
-    pub fn valid_range(&self, addr: Addr, len: usize) -> bool {
-        is_valid_ptr(addr, len, self.pages)
-    }
-
-    pub fn lsn(&self) -> u64 {
+    fn lsn(&self) -> u64 {
         self.base.lsn
     }
+}
 
-    #[cfg(test)]
-    fn resize(&mut self, pages: usize) {
-        self.pages = pages as PageNo;
+impl TxWrite for Snapshot {
+    fn write(&mut self, addr: Addr, bytes: impl Into<Vec<u8>>) {
+        let bytes = bytes.into();
+        split_ptr_checked(addr, bytes.len(), self.pages);
+
+        if !bytes.is_empty() {
+            push_patch(&mut self.patches, Patch::Write(addr, bytes))
+        }
+    }
+
+    /// Frees the given segment of memory.
+    ///
+    /// Reclaim is guaranteed to follow zeroing semantics. The read operation from the corresponding segment
+    /// after reclaiming will return zeros.
+    ///
+    /// The main purpose of reclaim is to mark memory as not used, so it can be freed from persistent storage
+    /// after snapshot compaction.
+    fn reclaim(&mut self, addr: Addr, len: usize) {
+        if len > 0 {
+            push_patch(&mut self.patches, Patch::Reclaim(addr, len))
+        }
     }
 }
 
@@ -839,7 +880,10 @@ fn debug_assert_sorted_and_has_no_overlaps<T: MemRange>(ranges: &[T]) {
 fn split_ptr_checked(addr: Addr, len: usize, pages: u32) -> (PageNo, PageOffset) {
     assert!(
         is_valid_ptr(addr, len, pages),
-        "Ptr address is out of bounds"
+        "Address range 0x{:08x}-0x{:08x} is out of bounds. Max address 0x{:08x}",
+        addr,
+        addr + len as Addr,
+        pages as u64 * PAGE_SIZE as u64
     );
 
     split_ptr(addr)
@@ -1070,8 +1114,8 @@ mod tests {
     #[tokio::test]
     async fn can_get_notifications_about_commit() {
         let mut pool = PagePool::new(1);
-        let mut n1 = pool.commit_notificaton();
-        let mut n2 = pool.commit_notificaton();
+        let mut n1 = pool.commit_notify();
+        let mut n2 = pool.commit_notify();
         let current_lsn = pool.snapshot().lsn();
 
         thread::spawn(move || {

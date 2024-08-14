@@ -1,12 +1,10 @@
-use pmem::{memory, Handle, Memory, Ptr, Storable, Transaction};
+use pmem::{memory, page::Snapshot, Handle, Memory, Ptr};
 use pmem_derive::Record;
 
 fn main() {
     let memory = Memory::default();
 
-    let tx = memory.start();
-
-    let mut list = LinkedList::allocate(tx);
+    let mut list = LinkedList::allocate(memory);
     list.push_front(3);
     list.push_front(2);
     list.push_front(1);
@@ -21,7 +19,7 @@ fn main() {
 }
 
 struct LinkedList {
-    tx: Transaction,
+    mem: Memory<Snapshot>,
     root: Handle<LinkedListNode>,
     ptr: Ptr<LinkedListNode>,
 }
@@ -31,26 +29,6 @@ struct LinkedListNode {
     first: Option<Ptr<ListNode>>,
 }
 
-impl Storable for LinkedList {
-    type Seed = LinkedListNode;
-
-    fn open(tx: Transaction, ptr: Ptr<Self::Seed>) -> Self {
-        let root = tx.lookup(ptr).unwrap();
-        Self { tx, root, ptr }
-    }
-
-    fn allocate(mut tx: Transaction) -> Self {
-        let root = tx.write(LinkedListNode { first: None }).unwrap();
-        let ptr = root.ptr();
-        Self { tx, root, ptr }
-    }
-
-    fn finish(mut self) -> Transaction {
-        self.tx.update(&self.root).unwrap();
-        self.tx
-    }
-}
-
 #[derive(Debug, Record)]
 struct ListNode {
     value: i32,
@@ -58,9 +36,25 @@ struct ListNode {
 }
 
 impl LinkedList {
+    fn open(mem: Memory<Snapshot>, ptr: Ptr<LinkedListNode>) -> Self {
+        let root = mem.lookup(ptr).unwrap();
+        Self { mem, root, ptr }
+    }
+
+    fn allocate(mut mem: Memory<Snapshot>) -> Self {
+        let root = mem.write(LinkedListNode { first: None }).unwrap();
+        let ptr = root.ptr();
+        Self { mem, root, ptr }
+    }
+
+    fn finish(mut self) -> Memory<Snapshot> {
+        self.mem.update(&self.root).unwrap();
+        self.mem
+    }
+
     fn push_front(&mut self, value: i32) {
         let handle = self
-            .tx
+            .mem
             .write(ListNode {
                 value,
                 next: self.root.first,
@@ -74,14 +68,14 @@ impl LinkedList {
         let mut len = 0;
         while let Some(node) = cur_node {
             len += 1;
-            cur_node = self.tx.lookup(node).unwrap().next;
+            cur_node = self.mem.lookup(node).unwrap().next;
         }
         len
     }
 
     fn iter(&self) -> impl Iterator<Item = i32> + '_ {
         ListIterator {
-            tx: &self.tx,
+            tx: &self.mem,
             ptr: self.root.first,
         }
     }
@@ -92,7 +86,7 @@ impl LinkedList {
 }
 
 struct ListIterator<'a> {
-    tx: &'a Transaction,
+    tx: &'a Memory<Snapshot>,
     ptr: Option<Ptr<ListNode>>,
 }
 

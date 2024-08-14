@@ -3,7 +3,7 @@
 
 use fatfs::{format_volume, FileSystem, FormatVolumeOptions, FsOptions};
 use pmem::{
-    page::{PagePool, Snapshot, PAGE_SIZE},
+    page::{PagePool, Snapshot, TxRead, TxWrite, PAGE_SIZE},
     Addr,
 };
 use std::io::{self, Read, Seek, SeekFrom, Write};
