@@ -58,7 +58,7 @@ use std::{borrow::Cow, ops::Range, sync::Arc};
 use tokio::sync::Notify;
 
 pub const PAGE_SIZE: usize = 1 << 16; // 64Kib
-pub type Addr = u32;
+pub type Addr = u64;
 pub type PageOffset = u32;
 pub type PageNo = u32;
 pub type LSN = u64;
@@ -71,10 +71,10 @@ pub type LSN = u64;
 #[cfg_attr(test, derive(PartialEq, Debug))]
 enum Patch {
     // Write given data at a specified offset
-    Write(PageOffset, Vec<u8>),
+    Write(Addr, Vec<u8>),
 
     /// Reclaim given amount of bytes at a specified address
-    Reclaim(PageOffset, usize),
+    Reclaim(Addr, usize),
 }
 
 impl Patch {
@@ -112,7 +112,7 @@ impl Patch {
         self.addr() <= other.addr() && other.end() <= self.end()
     }
 
-    fn trim_after(&mut self, at: u32) {
+    fn trim_after(&mut self, at: Addr) {
         let end = self.end();
         assert!(self.addr() < at && at < end, "Out-of-bounds");
         match self {
@@ -123,7 +123,7 @@ impl Patch {
         }
     }
 
-    fn trim_before(&mut self, at: u32) {
+    fn trim_before(&mut self, at: Addr) {
         assert!(self.addr() < at && at < self.end(), "Out-of-bounds");
         match self {
             Patch::Write(offset, data) => {
@@ -165,7 +165,7 @@ impl Patch {
                 };
                 result_data[range].copy_from_slice(&b_data[..]);
 
-                Merged(Write(start as u32, result_data))
+                Merged(Write(start as Addr, result_data))
             }
             (a @ Reclaim(..), b @ Reclaim(..)) => {
                 let offset = a.addr().min(b.addr());
@@ -258,7 +258,7 @@ impl Patch {
     }
 
     #[cfg(test)]
-    fn set_addr(&mut self, value: u32) {
+    fn set_addr(&mut self, value: Addr) {
         match self {
             Patch::Write(addr, _) => *addr = value,
             Patch::Reclaim(addr, _) => *addr = value,
@@ -267,20 +267,20 @@ impl Patch {
 }
 
 trait MemRange {
-    fn addr(&self) -> u32;
+    fn addr(&self) -> Addr;
     fn len(&self) -> usize;
 
-    fn end(&self) -> u32 {
-        self.addr() + self.len() as u32
+    fn end(&self) -> Addr {
+        self.addr() + self.len() as Addr
     }
 
-    fn to_range(&self) -> Range<u32> {
-        self.addr()..self.addr() + self.len() as u32
+    fn to_range(&self) -> Range<Addr> {
+        self.addr()..self.addr() + self.len() as Addr
     }
 }
 
 impl MemRange for Patch {
-    fn addr(&self) -> u32 {
+    fn addr(&self) -> Addr {
         match self {
             Patch::Write(offset, _) => *offset,
             Patch::Reclaim(offset, _) => *offset,
@@ -486,7 +486,7 @@ impl PagePool {
     }
 
     #[cfg(test)]
-    fn read(&self, addr: PageOffset, len: usize) -> Cow<[u8]> {
+    fn read(&self, addr: Addr, len: usize) -> Cow<[u8]> {
         #[allow(clippy::single_range_in_vec_init)]
         let mut buffer = vec![0; len];
         #[allow(clippy::single_range_in_vec_init)]
@@ -789,7 +789,7 @@ fn apply_patches(
         let first_matching_idx = patches
             // because end address is exclusive we need to subtract 1 from it to find idx of first possibly
             // intersecting patch
-            .binary_search_by(|i| (i.end() - 1).cmp(&(start_addr as u32)))
+            .binary_search_by(|i| (i.end() - 1).cmp(&(start_addr as Addr)))
             .unwrap_or_else(|idx| idx);
 
         let overlapping_patches = patches[first_matching_idx..]
@@ -899,9 +899,9 @@ fn is_valid_ptr(addr: Addr, len: usize, pages: u32) -> bool {
 
 fn split_ptr(addr: Addr) -> (PageNo, PageOffset) {
     const PAGE_SIZE_BITS: u32 = PAGE_SIZE.trailing_zeros();
-    let page_no = addr >> PAGE_SIZE_BITS;
-    let offset = addr & ((PAGE_SIZE - 1) as u32);
-    (page_no, offset)
+    let page_no = (addr >> PAGE_SIZE_BITS) & 0xFFFF_FFFF;
+    let offset = addr & (PAGE_SIZE - 1) as u64;
+    (page_no.try_into().unwrap(), offset.try_into().unwrap())
 }
 
 /// Returns true of given patch intersects given range of bytes
@@ -1035,7 +1035,7 @@ mod tests {
         let snapshot = mem.snapshot();
 
         // reading in a such a way that start address is still valid, but end address is not
-        let start = PAGE_SIZE as u32 - 10;
+        let start = PAGE_SIZE as Addr - 10;
         let len = 20;
         let _ = snapshot.read(start, len);
     }
@@ -1048,7 +1048,7 @@ mod tests {
         let mut snapshot = mem.snapshot();
         let bytes = [0; 20];
         let addr = PAGE_SIZE as u32 - 10;
-        snapshot.write(addr, bytes);
+        snapshot.write(addr as Addr, bytes);
     }
 
     #[test]
@@ -1304,7 +1304,7 @@ mod tests {
 
         #[test]
         fn split_ptr_at_boundary() {
-            let addr = PAGE_SIZE as u32 - 1; // Last address of the first page
+            let addr = PAGE_SIZE as Addr - 1; // Last address of the first page
             let (page_no, offset) = split_ptr(addr);
 
             assert_eq!(page_no, 0,);
@@ -1325,7 +1325,7 @@ mod tests {
             let addr = Addr::MAX;
             let (page_no, offset) = split_ptr(addr);
 
-            assert_eq!(page_no, 0xFFFF,);
+            assert_eq!(page_no, 0xFFFFFFFF);
             assert_eq!(offset, 0xFFFF);
         }
     }
@@ -1553,7 +1553,7 @@ mod tests {
                     .prop_perturb(|(a, mut b), mut rng| {
                         // Position B at the end of A so that they are partially overlaps
                         let offset = a.len().min(b.len());
-                        let offset = rng.gen_range(1..offset) as u32;
+                        let offset = rng.gen_range(1..offset) as Addr;
                         b.set_addr(a.end() - offset);
                         (a, b)
                     })
@@ -1578,7 +1578,7 @@ mod tests {
                     })
                     .prop_map(|(a, mut b, b_offset)| {
                         // placing B so that A covers it
-                        b.set_addr(a.addr() + b_offset as u32);
+                        b.set_addr(a.addr() + b_offset as Addr);
                         (a, b)
                     })
             }
@@ -1596,7 +1596,7 @@ mod tests {
                     .prop_filter("out of bounds patch", |(offset, bytes)| {
                         offset + bytes.len() < DB_SIZE
                     })
-                    .prop_map(|(offset, bytes)| Patch::Write(offset as u32, bytes))
+                    .prop_map(|(offset, bytes)| Patch::Write(offset as Addr, bytes))
             }
 
             pub(super) fn reclaim_patch(len: Range<usize>) -> impl Strategy<Value = Patch> {
@@ -1604,7 +1604,7 @@ mod tests {
                     .prop_filter("out of bounds patch", |(offset, len)| {
                         (*offset + *len) < DB_SIZE
                     })
-                    .prop_map(|(offset, len)| Patch::Reclaim(offset as u32, len))
+                    .prop_map(|(offset, len)| Patch::Reclaim(offset as Addr, len))
             }
 
             fn randomize_order((mut a, mut b): (Patch, Patch), mut rng: TestRng) -> (Patch, Patch) {
@@ -1678,8 +1678,8 @@ mod tests {
     }
 
     impl MemRange for Range<u32> {
-        fn addr(&self) -> u32 {
-            self.start
+        fn addr(&self) -> Addr {
+            self.start as Addr
         }
 
         fn len(&self) -> usize {

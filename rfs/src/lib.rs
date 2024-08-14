@@ -1,7 +1,7 @@
 use pmem::{
     memory::{self, SlicePtr, PTR_SIZE},
     page::{TxRead, TxWrite},
-    Handle, Memory, Ptr, Record,
+    Addr, Handle, Memory, Ptr, Record,
 };
 use pmem_derive::Record;
 use std::{
@@ -64,7 +64,7 @@ impl<S: TxRead> Filesystem<S> {
     /// Returns the file/directory with a given inode ([FileMeta::fid])
     pub fn lookup_by_id(&self, id: u64) -> Result<FileMeta> {
         assert!(id <= u32::MAX as u64);
-        let ptr = Ptr::<FNode>::from_addr(id as u32).ok_or(ErrorKind::NotFound)?;
+        let ptr = Ptr::<FNode>::from_addr(id as Addr).ok_or(ErrorKind::NotFound)?;
         let handle = self.mem.lookup(ptr)?;
         FileMeta::from(handle, &self.mem)
     }
@@ -109,7 +109,7 @@ impl<S: TxRead> Filesystem<S> {
     fn lookup_inode(&self, meta: &FileMeta) -> Result<Handle<FNode>> {
         assert!(meta.fid <= u32::MAX as u64);
 
-        let ptr = Ptr::from_addr(meta.fid as u32).ok_or(ErrorKind::NotFound)?;
+        let ptr = Ptr::from_addr(meta.fid as Addr).ok_or(ErrorKind::NotFound)?;
         self.mem.lookup(ptr).map_err(|e| e.into())
     }
 
@@ -815,7 +815,7 @@ impl FileMeta {
         let name = file_info.name(mem)?;
         Ok(FileMeta {
             name,
-            fid: u64::from(file_info.ptr().unwrap_addr()),
+            fid: file_info.ptr().unwrap_addr(),
             size: file_info.size,
             node_type: file_info.node_type,
         })

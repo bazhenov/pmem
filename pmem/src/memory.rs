@@ -11,8 +11,8 @@ use std::{
     ops::{Deref, DerefMut},
 };
 /// The size of any pointer in bytes
-pub const PTR_SIZE: usize = 4;
-const START_ADDR: PageOffset = 4;
+pub const PTR_SIZE: usize = mem::size_of::<Addr>();
+const START_ADDR: Addr = 8;
 
 /// The size of a header of each entity written to storage
 const SLICE_HEADER_SIZE: usize = mem::size_of::<u32>();
@@ -90,7 +90,7 @@ impl<S: TxRead> Memory<S> {
     }
 
     pub fn read_super_block<T: Record>(&self) -> Result<Handle<T>> {
-        let ptr = Ptr::from_addr(START_ADDR + MemoryInfo::SIZE as PageOffset).unwrap();
+        let ptr = Ptr::from_addr(START_ADDR + MemoryInfo::SIZE as Addr).unwrap();
         self.lookup(ptr)
     }
 
@@ -115,7 +115,7 @@ impl<S: TxRead> Memory<S> {
         let items = self.read_static::<SLICE_HEADER_SIZE>(addr);
 
         let items = u32::from_le_bytes(items) as usize;
-        let bytes = self.read_uncommitted(addr + SLICE_HEADER_SIZE as u32, items * T::SIZE);
+        let bytes = self.read_uncommitted(addr + SLICE_HEADER_SIZE as Addr, items * T::SIZE);
         let mut result = Vec::with_capacity(items);
         for chunk in bytes.chunks(T::SIZE) {
             result.push(T::read(chunk)?);
@@ -128,26 +128,26 @@ impl<S: TxRead> Memory<S> {
         let items = self.read_static::<SLICE_HEADER_SIZE>(addr);
 
         let bytes = u32::from_le_bytes(items) as usize;
-        Ok(self.read_uncommitted(addr + SLICE_HEADER_SIZE as u32, bytes))
+        Ok(self.read_uncommitted(addr + SLICE_HEADER_SIZE as Addr, bytes))
     }
 
-    fn read_static<const N: usize>(&self, offset: PageOffset) -> [u8; N] {
+    fn read_static<const N: usize>(&self, addr: Addr) -> [u8; N] {
         let mut ret = [0; N];
-        let bytes = self.read_uncommitted(offset, N);
+        let bytes = self.read_uncommitted(addr, N);
         for (to, from) in ret.iter_mut().zip(bytes.iter()) {
             *to = *from;
         }
         ret
     }
 
-    fn read_uncommitted(&self, addr: PageOffset, len: usize) -> Cow<[u8]> {
+    fn read_uncommitted(&self, addr: Addr, len: usize) -> Cow<[u8]> {
         self.snapshot.read(addr, len)
     }
 }
 
 impl<S: TxWrite> Memory<S> {
     pub fn init(mut snapshot: S) -> Self {
-        let next_addr = START_ADDR + MemoryInfo::SIZE as PageOffset;
+        let next_addr = START_ADDR + MemoryInfo::SIZE as Addr;
 
         let mem_info = MemoryInfo { next_addr };
 
@@ -164,7 +164,7 @@ impl<S: TxWrite> Memory<S> {
         if !self.snapshot.valid_range(addr, size) {
             return Err(Error::NoSpaceLeft);
         }
-        self.mem_info.next_addr += size as u32;
+        self.mem_info.next_addr += size as Addr;
         Ok(addr)
     }
 
@@ -186,7 +186,7 @@ impl<S: TxWrite> Memory<S> {
     }
 
     pub fn write_slice<T: Record>(&mut self, values: &[T]) -> Result<SlicePtr<T>> {
-        assert!(values.len() <= PageOffset::MAX as usize);
+        assert!(values.len() <= u32::MAX as usize);
 
         let size = SLICE_HEADER_SIZE + T::SIZE * values.len();
         let ptr = SlicePtr::from_addr(self.alloc_space(size)?).expect("Alloc failed");
@@ -280,12 +280,12 @@ impl<S: TxWrite> Memory<S> {
 }
 
 pub struct Ptr<T> {
-    addr: u32,
+    addr: Addr,
     _phantom: PhantomData<T>,
 }
 
 impl<T> Ptr<T> {
-    pub fn from_addr(addr: u32) -> Option<Self> {
+    pub fn from_addr(addr: Addr) -> Option<Self> {
         (addr > 0).then_some(Self {
             addr,
             _phantom: PhantomData::<T>,
@@ -297,7 +297,7 @@ impl<T> Record for Ptr<T> {
     const SIZE: usize = mem::size_of::<Addr>();
 
     fn read(data: &[u8]) -> Result<Self> {
-        let addr = u32::from_le_bytes(data.try_into()?);
+        let addr = Addr::from_le_bytes(data.try_into()?);
         Ptr::from_addr(addr).ok_or(Error::NullPointer)
     }
 
@@ -350,7 +350,7 @@ impl<T> Clone for SlicePtr<T> {
 }
 
 impl<T> SlicePtr<T> {
-    fn from_addr(addr: u32) -> Option<Self> {
+    fn from_addr(addr: Addr) -> Option<Self> {
         Ptr::from_addr(addr).map(Self)
     }
 }

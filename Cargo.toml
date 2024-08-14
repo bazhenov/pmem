@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["pmem", "pmem-derive", "rfs"]
+members = ["pmem", "pmem-derive", "replication", "rfs"]
 
 [workspace.dependencies]
 pmem-derive = { path = "pmem-derive" }
@@ -9,3 +9,5 @@ proptest = "1.0.0"
 tempfile = "3.10.1"
 rand = "0.8.5"
 tango-bench = "0.5.0"
+arc-swap = "1.7.1"
+tokio = "1.39.2"

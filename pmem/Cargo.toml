@@ -6,15 +6,14 @@ edition = "2021"
 [dependencies]
 thiserror = { workspace = true }
 pmem-derive = { workspace = true }
-arc-swap = "1.7.1"
-tokio = { version = "1.39.2", features = ["sync", "macros", "rt"] }
+arc-swap = { workspace = true }
+tokio = { workspace = true, features = ["sync", "macros", "rt"] }
 
 [dev-dependencies]
 fatfs = "0.3.6"
 proptest = "1.0.0"
 rand = { workspace = true, features = ["small_rng"] }
 tango-bench = { workspace = true }
-arc-swap = "1.7.1"
 
 [[bench]]
 name = "page"
