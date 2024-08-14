@@ -278,8 +278,8 @@ impl<S: TxWrite> Filesystem<S> {
         FileMeta::from(node, &self.mem)
     }
 
-    pub fn finish(self) -> Memory<S> {
-        self.mem
+    pub fn finish(self) -> S {
+        self.mem.finish()
     }
 
     /// Returns `Ok(child)` if it was created successfully otherwise returns existing child: `Err(child)`
