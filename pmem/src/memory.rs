@@ -158,10 +158,6 @@ impl<S: TxWrite> Memory<S> {
         Self { snapshot, mem_info }
     }
 
-    fn do_write_bytes(&mut self, addr: Addr, bytes: impl Into<Vec<u8>>) {
-        self.snapshot.write(addr, bytes)
-    }
-
     fn alloc_space(&mut self, size: usize) -> Result<Addr> {
         assert!(size > 0);
         let addr = self.mem_info.next_addr;
@@ -208,7 +204,11 @@ impl<S: TxWrite> Memory<S> {
             value.write(byte_chunk).unwrap();
         }
 
-        self.do_write_bytes(ptr.0.addr, buffer);
+        {
+            let this = &mut *self;
+            let addr = ptr.0.addr;
+            this.snapshot.write(addr, buffer)
+        };
         Ok(ptr)
     }
 
@@ -226,7 +226,11 @@ impl<S: TxWrite> Memory<S> {
 
         buffer[SLICE_HEADER_SIZE..].copy_from_slice(bytes);
 
-        self.do_write_bytes(ptr.0.addr, buffer);
+        {
+            let this = &mut *self;
+            let addr = ptr.0.addr;
+            this.snapshot.write(addr, buffer)
+        };
         Ok(ptr)
     }
 
@@ -247,7 +251,11 @@ impl<S: TxWrite> Memory<S> {
         };
 
         value.write(&mut buffer)?;
-        self.do_write_bytes(ptr.addr, buffer);
+        {
+            let this = &mut *self;
+            let addr = ptr.addr;
+            this.snapshot.write(addr, buffer)
+        };
         Ok((ptr, size))
     }
 
