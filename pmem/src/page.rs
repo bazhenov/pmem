@@ -1115,6 +1115,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(not(miri))]
     async fn can_get_notifications_about_commit() {
         let mut pool = PagePool::new(1);
         let mut n1 = pool.commit_notify();
