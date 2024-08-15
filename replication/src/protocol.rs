@@ -1,6 +1,7 @@
-use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
+use crate::io_error;
 use pmem::page::{Patch, PAGE_SIZE};
-use std::io::{self, Read, Write};
+use std::{io, pin::Pin};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(Debug, PartialEq)]
 pub enum Message {
@@ -15,22 +16,22 @@ const PATCH_WRITE: u8 = 1;
 const PATCH_RECLAIM: u8 = 2;
 
 impl Message {
-    pub fn write_to(&self, cursor: &mut impl Write) -> io::Result<()> {
+    pub async fn write_to(&self, mut out: Pin<&mut impl AsyncWriteExt>) -> io::Result<()> {
         match self {
-            Message::Handshake => cursor.write_all(&[HANDSHAKE])?,
+            Message::Handshake => out.write_u8(HANDSHAKE).await?,
             Message::Patch(p) => {
-                cursor.write_all(&[PATCH])?;
+                out.write_u8(PATCH).await?;
                 match p {
                     Patch::Write(addr, bytes) => {
-                        cursor.write_u8(PATCH_WRITE)?;
-                        cursor.write_u64::<BigEndian>(*addr)?;
-                        cursor.write_u64::<BigEndian>(bytes.len() as u64)?;
-                        cursor.write_all(bytes)?;
+                        out.write_u8(PATCH_WRITE).await?;
+                        out.write_u64(*addr).await?;
+                        out.write_u64(bytes.len() as u64).await?;
+                        out.write_all(bytes).await?;
                     }
                     Patch::Reclaim(addr, length) => {
-                        cursor.write_u8(PATCH_RECLAIM)?;
-                        cursor.write_u64::<BigEndian>(*addr)?;
-                        cursor.write_u64::<BigEndian>(*length as u64)?;
+                        out.write_u8(PATCH_RECLAIM).await?;
+                        out.write_u64(*addr).await?;
+                        out.write_u64(*length as u64).await?;
                     }
                 }
             }
@@ -38,26 +39,26 @@ impl Message {
         Ok(())
     }
 
-    pub fn read_from(input: &mut impl io::Read) -> io::Result<Self> {
-        let discriminator = read(input)?;
+    pub async fn read_from(mut input: Pin<&mut impl AsyncReadExt>) -> io::Result<Self> {
+        let discriminator = input.read_u8().await?;
 
         match discriminator {
             HANDSHAKE => Ok(Message::Handshake),
-            PATCH => match read(input)? {
+            PATCH => match input.read_u8().await? {
                 PATCH_WRITE => {
-                    let addr = input.read_u64::<BigEndian>()?;
-                    let len = usize::try_from(input.read_u64::<BigEndian>()?).unwrap();
+                    let addr = input.read_u64().await?;
+                    let len = usize::try_from(input.read_u64().await?).unwrap();
                     if len <= PAGE_SIZE {
                         let mut bytes = vec![0; len];
-                        input.read_exact(&mut bytes)?;
+                        input.read_exact(&mut bytes).await?;
                         Ok(Message::Patch(Patch::Write(addr, bytes)))
                     } else {
                         io_error("Patch length exceeds page size")
                     }
                 }
                 PATCH_RECLAIM => {
-                    let addr = input.read_u64::<BigEndian>()?;
-                    let len = usize::try_from(input.read_u64::<BigEndian>()?).unwrap();
+                    let addr = input.read_u64().await?;
+                    let len = usize::try_from(input.read_u64().await?).unwrap();
                     Ok(Message::Patch(Patch::Reclaim(addr, len)))
                 }
                 _ => io_error("Invalid patch type"),
@@ -67,38 +68,28 @@ impl Message {
     }
 }
 
-fn io_error(error: &str) -> Result<Message, io::Error> {
-    Err(io::Error::new(io::ErrorKind::InvalidData, error))
-}
-
-fn read(input: &mut impl Read) -> io::Result<u8> {
-    let mut buf = [0];
-    input.read_exact(&mut buf)?;
-    Ok(buf[0])
-}
-
 #[cfg(test)]
 mod tests {
     use io::Cursor;
+    use std::pin::pin;
 
     use super::*;
-    #[test]
-    fn check_serialization() -> io::Result<()> {
-        assert_read_write_eq(Message::Handshake)?;
+    #[tokio::test]
+    async fn check_serialization() -> io::Result<()> {
+        assert_read_write_eq(Message::Handshake).await?;
 
-        assert_read_write_eq(Message::Patch(Patch::Write(10, vec![0, 1, 2, 3])))?;
-        assert_read_write_eq(Message::Patch(Patch::Reclaim(20, 10)))?;
+        assert_read_write_eq(Message::Patch(Patch::Write(10, vec![0, 1, 2, 3]))).await?;
+        assert_read_write_eq(Message::Patch(Patch::Reclaim(20, 10))).await?;
         Ok(())
     }
 
-    #[track_caller]
-    fn assert_read_write_eq(msg: Message) -> Result<(), io::Error> {
+    async fn assert_read_write_eq(msg: Message) -> Result<(), io::Error> {
         let mut cursor = Cursor::new(Vec::new());
-        msg.write_to(&mut cursor)?;
+        msg.write_to(pin!(&mut cursor)).await?;
         // Writing garbage to the end of the buffer to ensure that we are not reading past the end
-        cursor.write_all(&[0; 10])?;
+        cursor.write_all(&[0; 10]).await?;
         cursor.set_position(0);
-        let msg_copy = Message::read_from(&mut cursor)?;
+        let msg_copy = Message::read_from(pin!(cursor)).await?;
         assert_eq!(msg, msg_copy);
         Ok(())
     }
