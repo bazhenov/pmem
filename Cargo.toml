@@ -4,6 +4,10 @@ members = ["pmem", "pmem-derive", "replication", "rfs"]
 
 [workspace.dependencies]
 pmem-derive = { path = "pmem-derive" }
+pmem = { path = "pmem" }
+rfs = { path = "rfs" }
+replication = { path = "replication" }
+
 thiserror = "1.0.61"
 proptest = "1.0.0"
 tempfile = "3.10.1"

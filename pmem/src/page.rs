@@ -67,9 +67,8 @@ pub type LSN = u64;
 ///
 /// A `Patch` can either write a range of bytes starting at a specified offset
 /// or reclaim a range of bytes starting at a specified offset.
-#[derive(Clone)]
-#[cfg_attr(test, derive(PartialEq, Debug))]
-enum Patch {
+#[derive(Clone, PartialEq, Debug)]
+pub enum Patch {
     // Write given data at a specified offset
     Write(Addr, Vec<u8>),
 
@@ -78,7 +77,7 @@ enum Patch {
 }
 
 impl Patch {
-    pub fn normalize(self, other: Patch) -> NormalizedPatches {
+    fn normalize(self, other: Patch) -> NormalizedPatches {
         if other.fully_covers(&self) {
             NormalizedPatches::Merged(other)
         } else if self.fully_covers(&other) {
