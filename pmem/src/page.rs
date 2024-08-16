@@ -495,6 +495,7 @@ impl PagePool {
     }
 }
 
+#[derive(Clone)]
 pub struct CommitNotify {
     snapshot: Arc<ArcSwap<CommittedSnapshot>>,
     last_seen_lsn: u64,
@@ -574,6 +575,10 @@ impl Default for CommittedSnapshot {
 }
 
 impl CommittedSnapshot {
+    pub fn patches(&self) -> &[Patch] {
+        self.patches.as_slice()
+    }
+
     fn read_to_buf(self: &Arc<Self>, addr: Addr, buf: &mut [u8], buf_mask: &mut Vec<Range<usize>>) {
         split_ptr_checked(addr, buf.len(), self.pages);
 

@@ -1,11 +1,9 @@
-use pmem::page::Patch;
+use pmem::page::{CommitNotify, Patch};
 use protocol::Message;
-use std::{io, pin::pin};
+use std::{borrow::Cow, io, pin::pin};
 use tokio::net::{TcpListener, TcpStream};
 
 mod protocol;
-
-const MAX_PACKET_SIZE: usize = 1024 * 1024;
 
 pub struct ReplicationServer {
     listener: TcpListener,
@@ -17,21 +15,29 @@ impl ReplicationServer {
         Ok(Self { listener })
     }
 
-    pub async fn run(&self) -> io::Result<()> {
+    pub async fn run(&self, notify: CommitNotify) -> io::Result<()> {
         loop {
             let (socket, _) = self.listener.accept().await?;
-            tokio::spawn(handle_client(socket));
+            tokio::spawn(handle_client(socket, notify.clone()));
         }
     }
 }
 
-async fn handle_client(mut socket: TcpStream) -> io::Result<()> {
+async fn handle_client(mut socket: TcpStream, mut notify: CommitNotify) -> io::Result<()> {
     Message::Handshake.write_to(pin!(&mut socket)).await?;
     let msg = Message::read_from(pin!(&mut socket)).await?;
     if msg != Message::Handshake {
         return io_error("Invalid handshake message");
     }
-    Ok(())
+
+    loop {
+        let snapshot = notify.next_snapshot().await;
+        for patch in snapshot.patches() {
+            Message::Patch(Cow::Borrowed(patch))
+                .write_to(pin!(&mut socket))
+                .await?;
+        }
+    }
 }
 
 pub struct ReplicationClient {
@@ -53,7 +59,7 @@ impl ReplicationClient {
     pub async fn next_patch(&mut self) -> io::Result<Patch> {
         let msg = Message::read_from(pin!(&mut self.socket)).await?;
         match msg {
-            Message::Patch(p) => Ok(p),
+            Message::Patch(p) => Ok(p.into_owned()),
             _ => io_error("Invalid message type"),
         }
     }
