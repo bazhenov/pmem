@@ -1,10 +1,14 @@
-use pmem::page::{PagePool, Patch, TxWrite};
-use replication::{ReplicationClient, ReplicationServer};
+use pmem::page::{PagePool, TxRead, TxWrite};
+use replication::{replica_connect, ReplicationServer};
 use std::io;
+use tracing::init_tracing;
+
+mod tracing;
 
 #[tokio::test]
 #[cfg(not(miri))]
 async fn check_replication() -> io::Result<()> {
+    init_tracing();
     let mut pool = PagePool::default();
 
     let server = ReplicationServer::bind("127.0.0.1:3315").await?;
@@ -16,10 +20,12 @@ async fn check_replication() -> io::Result<()> {
     snapshot.write(0, bytes);
     pool.commit(snapshot);
 
-    let mut client = ReplicationClient::connect("127.0.0.1:3315").await?;
+    let (mut replica, ctrl) = replica_connect("127.0.0.1:3315").await?;
 
-    let patch = client.next_patch().await?;
-    assert_eq!(patch, Patch::Write(0, bytes.to_vec()));
+    let snapshot = replica.next_snapshot().await;
+    assert_eq!(&*snapshot.read(0, 4), &bytes);
+
+    ctrl.shutdown().await??;
 
     Ok(())
 }
