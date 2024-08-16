@@ -1388,15 +1388,15 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[should_panic(expected = "NoSpaceLeft")]
     fn no_space_left() {
-        // Maximum file size is 17984 bytes in test environment. So in order to trigger NoSpaceLeft
-        // we need to write 64Kib (1 page in PagePool) / 17984 = 4 files.
+        // Maximum file size is 5184 bytes in test environment. So in order to trigger NoSpaceLeft
+        // we need to write 64Kib (1 page in PagePool) / 5184 = 13 files.
         const MAX_FILE_SIZE: usize = BLOCK_SIZE * LAST_DOUBLE_INDIRECT_BLOCK;
 
         let (mut fs, _) = create_fs();
         let root = fs.get_root().unwrap();
 
         let pos = Some(SeekFrom::Start((MAX_FILE_SIZE - 1) as u64));
-        for idx in 0..4 {
+        for idx in 0..13 {
             let f = fs.create_file(&root, format!("swap{}", idx)).unwrap();
             write_file(&mut fs, &f, &[1], pos).unwrap();
         }
