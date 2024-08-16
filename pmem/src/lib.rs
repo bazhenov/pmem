@@ -1,7 +1,7 @@
 pub mod memory;
 pub mod page;
 
-pub use memory::{Handle, Memory, Ptr, Record, Storable, Transaction};
+pub use memory::{Handle, Memory, Ptr, Record};
 pub use page::Addr;
 
 #[macro_export]

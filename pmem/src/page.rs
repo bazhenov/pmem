@@ -10,7 +10,6 @@
 //!
 //! - **Page Pool**: A collection of pages that can be snapshot, modified, and committed. It acts as the primary
 //!   interface for interacting with the page memory.
-//!
 //! - **Snapshot**: A snapshot represents the state of the page pool at a specific moment.
 //!   It can be modified independently of the pool, and later committed back to the pool to update its state.
 //! - **Commit**: The act of applying the changes made in a snapshot back to the page pool, updating the pool's state
@@ -30,7 +29,7 @@
 //! ## Example
 //!
 //! ```rust
-//! use pmem::page::PagePool;
+//! use pmem::page::{PagePool, TxWrite};
 //!
 //! let mut pool = PagePool::new(5); // Initialize a pool with 5 pages
 //! let mut snapshot = pool.snapshot(); // Create a snapshot of the current state
@@ -53,10 +52,12 @@
 //! overhead, making it perfectly valid and cost-effective to create a snapshot even when the intention is only to
 //! read data without any modifications.
 
+use arc_swap::ArcSwap;
 use std::{borrow::Cow, ops::Range, sync::Arc};
+use tokio::sync::Notify;
 
 pub const PAGE_SIZE: usize = 1 << 16; // 64Kib
-pub type Addr = u32;
+pub type Addr = u64;
 pub type PageOffset = u32;
 pub type PageNo = u32;
 pub type LSN = u64;
@@ -65,18 +66,17 @@ pub type LSN = u64;
 ///
 /// A `Patch` can either write a range of bytes starting at a specified offset
 /// or reclaim a range of bytes starting at a specified offset.
-#[derive(Clone)]
-#[cfg_attr(test, derive(PartialEq, Debug))]
-enum Patch {
+#[derive(Clone, PartialEq, Debug)]
+pub enum Patch {
     // Write given data at a specified offset
-    Write(PageOffset, Vec<u8>),
+    Write(Addr, Vec<u8>),
 
     /// Reclaim given amount of bytes at a specified address
-    Reclaim(PageOffset, usize),
+    Reclaim(Addr, usize),
 }
 
 impl Patch {
-    pub fn normalize(self, other: Patch) -> NormalizedPatches {
+    fn normalize(self, other: Patch) -> NormalizedPatches {
         if other.fully_covers(&self) {
             NormalizedPatches::Merged(other)
         } else if self.fully_covers(&other) {
@@ -110,7 +110,7 @@ impl Patch {
         self.addr() <= other.addr() && other.end() <= self.end()
     }
 
-    fn trim_after(&mut self, at: u32) {
+    fn trim_after(&mut self, at: Addr) {
         let end = self.end();
         assert!(self.addr() < at && at < end, "Out-of-bounds");
         match self {
@@ -121,7 +121,7 @@ impl Patch {
         }
     }
 
-    fn trim_before(&mut self, at: u32) {
+    fn trim_before(&mut self, at: Addr) {
         assert!(self.addr() < at && at < self.end(), "Out-of-bounds");
         match self {
             Patch::Write(offset, data) => {
@@ -163,7 +163,7 @@ impl Patch {
                 };
                 result_data[range].copy_from_slice(&b_data[..]);
 
-                Merged(Write(start as u32, result_data))
+                Merged(Write(start as Addr, result_data))
             }
             (a @ Reclaim(..), b @ Reclaim(..)) => {
                 let offset = a.addr().min(b.addr());
@@ -256,7 +256,7 @@ impl Patch {
     }
 
     #[cfg(test)]
-    fn set_addr(&mut self, value: u32) {
+    fn set_addr(&mut self, value: Addr) {
         match self {
             Patch::Write(addr, _) => *addr = value,
             Patch::Reclaim(addr, _) => *addr = value,
@@ -265,20 +265,20 @@ impl Patch {
 }
 
 trait MemRange {
-    fn addr(&self) -> u32;
+    fn addr(&self) -> Addr;
     fn len(&self) -> usize;
 
-    fn end(&self) -> u32 {
-        self.addr() + self.len() as u32
+    fn end(&self) -> Addr {
+        self.addr() + self.len() as Addr
     }
 
-    fn to_range(&self) -> Range<u32> {
-        self.addr()..self.addr() + self.len() as u32
+    fn to_range(&self) -> Range<Addr> {
+        self.addr()..self.addr() + self.len() as Addr
     }
 }
 
 impl MemRange for Patch {
-    fn addr(&self) -> u32 {
+    fn addr(&self) -> Addr {
         match self {
             Patch::Write(offset, _) => *offset,
             Patch::Reclaim(offset, _) => *offset,
@@ -341,7 +341,7 @@ pub enum Error {
 /// Basic usage:
 ///
 /// ```
-/// # use pmem::page::PagePool;
+/// # use pmem::page::{PagePool, TxWrite};
 /// let mut pool = PagePool::new(5);    // Initialize a pool with 5 pages
 /// let mut snapshot = pool.snapshot(); // Create a snapshot of the current state
 /// snapshot.write(0, &[0, 1, 2, 3]);   // Modify the snapshot
@@ -353,7 +353,8 @@ pub enum Error {
 /// can represent a state in the history of changes.
 #[derive(Default)]
 pub struct PagePool {
-    latest: Arc<CommittedSnapshot>,
+    latest: Arc<ArcSwap<CommittedSnapshot>>,
+    notify: Arc<Notify>,
 }
 
 impl PagePool {
@@ -375,7 +376,16 @@ impl PagePool {
             lsn: 1,
         };
         Self {
-            latest: Arc::new(snapshot),
+            latest: Arc::new(ArcSwap::new(Arc::new(snapshot))),
+            notify: Arc::new(Notify::new()),
+        }
+    }
+
+    #[cfg(test)]
+    fn from_snapshot(snapshot: CommittedSnapshot) -> Self {
+        Self {
+            latest: Arc::new(ArcSwap::new(Arc::new(snapshot))),
+            notify: Arc::new(Notify::new()),
         }
     }
 
@@ -409,16 +419,18 @@ impl PagePool {
     ///
     /// [`commit`]: Self::commit
     pub fn snapshot(&self) -> Snapshot {
+        let base = self.latest.load_full();
+        let pages = base.pages;
         Snapshot {
             patches: vec![],
-            base: Arc::clone(&self.latest),
-            pages: self.latest.pages,
+            base,
+            pages,
         }
     }
 
     /// Returns a snapshot of the page pool at a specific LSN **or newer**.
     pub fn snapshot_at(&self, lsn: u64) -> Result<Snapshot, Error> {
-        let latest = &self.latest;
+        let latest = ArcSwap::load(&self.latest);
         let base = latest
             .find_at_lsn(lsn)
             .ok_or(Error::NoSnapshot(lsn, latest.lsn))?;
@@ -442,31 +454,107 @@ impl PagePool {
     /// # Arguments
     ///
     /// * `snapshot` - A snapshot containing modifications to commit to the page pool.
-    pub fn commit(&mut self, snapshot: Snapshot) -> u64 {
+    pub fn commit(&mut self, snapshot: impl Into<Snapshot>) -> u64 {
+        let snapshot = snapshot.into();
+        let latest = self.latest.load_full();
         assert!(
-            Arc::ptr_eq(&self.latest, &snapshot.base),
+            Arc::ptr_eq(&latest, &snapshot.base),
             "Proposed snapshot is not linear"
         );
-        let lsn = self.latest.lsn + 1;
+        let lsn = latest.lsn + 1;
 
-        self.latest = Arc::new(CommittedSnapshot {
+        let new_snapshot = Arc::new(CommittedSnapshot {
             patches: snapshot.patches,
-            base: Some(Arc::clone(&self.latest)),
+            base: Some(latest),
             pages: snapshot.pages,
             lsn,
         });
+        self.latest.store(new_snapshot);
+        self.notify.notify_waiters();
         lsn
     }
 
+    pub fn commit_notify(&self) -> CommitNotify {
+        let snapshot = self.latest.clone();
+        CommitNotify {
+            last_seen_lsn: ArcSwap::load(&snapshot).lsn,
+            notify: self.notify.clone(),
+            snapshot,
+        }
+    }
+
     #[cfg(test)]
-    fn read(&self, addr: PageOffset, len: usize) -> Cow<[u8]> {
+    fn read(&self, addr: Addr, len: usize) -> Cow<[u8]> {
         #[allow(clippy::single_range_in_vec_init)]
         let mut buffer = vec![0; len];
         #[allow(clippy::single_range_in_vec_init)]
         let mut buf_ranges = vec![0..len];
-        self.latest.read_to_buf(addr, &mut buffer, &mut buf_ranges);
+        ArcSwap::load(&self.latest).read_to_buf(addr, &mut buffer, &mut buf_ranges);
         Cow::Owned(buffer)
     }
+}
+
+#[derive(Clone)]
+pub struct CommitNotify {
+    snapshot: Arc<ArcSwap<CommittedSnapshot>>,
+    last_seen_lsn: u64,
+    notify: Arc<Notify>,
+}
+
+impl CommitNotify {
+    /// Blocks until next snapshot is available and returns it
+    ///
+    /// The next snapshot is the one that is the most recent at the time this method is called.
+    /// It might be several snapshots ahead of the last seen snapshot. All intermediate snapshots
+    /// can be seen by using [`CommittedSnapshot::find_at_lsn()`]
+    pub async fn next_snapshot(&mut self) -> Arc<CommittedSnapshot> {
+        let future = self.notify.notified();
+        // Be carefult here to prevent race.
+        // First you need to create `Notified` future, then check if the new snapshot is already in place.
+        // Then wait for new snapshots.
+        if ArcSwap::load(&self.snapshot).lsn <= self.last_seen_lsn {
+            future.await;
+        }
+        let snapshot = self.snapshot.load_full();
+        self.last_seen_lsn = snapshot.lsn;
+        snapshot
+    }
+}
+
+/// Trait describing a read-only snapshot of a page pool.
+///
+/// Represents a consistent snapshot of a page pool at a specific point in time.
+pub trait TxRead {
+    /// Reads the specified number of bytes from the given address.
+    ///
+    /// # Panics
+    /// Panic if the address is out of bounds. See [`Self::valid_range`] for bounds checking.
+    fn read(&self, addr: Addr, len: usize) -> Cow<[u8]>;
+
+    /// Checks if the specified range of addresses is valid.
+    ///
+    /// The address is not valid if it addresses the pages that are outside of the pool bounds.
+    fn valid_range(&self, addr: Addr, len: usize) -> bool;
+}
+
+/// Trait describing a transaction that can modify data in a page pool.
+///
+/// Compared to [`TxRead`], this trait allows for writing and reclaiming data.
+pub trait TxWrite: TxRead {
+    /// Writes the specified bytes to the given address.
+    ///
+    /// # Panics
+    /// Panic if the address is out of bounds. See [`TxRead::valid_range`] for bounds checking.
+    fn write(&mut self, addr: Addr, bytes: impl Into<Vec<u8>>);
+
+    /// Frees the given segment of memory.
+    ///
+    /// Reclaim is guaranteed to follow zeroing semantics. The read operation from the corresponding segment
+    /// after reclaiming will return zeros.
+    ///
+    /// The main purpose of reclaim is to mark memory as not used, so it can be freed from persistent storage
+    /// after snapshot compaction.
+    fn reclaim(&mut self, addr: Addr, len: usize);
 }
 
 /// Represents a committed snapshot of a page pool.
@@ -511,6 +599,10 @@ impl Default for CommittedSnapshot {
 }
 
 impl CommittedSnapshot {
+    pub fn patches(&self) -> &[Patch] {
+        self.patches.as_slice()
+    }
+
     fn read_to_buf(self: &Arc<Self>, addr: Addr, buf: &mut [u8], buf_mask: &mut Vec<Range<usize>>) {
         split_ptr_checked(addr, buf.len(), self.pages);
 
@@ -524,7 +616,7 @@ impl CommittedSnapshot {
     }
 
     /// Returns first snapshot in the chain that has LSN greater or equal to the provided LSN or newer.
-    fn find_at_lsn(self: &Arc<Self>, lsn: u64) -> Option<Arc<Self>> {
+    pub fn find_at_lsn(self: &Arc<Self>, lsn: u64) -> Option<Arc<Self>> {
         let mut snapshot = self;
         while let Some(s) = snapshot.base.as_ref() {
             if s.lsn < lsn {
@@ -534,6 +626,23 @@ impl CommittedSnapshot {
             }
         }
         (snapshot.lsn >= lsn).then(|| Arc::clone(snapshot))
+    }
+}
+
+impl TxRead for Arc<CommittedSnapshot> {
+    fn read(&self, addr: Addr, len: usize) -> Cow<[u8]> {
+        split_ptr_checked(addr, len, self.pages);
+
+        let mut buf = vec![0; len];
+        #[allow(clippy::single_range_in_vec_init)]
+        let mut buf_ranges = vec![0..len];
+
+        self.read_to_buf(addr, &mut buf, &mut buf_ranges);
+        Cow::Owned(buf)
+    }
+
+    fn valid_range(&self, addr: Addr, len: usize) -> bool {
+        is_valid_ptr(addr, len, self.pages)
     }
 }
 
@@ -563,29 +672,27 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    pub fn write(&mut self, addr: Addr, bytes: impl Into<Vec<u8>>) {
-        let bytes = bytes.into();
-        split_ptr_checked(addr, bytes.len(), self.pages);
-
-        if !bytes.is_empty() {
-            push_patch(&mut self.patches, Patch::Write(addr, bytes))
-        }
+    pub fn base(&self) -> Arc<CommittedSnapshot> {
+        Arc::clone(&self.base)
     }
 
-    /// Frees the given segment of memory.
-    ///
-    /// Reclaim is guaranteed to follow zeroing semantics. The read operation from the corresponding segment
-    /// after reclaiming will return zeros.
-    ///
-    /// The main purpose of reclaim is to mark memory as not used, so it can be freed from persistent storage
-    /// after snapshot compaction.
-    pub fn reclaim(&mut self, addr: Addr, len: usize) {
-        if len > 0 {
-            push_patch(&mut self.patches, Patch::Reclaim(addr, len))
-        }
+    #[cfg(test)]
+    fn resize(&mut self, pages: usize) {
+        self.pages = pages as PageNo;
     }
 
-    pub fn read(&self, addr: Addr, len: usize) -> Cow<[u8]> {
+    #[cfg(test)]
+    fn lsn(&self) -> u64 {
+        self.base.lsn
+    }
+}
+
+impl TxRead for Snapshot {
+    fn valid_range(&self, addr: Addr, len: usize) -> bool {
+        is_valid_ptr(addr, len, self.pages)
+    }
+
+    fn read(&self, addr: Addr, len: usize) -> Cow<[u8]> {
         split_ptr_checked(addr, len, self.pages);
 
         let mut buf = vec![0; len];
@@ -600,14 +707,23 @@ impl Snapshot {
 
         Cow::Owned(buf)
     }
+}
 
-    pub fn valid_range(&self, addr: Addr, len: usize) -> bool {
-        is_valid_ptr(addr, len, self.pages)
+impl TxWrite for Snapshot {
+    fn write(&mut self, addr: Addr, bytes: impl Into<Vec<u8>>) {
+        let bytes = bytes.into();
+        split_ptr_checked(addr, bytes.len(), self.pages);
+
+        if !bytes.is_empty() {
+            push_patch(&mut self.patches, Patch::Write(addr, bytes))
+        }
     }
 
-    #[cfg(test)]
-    fn resize(&mut self, pages: usize) {
-        self.pages = pages as PageNo;
+    fn reclaim(&mut self, addr: Addr, len: usize) {
+        split_ptr_checked(addr, len, self.pages);
+        if len > 0 {
+            push_patch(&mut self.patches, Patch::Reclaim(addr, len))
+        }
     }
 }
 
@@ -692,7 +808,7 @@ fn apply_patches(
         let first_matching_idx = patches
             // because end address is exclusive we need to subtract 1 from it to find idx of first possibly
             // intersecting patch
-            .binary_search_by(|i| (i.end() - 1).cmp(&(start_addr as u32)))
+            .binary_search_by(|i| (i.end() - 1).cmp(&(start_addr as Addr)))
             .unwrap_or_else(|idx| idx);
 
         let overlapping_patches = patches[first_matching_idx..]
@@ -783,7 +899,10 @@ fn debug_assert_sorted_and_has_no_overlaps<T: MemRange>(ranges: &[T]) {
 fn split_ptr_checked(addr: Addr, len: usize, pages: u32) -> (PageNo, PageOffset) {
     assert!(
         is_valid_ptr(addr, len, pages),
-        "Ptr address is out of bounds"
+        "Address range is out of bounds 0x{:08x}-0x{:08x}. Max address 0x{:08x}",
+        addr,
+        addr + len as Addr,
+        pages as u64 * PAGE_SIZE as u64
     );
 
     split_ptr(addr)
@@ -799,9 +918,9 @@ fn is_valid_ptr(addr: Addr, len: usize, pages: u32) -> bool {
 
 fn split_ptr(addr: Addr) -> (PageNo, PageOffset) {
     const PAGE_SIZE_BITS: u32 = PAGE_SIZE.trailing_zeros();
-    let page_no = addr >> PAGE_SIZE_BITS;
-    let offset = addr & ((PAGE_SIZE - 1) as u32);
-    (page_no, offset)
+    let page_no = (addr >> PAGE_SIZE_BITS) & 0xFFFF_FFFF;
+    let offset = addr & (PAGE_SIZE - 1) as u64;
+    (page_no.try_into().unwrap(), offset.try_into().unwrap())
 }
 
 /// Returns true of given patch intersects given range of bytes
@@ -929,26 +1048,28 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "address is out of bounds")]
-    fn page_pool_should_return_error_on_oob_read() {
-        let mem = PagePool::default();
-        let snapshot = mem.snapshot();
-
+    #[should_panic(expected = "Address range is out of bounds")]
+    fn must_panic_on_oob_read() {
         // reading in a such a way that start address is still valid, but end address is not
-        let start = PAGE_SIZE as u32 - 10;
-        let len = 20;
-        let _ = snapshot.read(start, len);
+        PagePool::default()
+            .snapshot()
+            .read(PAGE_SIZE as Addr - 10, 20);
     }
 
     #[test]
-    #[should_panic(expected = "address is out of bounds")]
-    fn page_pool_should_return_error_on_oob_write() {
-        let mem = PagePool::default();
+    #[should_panic(expected = "Address range is out of bounds")]
+    fn must_panic_on_oob_write() {
+        PagePool::default()
+            .snapshot()
+            .write(PAGE_SIZE as Addr - 10, [0; 20]);
+    }
 
-        let mut snapshot = mem.snapshot();
-        let bytes = [0; 20];
-        let addr = PAGE_SIZE as u32 - 10;
-        snapshot.write(addr, bytes);
+    #[test]
+    #[should_panic(expected = "Address range is out of bounds")]
+    fn must_panic_on_oob_reclaim() {
+        PagePool::default()
+            .snapshot()
+            .reclaim(PAGE_SIZE as Addr - 10, 20);
     }
 
     #[test]
@@ -967,6 +1088,9 @@ mod tests {
         snapshot.resize(2); // adding second page
         snapshot.write(page_b, bob);
         mem.commit(snapshot);
+
+        let snapshot = mem.snapshot();
+        assert!(snapshot.valid_range(page_b, bob.len()));
     }
 
     #[test]
@@ -1009,6 +1133,31 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(not(miri))]
+    async fn can_get_notifications_about_commit() {
+        let mut pool = PagePool::new(1);
+        let mut n1 = pool.commit_notify();
+        let mut n2 = pool.commit_notify();
+        let current_lsn = pool.snapshot().lsn();
+
+        thread::spawn(move || {
+            let mut snapshot = pool.snapshot();
+            snapshot.write(0, [1]);
+            pool.commit(snapshot);
+        });
+
+        let lsn2 = tokio::spawn(async move { n2.next_snapshot().await.lsn })
+            .await
+            .unwrap();
+        let lsn1 = tokio::spawn(async move { n1.next_snapshot().await.lsn })
+            .await
+            .unwrap();
+
+        assert_eq!(lsn1, current_lsn + 1);
+        assert_eq!(lsn2, current_lsn + 1);
     }
 
     mod patch {
@@ -1176,7 +1325,7 @@ mod tests {
 
         #[test]
         fn split_ptr_at_boundary() {
-            let addr = PAGE_SIZE as u32 - 1; // Last address of the first page
+            let addr = PAGE_SIZE as Addr - 1; // Last address of the first page
             let (page_no, offset) = split_ptr(addr);
 
             assert_eq!(page_no, 0,);
@@ -1197,7 +1346,7 @@ mod tests {
             let addr = Addr::MAX;
             let (page_no, offset) = split_ptr(addr);
 
-            assert_eq!(page_no, 0xFFFF,);
+            assert_eq!(page_no, 0xFFFFFFFF);
             assert_eq!(offset, 0xFFFF);
         }
     }
@@ -1425,7 +1574,7 @@ mod tests {
                     .prop_perturb(|(a, mut b), mut rng| {
                         // Position B at the end of A so that they are partially overlaps
                         let offset = a.len().min(b.len());
-                        let offset = rng.gen_range(1..offset) as u32;
+                        let offset = rng.gen_range(1..offset) as Addr;
                         b.set_addr(a.end() - offset);
                         (a, b)
                     })
@@ -1450,7 +1599,7 @@ mod tests {
                     })
                     .prop_map(|(a, mut b, b_offset)| {
                         // placing B so that A covers it
-                        b.set_addr(a.addr() + b_offset as u32);
+                        b.set_addr(a.addr() + b_offset as Addr);
                         (a, b)
                     })
             }
@@ -1468,7 +1617,7 @@ mod tests {
                     .prop_filter("out of bounds patch", |(offset, bytes)| {
                         offset + bytes.len() < DB_SIZE
                     })
-                    .prop_map(|(offset, bytes)| Patch::Write(offset as u32, bytes))
+                    .prop_map(|(offset, bytes)| Patch::Write(offset as Addr, bytes))
             }
 
             pub(super) fn reclaim_patch(len: Range<usize>) -> impl Strategy<Value = Patch> {
@@ -1476,7 +1625,7 @@ mod tests {
                     .prop_filter("out of bounds patch", |(offset, len)| {
                         (*offset + *len) < DB_SIZE
                     })
-                    .prop_map(|(offset, len)| Patch::Reclaim(offset as u32, len))
+                    .prop_map(|(offset, len)| Patch::Reclaim(offset as Addr, len))
             }
 
             fn randomize_order((mut a, mut b): (Patch, Patch), mut rng: TestRng) -> (Patch, Patch) {
@@ -1539,21 +1688,19 @@ mod tests {
 
     impl From<&str> for PagePool {
         fn from(value: &str) -> Self {
-            let page = Arc::new(CommittedSnapshot::from(value.as_bytes()));
-            PagePool { latest: page }
+            Self::from(value.as_bytes())
         }
     }
 
     impl From<&[u8]> for PagePool {
         fn from(value: &[u8]) -> Self {
-            let page = Arc::new(CommittedSnapshot::from(value));
-            PagePool { latest: page }
+            PagePool::from_snapshot(CommittedSnapshot::from(value))
         }
     }
 
     impl MemRange for Range<u32> {
-        fn addr(&self) -> u32 {
-            self.start
+        fn addr(&self) -> Addr {
+            self.start as Addr
         }
 
         fn len(&self) -> usize {

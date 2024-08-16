@@ -1,4 +1,4 @@
-use pmem::{page::PagePool, Memory};
+use pmem::page::{PagePool, TxWrite};
 use rand::{rngs::SmallRng, seq::SliceRandom, Rng, SeedableRng};
 use rfs::{FileMeta, Filesystem};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -91,7 +91,7 @@ fn create_100_empty_files(b: Bencher) -> Box<dyn Sampler> {
     })
 }
 
-fn create_test_file(fs: &mut Filesystem, file_size: u64) -> FileMeta {
+fn create_test_file(fs: &mut Filesystem<impl TxWrite>, file_size: u64) -> FileMeta {
     let root = fs.get_root().unwrap();
     let meta = fs.create_file(&root, "file").unwrap();
 
@@ -128,7 +128,12 @@ fn navigate_directories(b: Bencher) -> Box<dyn Sampler> {
     })
 }
 
-fn create_deep_tree(fs: &mut Filesystem, parent: &FileMeta, level: u64, names: &[&str]) {
+fn create_deep_tree(
+    fs: &mut Filesystem<impl TxWrite>,
+    parent: &FileMeta,
+    level: u64,
+    names: &[&str],
+) {
     if level == 0 {
         return;
     }
@@ -138,10 +143,9 @@ fn create_deep_tree(fs: &mut Filesystem, parent: &FileMeta, level: u64, names: &
     }
 }
 
-fn create_fs() -> Filesystem {
+fn create_fs() -> Filesystem<impl TxWrite> {
     let pool = PagePool::with_capacity(2usize.pow(32)); // 4GiB
-    let mem = Memory::new(pool);
-    Filesystem::allocate(mem.start())
+    Filesystem::allocate(pool.snapshot())
 }
 
 tango_benchmarks!(page_benchmarks());

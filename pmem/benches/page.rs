@@ -1,5 +1,5 @@
 use pmem::{
-    page::{PagePool, PAGE_SIZE},
+    page::{PagePool, TxRead, TxWrite, PAGE_SIZE},
     Addr,
 };
 use rand::{rngs::SmallRng, Rng, SeedableRng};
