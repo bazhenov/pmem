@@ -10,7 +10,6 @@
 //!
 //! - **Page Pool**: A collection of pages that can be snapshot, modified, and committed. It acts as the primary
 //!   interface for interacting with the page memory.
-//!
 //! - **Snapshot**: A snapshot represents the state of the page pool at a specific moment.
 //!   It can be modified independently of the pool, and later committed back to the pool to update its state.
 //! - **Commit**: The act of applying the changes made in a snapshot back to the page pool, updating the pool's state
@@ -522,14 +521,39 @@ impl CommitNotify {
     }
 }
 
+/// Trait describing a read-only snapshot of a page pool.
+///
+/// Represents a consistent snapshot of a page pool at a specific point in time.
 pub trait TxRead {
+    /// Reads the specified number of bytes from the given address.
+    ///
+    /// # Panics
+    /// Panic if the address is out of bounds. See [`Self::valid_range`] for bounds checking.
     fn read(&self, addr: Addr, len: usize) -> Cow<[u8]>;
+
+    /// Checks if the specified range of addresses is valid.
+    ///
+    /// The address is not valid if it addresses the pages that are outside of the pool bounds.
     fn valid_range(&self, addr: Addr, len: usize) -> bool;
-    fn lsn(&self) -> u64;
 }
 
+/// Trait describing a transaction that can modify data in a page pool.
+///
+/// Compared to [`TxRead`], this trait allows for writing and reclaiming data.
 pub trait TxWrite: TxRead {
+    /// Writes the specified bytes to the given address.
+    ///
+    /// # Panics
+    /// Panic if the address is out of bounds. See [`Self::valid_range`] for bounds checking.
     fn write(&mut self, addr: Addr, bytes: impl Into<Vec<u8>>);
+
+    /// Frees the given segment of memory.
+    ///
+    /// Reclaim is guaranteed to follow zeroing semantics. The read operation from the corresponding segment
+    /// after reclaiming will return zeros.
+    ///
+    /// The main purpose of reclaim is to mark memory as not used, so it can be freed from persistent storage
+    /// after snapshot compaction.
     fn reclaim(&mut self, addr: Addr, len: usize);
 }
 
@@ -620,10 +644,6 @@ impl TxRead for Arc<CommittedSnapshot> {
     fn valid_range(&self, addr: Addr, len: usize) -> bool {
         is_valid_ptr(addr, len, self.pages)
     }
-
-    fn lsn(&self) -> u64 {
-        todo!()
-    }
 }
 
 impl Drop for CommittedSnapshot {
@@ -660,6 +680,11 @@ impl Snapshot {
     fn resize(&mut self, pages: usize) {
         self.pages = pages as PageNo;
     }
+
+    #[cfg(test)]
+    fn lsn(&self) -> u64 {
+        self.base.lsn
+    }
 }
 
 impl TxRead for Snapshot {
@@ -682,10 +707,6 @@ impl TxRead for Snapshot {
 
         Cow::Owned(buf)
     }
-
-    fn lsn(&self) -> u64 {
-        self.base.lsn
-    }
 }
 
 impl TxWrite for Snapshot {
@@ -698,14 +719,8 @@ impl TxWrite for Snapshot {
         }
     }
 
-    /// Frees the given segment of memory.
-    ///
-    /// Reclaim is guaranteed to follow zeroing semantics. The read operation from the corresponding segment
-    /// after reclaiming will return zeros.
-    ///
-    /// The main purpose of reclaim is to mark memory as not used, so it can be freed from persistent storage
-    /// after snapshot compaction.
     fn reclaim(&mut self, addr: Addr, len: usize) {
+        split_ptr_checked(addr, len, self.pages);
         if len > 0 {
             push_patch(&mut self.patches, Patch::Reclaim(addr, len))
         }
@@ -1034,25 +1049,27 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "Address range is out of bounds")]
-    fn page_pool_should_return_error_on_oob_read() {
-        let mem = PagePool::default();
-        let snapshot = mem.snapshot();
-
+    fn must_panic_on_oob_read() {
         // reading in a such a way that start address is still valid, but end address is not
-        let start = PAGE_SIZE as Addr - 10;
-        let len = 20;
-        let _ = snapshot.read(start, len);
+        PagePool::default()
+            .snapshot()
+            .read(PAGE_SIZE as Addr - 10, 20);
     }
 
     #[test]
     #[should_panic(expected = "Address range is out of bounds")]
-    fn page_pool_should_return_error_on_oob_write() {
-        let mem = PagePool::default();
+    fn must_panic_on_oob_write() {
+        PagePool::default()
+            .snapshot()
+            .write(PAGE_SIZE as Addr - 10, [0; 20]);
+    }
 
-        let mut snapshot = mem.snapshot();
-        let bytes = [0; 20];
-        let addr = PAGE_SIZE as u32 - 10;
-        snapshot.write(addr as Addr, bytes);
+    #[test]
+    #[should_panic(expected = "Address range is out of bounds")]
+    fn must_panic_on_oob_reclaim() {
+        PagePool::default()
+            .snapshot()
+            .reclaim(PAGE_SIZE as Addr - 10, 20);
     }
 
     #[test]
