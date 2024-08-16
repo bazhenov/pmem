@@ -12,10 +12,14 @@ jobs:
           components: "clippy, rustfmt"
       - uses: olix0r/cargo-action-fmt/setup@v2
       - uses: Swatinem/rust-cache@v2
-      - name: Running clippy
-        run: cargo clippy --all-targets --all-features --message-format=json | cargo-action-fmt
       - name: Checking formatting
         run: cargo fmt -- --check --color always
+      - name: Running clippy
+        run: cargo clippy --all-targets --all-features --message-format=json | cargo-action-fmt
+      - name: Running clippy
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --lib
       - name: Typo
         uses: crate-ci/typos@master
   test:
