@@ -506,7 +506,7 @@ impl CommitNotify {
     ///
     /// The next snapshot is the one that is the most recent at the time this method is called.
     /// It might be several snapshots ahead of the last seen snapshot. All intermediate snapshots
-    /// can be seen by using [`CommitNotification::find_at_lsn()`]
+    /// can be seen by using [`CommittedSnapshot::find_at_lsn()`]
     pub async fn next_snapshot(&mut self) -> Arc<CommittedSnapshot> {
         let future = self.notify.notified();
         // Be carefult here to prevent race.
@@ -544,7 +544,7 @@ pub trait TxWrite: TxRead {
     /// Writes the specified bytes to the given address.
     ///
     /// # Panics
-    /// Panic if the address is out of bounds. See [`Self::valid_range`] for bounds checking.
+    /// Panic if the address is out of bounds. See [`TxRead::valid_range`] for bounds checking.
     fn write(&mut self, addr: Addr, bytes: impl Into<Vec<u8>>);
 
     /// Frees the given segment of memory.
@@ -616,7 +616,7 @@ impl CommittedSnapshot {
     }
 
     /// Returns first snapshot in the chain that has LSN greater or equal to the provided LSN or newer.
-    fn find_at_lsn(self: &Arc<Self>, lsn: u64) -> Option<Arc<Self>> {
+    pub fn find_at_lsn(self: &Arc<Self>, lsn: u64) -> Option<Arc<Self>> {
         let mut snapshot = self;
         while let Some(s) = snapshot.base.as_ref() {
             if s.lsn < lsn {

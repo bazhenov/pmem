@@ -222,8 +222,8 @@ impl<S: TxWrite> Filesystem<S> {
     /// Creates a new directory in the given parent directory
     ///
     /// Returns:
-    /// - [Error::AlreadyExists] if the directory already exists;
-    /// - [ErrorKind::NotFound] if the parent directory does not exist;
+    /// - [`ErrorKind::AlreadyExists`] if the directory already exists;
+    /// - [`ErrorKind::NotFound`] if the parent directory does not exist;
     pub fn create_dir(&mut self, parent: &FileMeta, name: impl AsRef<str>) -> Result<FileMeta> {
         let mut parent = self.lookup_inode(parent)?;
 
