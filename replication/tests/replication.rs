@@ -22,7 +22,7 @@ async fn check_replication() -> io::Result<()> {
 
     pool.commit(snapshot);
 
-    let snapshot = replica.next_snapshot().await;
+    let snapshot = tokio::task::spawn_blocking(move || replica.next_snapshot()).await?;
     assert_eq!(&*snapshot.read(0, 4), &bytes);
     assert_eq!(&*snapshot.read(4, 4), &bytes);
 

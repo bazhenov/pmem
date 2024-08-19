@@ -6,17 +6,12 @@ edition = "2021"
 [dependencies]
 thiserror = { workspace = true }
 pmem-derive = { workspace = true }
-arc-swap = { workspace = true }
-
-# The only reason we need tokio in this crate this is Notify struct used in
-# PagePool to notify the background thread about new snapshots.
-# If you're able to replace it with something more lightweight, please do
-tokio = { workspace = true, features = ["sync", "macros", "rt"] }
 
 [dev-dependencies]
 proptest = "1.0.0"
 rand = { workspace = true, features = ["small_rng"] }
 tango-bench = { workspace = true }
+arc-swap = { workspace = true }
 
 [[bench]]
 name = "page"

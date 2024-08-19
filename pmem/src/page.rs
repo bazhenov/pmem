@@ -52,9 +52,11 @@
 //! overhead, making it perfectly valid and cost-effective to create a snapshot even when the intention is only to
 //! read data without any modifications.
 
-use arc_swap::ArcSwap;
-use std::{borrow::Cow, ops::Range, sync::Arc};
-use tokio::sync::Notify;
+use std::{
+    borrow::Cow,
+    ops::Range,
+    sync::{Arc, Condvar, Mutex},
+};
 
 pub const PAGE_SIZE: usize = 1 << 16; // 64Kib
 pub type Addr = u64;
@@ -353,8 +355,8 @@ pub enum Error {
 /// can represent a state in the history of changes.
 #[derive(Default)]
 pub struct PagePool {
-    latest: Arc<ArcSwap<CommittedSnapshot>>,
-    notify: Arc<Notify>,
+    latest: Arc<Mutex<Arc<CommittedSnapshot>>>,
+    notify: Arc<Condvar>,
 }
 
 impl PagePool {
@@ -375,17 +377,13 @@ impl PagePool {
             pages: u32::try_from(pages).unwrap(),
             lsn: 1,
         };
-        Self {
-            latest: Arc::new(ArcSwap::new(Arc::new(snapshot))),
-            notify: Arc::new(Notify::new()),
-        }
+        Self::from_snapshot(snapshot)
     }
 
-    #[cfg(test)]
     fn from_snapshot(snapshot: CommittedSnapshot) -> Self {
         Self {
-            latest: Arc::new(ArcSwap::new(Arc::new(snapshot))),
-            notify: Arc::new(Notify::new()),
+            latest: Arc::new(Mutex::new(Arc::new(snapshot))),
+            notify: Arc::new(Condvar::new()),
         }
     }
 
@@ -419,11 +417,11 @@ impl PagePool {
     ///
     /// [`commit`]: Self::commit
     pub fn snapshot(&self) -> Snapshot {
-        let base = self.latest.load_full();
+        let base = self.latest.lock().unwrap();
         let pages = base.pages;
         Snapshot {
             patches: vec![],
-            base,
+            base: Arc::clone(&base),
             pages,
         }
     }
@@ -431,7 +429,7 @@ impl PagePool {
     /// Returns a snapshot of the page pool at a specific LSN **or newer**.
     /// TODO: this method should return CommitedSnapshot instead of Snapshot
     pub fn snapshot_at(&self, lsn: u64) -> Result<Snapshot, Error> {
-        let latest = ArcSwap::load(&self.latest);
+        let latest = self.latest.lock().unwrap();
         let base = latest
             .find_at_lsn(lsn)
             .ok_or(Error::NoSnapshot(lsn, latest.lsn))?;
@@ -457,7 +455,7 @@ impl PagePool {
     /// * `snapshot` - A snapshot containing modifications to commit to the page pool.
     pub fn commit(&mut self, snapshot: impl Into<Snapshot>) -> u64 {
         let snapshot = snapshot.into();
-        let latest = self.latest.load_full();
+        let mut latest = self.latest.lock().unwrap();
         assert!(
             Arc::ptr_eq(&latest, &snapshot.base),
             "Proposed snapshot is not linear"
@@ -466,21 +464,29 @@ impl PagePool {
 
         let new_snapshot = Arc::new(CommittedSnapshot {
             patches: snapshot.patches,
-            base: Some(latest),
+            base: Some(Arc::clone(&latest)),
             pages: snapshot.pages,
             lsn,
         });
-        self.latest.store(new_snapshot);
-        self.notify.notify_waiters();
+        *latest = new_snapshot;
+        drop(latest);
+        self.notify.notify_all();
         lsn
     }
 
     pub fn commit_notify(&self) -> CommitNotify {
-        let snapshot = self.latest.clone();
+        let snapshot = self.latest.lock().unwrap();
         CommitNotify {
-            last_seen_lsn: ArcSwap::load(&snapshot).lsn,
-            notify: self.notify.clone(),
-            snapshot,
+            last_seen_lsn: snapshot.lsn,
+            notify: Arc::clone(&self.notify),
+            snapshot: Arc::clone(&self.latest),
+        }
+    }
+
+    pub fn handle(&self) -> PagePoolHandle {
+        PagePoolHandle {
+            latest: Arc::clone(&self.latest),
+            notify: self.commit_notify(),
         }
     }
 
@@ -490,16 +496,45 @@ impl PagePool {
         let mut buffer = vec![0; len];
         #[allow(clippy::single_range_in_vec_init)]
         let mut buf_ranges = vec![0..len];
-        ArcSwap::load(&self.latest).read_to_buf(addr, &mut buffer, &mut buf_ranges);
+        let latest = {
+            // Explicit scope to drop lock early
+            Arc::clone(&self.latest.lock().unwrap())
+        };
+        latest.read_to_buf(addr, &mut buffer, &mut buf_ranges);
         Cow::Owned(buffer)
+    }
+}
+
+pub struct PagePoolHandle {
+    latest: Arc<Mutex<Arc<CommittedSnapshot>>>,
+    notify: CommitNotify,
+}
+
+impl PagePoolHandle {
+    pub fn snapshot(&self) -> Arc<CommittedSnapshot> {
+        Arc::clone(&self.latest.lock().unwrap())
+    }
+
+    pub fn snapshot_at(&self, lsn: u64) -> Result<Arc<CommittedSnapshot>, Error> {
+        let latest = {
+            // Explicit scope to drop lock early
+            Arc::clone(&self.latest.lock().unwrap())
+        };
+        latest
+            .find_at_lsn(lsn)
+            .ok_or(Error::NoSnapshot(lsn, latest.lsn))
+    }
+
+    pub fn wait_for_commit(&mut self) -> Arc<CommittedSnapshot> {
+        self.notify.next_snapshot()
     }
 }
 
 #[derive(Clone)]
 pub struct CommitNotify {
-    snapshot: Arc<ArcSwap<CommittedSnapshot>>,
+    snapshot: Arc<Mutex<Arc<CommittedSnapshot>>>,
     last_seen_lsn: u64,
-    notify: Arc<Notify>,
+    notify: Arc<Condvar>,
 }
 
 impl CommitNotify {
@@ -508,15 +543,14 @@ impl CommitNotify {
     /// The next snapshot is the one that is the most recent at the time this method is called.
     /// It might be several snapshots ahead of the last seen snapshot. All intermediate snapshots
     /// can be seen by using [`CommittedSnapshot::find_at_lsn()`]
-    pub async fn next_snapshot(&mut self) -> Arc<CommittedSnapshot> {
-        let future = self.notify.notified();
-        // Be carefult here to prevent race.
-        // First you need to create `Notified` future, then check if the new snapshot is already in place.
-        // Then wait for new snapshots.
-        if ArcSwap::load(&self.snapshot).lsn <= self.last_seen_lsn {
-            future.await;
-        }
-        let snapshot = self.snapshot.load_full();
+    pub fn next_snapshot(&mut self) -> Arc<CommittedSnapshot> {
+        let snapshot = {
+            let mut snapshot = self.snapshot.lock().unwrap();
+            if snapshot.lsn <= self.last_seen_lsn {
+                snapshot = self.notify.wait(snapshot).unwrap();
+            }
+            Arc::clone(&snapshot)
+        };
         self.last_seen_lsn = snapshot.lsn;
         snapshot
     }
@@ -1136,9 +1170,28 @@ mod tests {
             .unwrap();
     }
 
-    #[tokio::test]
-    #[cfg(not(miri))]
-    async fn can_get_notifications_about_commit() {
+    #[test]
+    fn data_can_be_read_from_a_different_thread() {
+        let mut pool = PagePool::new(1);
+
+        let mut handle = pool.handle();
+
+        let lsn = thread::spawn(move || {
+            let mut snapshot = pool.snapshot();
+            snapshot.write(0, [1, 2, 3, 4]);
+            pool.commit(snapshot)
+        });
+
+        let commit = handle.wait_for_commit();
+        let bytes = commit.read(0, 4);
+
+        let lsn = lsn.join().unwrap();
+        assert_eq!(commit.lsn, lsn);
+        assert_eq!(&*bytes, [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn can_get_notifications_about_commit() {
         let mut pool = PagePool::new(1);
         let mut n1 = pool.commit_notify();
         let mut n2 = pool.commit_notify();
@@ -1150,12 +1203,8 @@ mod tests {
             pool.commit(snapshot);
         });
 
-        let lsn2 = tokio::spawn(async move { n2.next_snapshot().await.lsn })
-            .await
-            .unwrap();
-        let lsn1 = tokio::spawn(async move { n1.next_snapshot().await.lsn })
-            .await
-            .unwrap();
+        let lsn2 = n2.next_snapshot().lsn;
+        let lsn1 = n1.next_snapshot().lsn;
 
         assert_eq!(lsn1, current_lsn + 1);
         assert_eq!(lsn2, current_lsn + 1);

@@ -633,7 +633,6 @@ dependencies = [
  "rand",
  "tango-bench",
  "thiserror",
- "tokio",
 ]
 
 [[package]]

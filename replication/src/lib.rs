@@ -3,8 +3,8 @@ use protocol::{Message, PROTOCOL_VERSION};
 use std::{borrow::Cow, io, net::SocketAddr, pin::pin, sync::Arc};
 use tokio::{
     net::{TcpListener, TcpStream, ToSocketAddrs},
-    sync::oneshot::{self},
-    task::JoinHandle,
+    sync::oneshot,
+    task::{self, JoinHandle},
 };
 use tracing::info;
 
@@ -31,7 +31,7 @@ pub async fn accept_loop(listener: TcpListener, notify: CommitNotify) -> io::Res
     }
 }
 
-async fn handle_client(mut socket: TcpStream, mut notify: CommitNotify) -> io::Result<()> {
+async fn handle_client(mut socket: TcpStream, notify: CommitNotify) -> io::Result<()> {
     Message::Handshake(PROTOCOL_VERSION)
         .write_to(pin!(&mut socket))
         .await?;
@@ -44,7 +44,9 @@ async fn handle_client(mut socket: TcpStream, mut notify: CommitNotify) -> io::R
     }
 
     loop {
-        let snapshot = notify.next_snapshot().await;
+        let mut notify = notify.clone();
+        let snapshot = task::spawn_blocking(move || notify.next_snapshot()).await?;
+
         for patch in snapshot.patches() {
             Message::Patch(Cow::Borrowed(patch))
                 .write_to(pin!(&mut socket))
@@ -106,6 +108,7 @@ async fn replicate_worker(mut client: ReplicationClient, mut pool: PagePool) -> 
             Patch::Write(addr, bytes) => s.write(addr, bytes),
             Patch::Reclaim(addr, len) => s.reclaim(addr, len),
         }
+
         pool.commit(s);
     }
 }
