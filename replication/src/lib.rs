@@ -1,5 +1,5 @@
 use pmem::page::{CommitNotify, PagePool, Patch, TxWrite};
-use protocol::Message;
+use protocol::{Message, PROTOCOL_VERSION};
 use std::{borrow::Cow, io, net::SocketAddr, pin::pin};
 use tokio::{
     net::{TcpListener, TcpStream, ToSocketAddrs},
@@ -32,10 +32,15 @@ pub async fn accept_loop(listener: TcpListener, notify: CommitNotify) -> io::Res
 }
 
 async fn handle_client(mut socket: TcpStream, mut notify: CommitNotify) -> io::Result<()> {
-    Message::Handshake.write_to(pin!(&mut socket)).await?;
+    Message::Handshake(PROTOCOL_VERSION)
+        .write_to(pin!(&mut socket))
+        .await?;
     let msg = Message::read_from(pin!(&mut socket)).await?;
-    if msg != Message::Handshake {
+    let Message::Handshake(v) = msg else {
         return io_error("Invalid handshake message");
+    };
+    if v != PROTOCOL_VERSION {
+        return io_error("Invalid protocol version");
     }
 
     loop {
@@ -89,10 +94,12 @@ pub struct ReplicationClient {
 impl ReplicationClient {
     pub async fn connect(addr: impl ToSocketAddrs) -> io::Result<Self> {
         let mut socket = TcpStream::connect(addr).await?;
-        Message::Handshake.write_to(pin!(&mut socket)).await?;
+        Message::Handshake(PROTOCOL_VERSION)
+            .write_to(pin!(&mut socket))
+            .await?;
 
         let msg = Message::read_from(pin!(&mut socket)).await?;
-        if msg != Message::Handshake {
+        if msg != Message::Handshake(PROTOCOL_VERSION) {
             return io_error("Invalid handshake response");
         }
         Ok(Self { socket })

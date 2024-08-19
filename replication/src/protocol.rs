@@ -5,9 +5,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(Debug, PartialEq)]
 pub enum Message<'a> {
-    Handshake,
+    Handshake(u8),
     Patch(Cow<'a, Patch>),
 }
+
+pub const PROTOCOL_VERSION: u8 = 1;
 
 const HANDSHAKE: u8 = 1;
 const PATCH: u8 = 2;
@@ -18,7 +20,10 @@ const PATCH_RECLAIM: u8 = 2;
 impl<'a> Message<'a> {
     pub async fn write_to(&self, mut out: Pin<&mut impl AsyncWriteExt>) -> io::Result<()> {
         match self {
-            Message::Handshake => out.write_u8(HANDSHAKE).await?,
+            Message::Handshake(v) => {
+                out.write_u8(HANDSHAKE).await?;
+                out.write_u8(*v).await?;
+            }
             Message::Patch(p) => {
                 out.write_u8(PATCH).await?;
                 match p.as_ref() {
@@ -43,7 +48,10 @@ impl<'a> Message<'a> {
         let discriminator = input.read_u8().await?;
 
         match discriminator {
-            HANDSHAKE => Ok(Message::Handshake),
+            HANDSHAKE => {
+                let version = input.read_u8().await?;
+                Ok(Message::Handshake(version))
+            }
             PATCH => match input.read_u8().await? {
                 PATCH_WRITE => {
                     let addr = input.read_u64().await?;
@@ -76,7 +84,7 @@ mod tests {
     use super::*;
     #[tokio::test]
     async fn check_serialization() -> io::Result<()> {
-        assert_read_write_eq(Message::Handshake).await?;
+        assert_read_write_eq(Message::Handshake(10)).await?;
 
         let write = Patch::Write(10, vec![0, 1, 2, 3]);
         let reclaim = Patch::Reclaim(20, 10);

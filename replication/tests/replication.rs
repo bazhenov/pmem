@@ -18,10 +18,13 @@ async fn check_replication() -> io::Result<()> {
     let mut snapshot = pool.snapshot();
     let bytes = [1, 2, 3, 4];
     snapshot.write(0, bytes);
+    snapshot.write(4, bytes);
+
     pool.commit(snapshot);
 
     let snapshot = replica.next_snapshot().await;
     assert_eq!(&*snapshot.read(0, 4), &bytes);
+    assert_eq!(&*snapshot.read(4, 4), &bytes);
 
     server_ctrl.abort();
     replica_ctrl.abort();
