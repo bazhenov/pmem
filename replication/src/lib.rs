@@ -1,6 +1,6 @@
-use pmem::page::{CommitNotify, PagePool, Patch, TxWrite};
+use pmem::page::{CommitNotify, CommittedSnapshot, PagePool, Patch, TxWrite};
 use protocol::{Message, PROTOCOL_VERSION};
-use std::{borrow::Cow, io, net::SocketAddr, pin::pin};
+use std::{borrow::Cow, io, net::SocketAddr, pin::pin, sync::Arc};
 use tokio::{
     net::{TcpListener, TcpStream, ToSocketAddrs},
     sync::oneshot::{self},
@@ -61,6 +61,29 @@ impl ShutdownSignal {
         // and the worker has already shutdown
         let _ = self.0.send(());
         self.1
+    }
+}
+
+pub struct PoolReplica {
+    pool: PagePool,
+    last_snapshot: Arc<CommittedSnapshot>,
+}
+
+impl PoolReplica {
+    pub fn new(pool: PagePool) -> Self {
+        let last_snapshot = Arc::new(CommittedSnapshot::default());
+        Self {
+            pool,
+            last_snapshot,
+        }
+    }
+
+    pub fn snapshot(&self) -> Arc<CommittedSnapshot> {
+        self.last_snapshot.clone()
+    }
+
+    pub fn commit_notify(&self) -> CommitNotify {
+        self.pool.commit_notify()
     }
 }
 

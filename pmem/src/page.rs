@@ -429,6 +429,7 @@ impl PagePool {
     }
 
     /// Returns a snapshot of the page pool at a specific LSN **or newer**.
+    /// TODO: this method should return CommitedSnapshot instead of Snapshot
     pub fn snapshot_at(&self, lsn: u64) -> Result<Snapshot, Error> {
         let latest = ArcSwap::load(&self.latest);
         let base = latest
@@ -1367,9 +1368,8 @@ mod tests {
             })]
 
             /// This test uses "shadow writes" to check if snapshot writing and reading
-            /// algorithms are consistent with sequential consistency. We do it by
-            /// mirroring all patches to a shadow buffer sequentially. In the end,
-            /// the final snapshot state should be equal to the shadow buffer.
+            /// algorithms are consistent. We do it by mirroring all patches to a shadow buffer sequentially.
+            /// In the end, the final snapshot state should be equal to the shadow buffer.
             #[test]
             fn shadow_write(snapshots in vec(any_snapshot(), 0..10)) {
                 let mut shadow_buffer = vec![0; DB_SIZE];
