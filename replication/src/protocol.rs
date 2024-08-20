@@ -77,6 +77,7 @@ impl<'a> Message<'a> {
 }
 
 #[cfg(test)]
+#[cfg(not(miri))]
 mod tests {
     use io::Cursor;
     use std::pin::pin;

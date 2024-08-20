@@ -1,4 +1,4 @@
-use pmem::page::{CommitNotify, CommittedSnapshot, PagePool, Patch, TxWrite};
+use pmem::page::{CommitNotify, CommittedSnapshot, PagePool, PagePoolHandle, Patch, TxWrite};
 use protocol::{Message, PROTOCOL_VERSION};
 use std::{borrow::Cow, io, net::SocketAddr, pin::pin, sync::Arc};
 use tokio::{
@@ -91,13 +91,14 @@ impl PoolReplica {
 
 pub async fn replica_connect(
     addr: impl ToSocketAddrs,
-) -> io::Result<(CommitNotify, JoinHandle<io::Result<()>>)> {
+) -> io::Result<(PagePoolHandle, JoinHandle<io::Result<()>>)> {
     let pool = PagePool::default();
-    let client = ReplicationClient::connect(addr).await?;
-    let commit_notify = pool.commit_notify();
+    let read_handle = pool.handle();
 
-    let handle = tokio::spawn(replicate_worker(client, pool));
-    Ok((commit_notify, handle))
+    let client = ReplicationClient::connect(addr).await?;
+    let join_handle = tokio::spawn(replicate_worker(client, pool));
+
+    Ok((read_handle, join_handle))
 }
 
 async fn replicate_worker(mut client: ReplicationClient, mut pool: PagePool) -> io::Result<()> {
