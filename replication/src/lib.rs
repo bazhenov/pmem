@@ -1,12 +1,12 @@
 use pmem::page::{CommitNotify, CommittedSnapshot, PagePool, PagePoolHandle, Patch, TxWrite};
 use protocol::{Message, PROTOCOL_VERSION};
-use std::{borrow::Cow, io, net::SocketAddr, pin::pin, sync::Arc, thread};
+use std::{borrow::Cow, fmt::Debug, io, net::SocketAddr, pin::pin, sync::Arc, thread};
 use tokio::{
     net::{TcpListener, TcpStream, ToSocketAddrs},
     sync::{self, oneshot},
     task::JoinHandle,
 };
-use tracing::{info, trace};
+use tracing::{info, instrument, trace};
 
 mod protocol;
 
@@ -27,11 +27,12 @@ pub async fn accept_loop(listener: TcpListener, notify: CommitNotify) -> io::Res
         if let Ok(addr) = socket.peer_addr() {
             info!("Accepted connection from {}", addr);
         }
-        tokio::spawn(handle_client(socket, notify.clone()));
+        tokio::spawn(server_worker(socket, notify.clone()));
     }
 }
 
-async fn handle_client(mut socket: TcpStream, mut notify: CommitNotify) -> io::Result<()> {
+#[instrument(skip(socket, notify), fields(addr = %socket.peer_addr().unwrap()))]
+async fn server_worker(mut socket: TcpStream, mut notify: CommitNotify) -> io::Result<()> {
     Message::Handshake(PROTOCOL_VERSION)
         .write_to(pin!(&mut socket))
         .await?;
@@ -44,13 +45,16 @@ async fn handle_client(mut socket: TcpStream, mut notify: CommitNotify) -> io::R
     }
 
     let last_seen_lsn = notify.last_seen_lsn();
-    let (tx, mut rx) = sync::mpsc::channel::<Arc<CommittedSnapshot>>(0);
-    let _ = thread::spawn(move || loop {
+    trace!("Starting log relay from LSN: {}", last_seen_lsn);
+    let (tx, mut rx) = sync::mpsc::channel(1);
+
+    thread::spawn(move || loop {
         tx.blocking_send(notify.next_snapshot()).unwrap();
     });
 
     while let Some(snapshot) = rx.recv().await {
         for lsn in last_seen_lsn..=snapshot.lsn() {
+            trace!("Relaying LSN: {}", lsn);
             for patch in snapshot.find_at_lsn(lsn).unwrap().patches() {
                 Message::Patch(Cow::Borrowed(patch))
                     .write_to(pin!(&mut socket))
@@ -96,17 +100,19 @@ impl PoolReplica {
 }
 
 pub async fn replica_connect(
-    addr: impl ToSocketAddrs,
+    addr: impl ToSocketAddrs + Debug,
 ) -> io::Result<(PagePoolHandle, JoinHandle<io::Result<()>>)> {
     let pool = PagePool::default();
     let read_handle = pool.handle();
 
-    let client = ReplicationClient::connect(addr).await?;
+    let client = ReplicationClient::connect(&addr).await?;
+    trace!("Connected to remote {:?}", addr);
     let join_handle = tokio::spawn(client_worker(client, pool));
 
     Ok((read_handle, join_handle))
 }
 
+#[instrument(skip(client, pool), fields(addr = %client.socket.peer_addr().unwrap()))]
 async fn client_worker(mut client: ReplicationClient, mut pool: PagePool) -> io::Result<()> {
     loop {
         let patch = client.next_patch().await?;

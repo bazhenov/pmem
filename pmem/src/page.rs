@@ -538,6 +538,15 @@ impl PagePoolHandle {
     pub fn wait_for_commit(&mut self) -> Arc<CommittedSnapshot> {
         self.notify.next_snapshot()
     }
+
+    /// Waits for and returns an earliest snapshot with LSM equal or greater than a given LSN
+    pub fn wait_for_lsn(&mut self, expected_lsn: LSN) -> Arc<CommittedSnapshot> {
+        let mut snapshot = Arc::clone(&self.latest.lock().unwrap());
+        while snapshot.lsn() < expected_lsn {
+            snapshot = self.notify.next_snapshot();
+        }
+        snapshot.find_at_lsn(expected_lsn).unwrap()
+    }
 }
 
 #[derive(Clone)]
@@ -665,7 +674,7 @@ impl CommittedSnapshot {
     }
 
     /// Returns first snapshot in the chain that has LSN greater or equal to the provided LSN or newer.
-    pub fn find_at_lsn(self: &Arc<Self>, lsn: u64) -> Option<Arc<Self>> {
+    pub fn find_at_lsn(self: &Arc<Self>, lsn: LSN) -> Option<Arc<Self>> {
         let mut snapshot = self;
         while let Some(s) = snapshot.base.as_ref() {
             if s.lsn < lsn {
@@ -1248,6 +1257,24 @@ mod tests {
                 .expect("Unable to find intermediate snapshot");
             assert_eq!(&*s.read(lsn, 1), &[lsn as u8]);
         }
+    }
+
+    #[test]
+    fn can_wait_for_a_given_snapshot() {
+        let mut pool = PagePool::new(1);
+        let mut handle = pool.handle();
+
+        let latest_lsn = pool.snapshot().lsn();
+        let snapshot = thread::spawn(move || handle.wait_for_lsn(latest_lsn + 5));
+
+        for i in 0..10 {
+            let mut snapshot = pool.snapshot();
+            snapshot.write(0, [i]);
+            pool.commit(snapshot);
+        }
+
+        let snapshot = snapshot.join().unwrap();
+        assert_eq!(snapshot.lsn(), latest_lsn + 5);
     }
 
     mod patch {

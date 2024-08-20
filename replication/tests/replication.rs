@@ -59,7 +59,7 @@ async fn check_replication_work_if_connected_later() -> io::Result<()> {
     // Waiting for replica to catch up
     // We need to spawn_blocking here because replica.wait_for_commit() is a blocking call
     // if Runtime is not multithreaded it may block the only thread that is running server async tasks
-    let snapshot = spawn_blocking(move || replica.wait_for_commit()).await?;
+    let snapshot = spawn_blocking(move || replica.wait_for_lsn(last_lsn - 1)).await?;
     assert_eq!(&*snapshot.read(0, 4), &bytes);
 
     replica_ctrl.abort();
