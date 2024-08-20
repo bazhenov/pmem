@@ -22,7 +22,7 @@ async fn main() {
 
     let rfs = RFS::new(pool.snapshot());
     let state = rfs.state_handle();
-    let listener = NFSTcpListener::bind(&format!("127.0.0.1:{HOSTPORT}"), rfs)
+    let listener = NFSTcpListener::bind(&format!("127.1:{HOSTPORT}"), rfs)
         .await
         .unwrap();
 

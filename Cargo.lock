@@ -816,6 +816,7 @@ dependencies = [
  "pmem-derive",
  "proptest",
  "rand",
+ "replication",
  "tango-bench",
  "tempfile",
  "thiserror",

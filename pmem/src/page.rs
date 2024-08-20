@@ -54,6 +54,7 @@
 
 use std::{
     borrow::Cow,
+    fmt::{self, Display, Formatter},
     ops::Range,
     sync::{Arc, Condvar, Mutex},
 };
@@ -262,6 +263,15 @@ impl Patch {
         match self {
             Patch::Write(addr, _) => *addr = value,
             Patch::Reclaim(addr, _) => *addr = value,
+        }
+    }
+}
+
+impl Display for Patch {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        match self {
+            Patch::Write(addr, bytes) => write!(f, "Write({:#x}, {})", addr, bytes.len()),
+            Patch::Reclaim(addr, len) => write!(f, "Reclaim({:#x}, {})", addr, len),
         }
     }
 }
@@ -554,6 +564,10 @@ impl CommitNotify {
         self.last_seen_lsn = snapshot.lsn;
         snapshot
     }
+
+    pub fn last_seen_lsn(&self) -> u64 {
+        self.last_seen_lsn
+    }
 }
 
 /// Trait describing a read-only snapshot of a page pool.
@@ -661,6 +675,10 @@ impl CommittedSnapshot {
             }
         }
         (snapshot.lsn >= lsn).then(|| Arc::clone(snapshot))
+    }
+
+    pub fn lsn(&self) -> LSN {
+        self.lsn
     }
 }
 
@@ -1208,6 +1226,28 @@ mod tests {
 
         assert_eq!(lsn1, current_lsn + 1);
         assert_eq!(lsn2, current_lsn + 1);
+    }
+
+    #[test]
+    fn each_commit_snapshot_can_be_addressed() {
+        let mut pool = PagePool::new(1);
+        let mut notify = pool.commit_notify();
+
+        for i in 1..=10 {
+            let mut snapshot = pool.snapshot();
+            snapshot.write(i, [i as u8]);
+            pool.commit(snapshot);
+        }
+
+        let snapshot = notify.next_snapshot();
+        assert_eq!(snapshot.lsn, 11);
+
+        for lsn in 1..=10 {
+            let s = snapshot
+                .find_at_lsn(lsn + 1)
+                .expect("Unable to find intermediate snapshot");
+            assert_eq!(&*s.read(lsn, 1), &[lsn as u8]);
+        }
     }
 
     mod patch {

@@ -5,9 +5,10 @@ edition = "2021"
 
 [dependencies]
 async-trait = "0.1.81"
-pmem = { path = "../pmem" }
-pmem-derive = { path = "../pmem-derive" }
+pmem = { workspace = true }
+pmem-derive = { workspace = true }
 thiserror = { workspace = true }
+replication = { workspace = true }
 tokio = { version = "1.38.1", features = ["macros", "rt-multi-thread"] }
 nfsserve = "0.10.2"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }

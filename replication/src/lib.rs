@@ -1,12 +1,12 @@
 use pmem::page::{CommitNotify, CommittedSnapshot, PagePool, PagePoolHandle, Patch, TxWrite};
 use protocol::{Message, PROTOCOL_VERSION};
-use std::{borrow::Cow, io, net::SocketAddr, pin::pin, sync::Arc};
+use std::{borrow::Cow, io, net::SocketAddr, pin::pin, sync::Arc, thread};
 use tokio::{
     net::{TcpListener, TcpStream, ToSocketAddrs},
-    sync::oneshot,
-    task::{self, JoinHandle},
+    sync::{self, oneshot},
+    task::JoinHandle,
 };
-use tracing::info;
+use tracing::{info, trace};
 
 mod protocol;
 
@@ -31,7 +31,7 @@ pub async fn accept_loop(listener: TcpListener, notify: CommitNotify) -> io::Res
     }
 }
 
-async fn handle_client(mut socket: TcpStream, notify: CommitNotify) -> io::Result<()> {
+async fn handle_client(mut socket: TcpStream, mut notify: CommitNotify) -> io::Result<()> {
     Message::Handshake(PROTOCOL_VERSION)
         .write_to(pin!(&mut socket))
         .await?;
@@ -43,16 +43,22 @@ async fn handle_client(mut socket: TcpStream, notify: CommitNotify) -> io::Resul
         return io_error("Invalid protocol version");
     }
 
-    loop {
-        let mut notify = notify.clone();
-        let snapshot = task::spawn_blocking(move || notify.next_snapshot()).await?;
+    let last_seen_lsn = notify.last_seen_lsn();
+    let (tx, mut rx) = sync::mpsc::channel::<Arc<CommittedSnapshot>>(0);
+    let _ = thread::spawn(move || loop {
+        tx.blocking_send(notify.next_snapshot()).unwrap();
+    });
 
-        for patch in snapshot.patches() {
-            Message::Patch(Cow::Borrowed(patch))
-                .write_to(pin!(&mut socket))
-                .await?;
+    while let Some(snapshot) = rx.recv().await {
+        for lsn in last_seen_lsn..=snapshot.lsn() {
+            for patch in snapshot.find_at_lsn(lsn).unwrap().patches() {
+                Message::Patch(Cow::Borrowed(patch))
+                    .write_to(pin!(&mut socket))
+                    .await?;
+            }
         }
     }
+    Ok(())
 }
 
 pub struct ShutdownSignal(oneshot::Sender<()>, JoinHandle<io::Result<()>>);
@@ -96,14 +102,15 @@ pub async fn replica_connect(
     let read_handle = pool.handle();
 
     let client = ReplicationClient::connect(addr).await?;
-    let join_handle = tokio::spawn(replicate_worker(client, pool));
+    let join_handle = tokio::spawn(client_worker(client, pool));
 
     Ok((read_handle, join_handle))
 }
 
-async fn replicate_worker(mut client: ReplicationClient, mut pool: PagePool) -> io::Result<()> {
+async fn client_worker(mut client: ReplicationClient, mut pool: PagePool) -> io::Result<()> {
     loop {
         let patch = client.next_patch().await?;
+        trace!("Received patch from master {}", patch);
         let mut s = pool.snapshot();
         match patch {
             Patch::Write(addr, bytes) => s.write(addr, bytes),
