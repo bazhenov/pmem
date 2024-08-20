@@ -20,6 +20,12 @@ tempfile = { workspace = true }
 rand = { workspace = true, features = ["small_rng"] }
 tango-bench = { workspace = true }
 
+[[bin]]
+name = "client"
+
+[[bin]]
+name = "main"
+
 [[bench]]
 name = "rfs-bench"
 harness = false

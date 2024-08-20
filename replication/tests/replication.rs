@@ -1,5 +1,5 @@
 use pmem::page::{PagePool, TxRead, TxWrite};
-use replication::{replica_connect, run_replication_server};
+use replication::{replica_connect, start_replication_server};
 use std::io;
 use tokio::task::spawn_blocking;
 use tracing::init_tracing;
@@ -13,7 +13,7 @@ async fn check_replication() -> io::Result<()> {
 
     // Running server
     let notify = master_pool.commit_notify();
-    let (addr, server_ctrl) = run_replication_server("127.1:0", notify).await?;
+    let (addr, server_ctrl) = start_replication_server("127.1:0", notify).await?;
     let (mut replica, replica_ctrl) = replica_connect(addr).await?;
 
     // Writing to master
@@ -42,7 +42,7 @@ async fn check_replication_work_if_connected_later() -> io::Result<()> {
 
     // Running server
     let notify = master_pool.commit_notify();
-    let (addr, server_ctrl) = run_replication_server("127.1:0", notify).await?;
+    let (addr, server_ctrl) = start_replication_server("127.1:0", notify).await?;
 
     // Writing to master
     let mut snapshot = master_pool.snapshot();

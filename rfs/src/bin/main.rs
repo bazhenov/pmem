@@ -20,11 +20,15 @@ async fn main() {
     let tx = Filesystem::allocate(pool.snapshot()).finish();
     pool.commit(tx);
 
+    let commit_notify = pool.commit_notify();
+
     let rfs = RFS::new(pool.snapshot());
     let state = rfs.state_handle();
     let listener = NFSTcpListener::bind(&format!("127.1:{HOSTPORT}"), rfs)
         .await
         .unwrap();
+
+    let _ = replication::start_replication_server("127.1:1111", commit_notify).await;
 
     tokio::spawn(async move { listener.handle_forever().await });
 

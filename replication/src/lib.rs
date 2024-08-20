@@ -10,7 +10,7 @@ use tracing::{info, instrument, trace};
 
 mod protocol;
 
-pub async fn run_replication_server(
+pub async fn start_replication_server(
     addr: impl ToSocketAddrs,
     notify: CommitNotify,
 ) -> io::Result<(SocketAddr, JoinHandle<io::Result<()>>)> {

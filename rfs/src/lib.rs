@@ -1024,6 +1024,51 @@ enum Joined<T: PartialEq> {
     Both(T, T),
 }
 
+/// Helper structure that represents the filesystem as a tree in a form of [`Debug`] format
+/// (eg. `{:?}` in print! macro will print the tree structure of the filesystem)
+pub struct FsTree<'a, S>(pub &'a Filesystem<S>);
+
+impl<'a, S: TxRead> fmt::Debug for FsTree<'a, S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn do_print(
+            f: &mut fmt::Formatter<'_>,
+            fs: &Filesystem<impl TxRead>,
+            dir: &FileMeta,
+            is_last_vec: &mut Vec<bool>,
+        ) -> fmt::Result {
+            let mut children = fs.readdir(dir).peekable();
+            while let Some(child) = children.next() {
+                let is_last = children.peek().is_none();
+
+                let node_type = match child.node_type {
+                    NodeType::Directory => "/",
+                    NodeType::File => "",
+                };
+                let marker = if is_last { "└─" } else { "├─" };
+                for is_last in &*is_last_vec {
+                    if *is_last {
+                        write!(f, "   ")?;
+                    } else {
+                        write!(f, " │ ")?;
+                    }
+                }
+                writeln!(f, " {} {}{}", marker, child.name, node_type)?;
+                if child.is_directory() {
+                    is_last_vec.push(is_last);
+                    do_print(f, fs, &child, is_last_vec)?;
+                    is_last_vec.pop();
+                }
+            }
+            Ok(())
+        }
+
+        writeln!(f, " /")?;
+        let fs = self.0;
+        do_print(f, fs, &fs.get_root().unwrap(), &mut vec![])?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1558,51 +1603,6 @@ mod tests {
         }
 
         Ok(())
-    }
-
-    /// Helper structure that represents the filesystem as a tree in a form of [`Debug`] format
-    /// (eg. `{:?}` in print! macro will print the tree structure of the filesystem)
-    struct FsTree<'a, S>(&'a Filesystem<S>);
-
-    impl<'a, S: TxRead> fmt::Debug for FsTree<'a, S> {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            fn do_print(
-                f: &mut fmt::Formatter<'_>,
-                fs: &Filesystem<impl TxRead>,
-                dir: &FileMeta,
-                is_last_vec: &mut Vec<bool>,
-            ) -> fmt::Result {
-                let mut children = fs.readdir(dir).peekable();
-                while let Some(child) = children.next() {
-                    let is_last = children.peek().is_none();
-
-                    let node_type = match child.node_type {
-                        NodeType::Directory => "/",
-                        NodeType::File => "",
-                    };
-                    let marker = if is_last { "└─" } else { "├─" };
-                    for is_last in &*is_last_vec {
-                        if *is_last {
-                            write!(f, "   ")?;
-                        } else {
-                            write!(f, " │ ")?;
-                        }
-                    }
-                    writeln!(f, " {} {}{}", marker, child.name, node_type)?;
-                    if child.is_directory() {
-                        is_last_vec.push(is_last);
-                        do_print(f, fs, &child, is_last_vec)?;
-                        is_last_vec.pop();
-                    }
-                }
-                Ok(())
-            }
-
-            writeln!(f, " /")?;
-            let fs = self.0;
-            do_print(f, fs, &fs.get_root().unwrap(), &mut vec![])?;
-            Ok(())
-        }
     }
 
     // This function adjusts the seek operation to be valid for a given file
