@@ -8,7 +8,8 @@ mod tracing;
 
 #[tokio::test]
 #[cfg(not(miri))]
-async fn check_replication() -> io::Result<()> {
+async fn check_replication_simple_case() -> io::Result<()> {
+    init_tracing();
     let mut master_pool = PagePool::default();
 
     // Running server
@@ -16,17 +17,23 @@ async fn check_replication() -> io::Result<()> {
     let (addr, server_ctrl) = start_replication_server("127.1:0", notify).await?;
     let (mut replica, replica_ctrl) = replica_connect(addr).await?;
 
-    // Writing to master
+    // Writing 2 disconnected patches to master to check that
+    // replica will replicate all patches in a snapshot as a single transaction
     let mut snapshot = master_pool.snapshot();
+
     let bytes = [1, 2, 3, 4];
     snapshot.write(0, bytes);
-    master_pool.commit(snapshot);
+    snapshot.write(10, bytes);
+    let expected_lsn = master_pool.commit(snapshot);
+    println!("LSN = {}", expected_lsn);
 
     // Waiting for replica to catch up
-    // We need to spawn_blocking here because replica.wait_for_commit() is a blocking call
+    // We need to spawn_blocking here because wait_for_commit() is a blocking call
     // if Runtime is not multithreaded it may block the only thread that is running server async tasks
     let snapshot = spawn_blocking(move || replica.wait_for_commit()).await?;
+    assert_eq!(snapshot.lsn(), expected_lsn);
     assert_eq!(&*snapshot.read(0, 4), &bytes);
+    assert_eq!(&*snapshot.read(10, 4), &bytes);
 
     server_ctrl.abort();
     replica_ctrl.abort();
@@ -37,7 +44,6 @@ async fn check_replication() -> io::Result<()> {
 #[tokio::test]
 #[cfg(not(miri))]
 async fn check_replication_work_if_connected_later() -> io::Result<()> {
-    init_tracing();
     let mut master_pool = PagePool::default();
 
     // Running server

@@ -385,7 +385,7 @@ impl PagePool {
             patches: vec![],
             base: None,
             pages: u32::try_from(pages).unwrap(),
-            lsn: 1,
+            lsn: 0,
         };
         Self::from_snapshot(snapshot)
     }
@@ -564,13 +564,14 @@ impl CommitNotify {
     /// can be seen by using [`CommittedSnapshot::find_at_lsn()`]
     pub fn next_snapshot(&mut self) -> Arc<CommittedSnapshot> {
         let snapshot = {
-            let mut snapshot = self.snapshot.lock().unwrap();
-            if snapshot.lsn <= self.last_seen_lsn {
-                snapshot = self.notify.wait(snapshot).unwrap();
+            let mut locked_snapshot = self.snapshot.lock().unwrap();
+            if locked_snapshot.lsn() <= self.last_seen_lsn() {
+                locked_snapshot = self.notify.wait(locked_snapshot).unwrap();
             }
-            Arc::clone(&snapshot)
+            Arc::clone(&locked_snapshot)
         };
-        self.last_seen_lsn = snapshot.lsn;
+        debug_assert!(snapshot.lsn() > self.last_seen_lsn());
+        self.last_seen_lsn = snapshot.lsn();
         snapshot
     }
 
@@ -651,7 +652,7 @@ impl Default for CommittedSnapshot {
             patches: vec![],
             base: None,
             pages: 1,
-            lsn: 1,
+            lsn: 0,
         }
     }
 }
@@ -743,8 +744,9 @@ impl Snapshot {
         self.pages = pages as PageNo;
     }
 
+    /// Returns the log sequence number (LSN) of the committed snapshot that this snapshot is based on.
     #[cfg(test)]
-    fn lsn(&self) -> u64 {
+    fn commited_lsn(&self) -> u64 {
         self.base.lsn
     }
 }
@@ -998,6 +1000,15 @@ mod tests {
     use std::{panic, thread};
 
     #[test]
+    fn first_commit_should_have_lsn_1() {
+        // In several places in codebase we assume that first commit has LSN 1
+        // and LSN 0 is synthetic LSN used for base empty snapshot
+        let mut mem = PagePool::default();
+        let snapshot = mem.snapshot();
+        assert_eq!(mem.commit(snapshot), 1);
+    }
+
+    #[test]
     fn committed_changes_should_be_visible_on_a_page() {
         let mut mem = PagePool::from("Jekyll");
 
@@ -1222,7 +1233,7 @@ mod tests {
         let mut pool = PagePool::new(1);
         let mut n1 = pool.commit_notify();
         let mut n2 = pool.commit_notify();
-        let current_lsn = pool.snapshot().lsn();
+        let current_lsn = pool.snapshot().commited_lsn();
 
         thread::spawn(move || {
             let mut snapshot = pool.snapshot();
@@ -1249,11 +1260,11 @@ mod tests {
         }
 
         let snapshot = notify.next_snapshot();
-        assert_eq!(snapshot.lsn, 11);
+        assert_eq!(snapshot.lsn, 10);
 
         for lsn in 1..=10 {
             let s = snapshot
-                .find_at_lsn(lsn + 1)
+                .find_at_lsn(lsn)
                 .expect("Unable to find intermediate snapshot");
             assert_eq!(&*s.read(lsn, 1), &[lsn as u8]);
         }
@@ -1264,7 +1275,7 @@ mod tests {
         let mut pool = PagePool::new(1);
         let mut handle = pool.handle();
 
-        let latest_lsn = pool.snapshot().lsn();
+        let latest_lsn = pool.snapshot().commited_lsn();
         let snapshot = thread::spawn(move || handle.wait_for_lsn(latest_lsn + 5));
 
         for i in 0..10 {

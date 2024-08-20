@@ -1,5 +1,5 @@
 use crate::io_error;
-use pmem::page::{Patch, PAGE_SIZE};
+use pmem::page::{Patch, LSN, PAGE_SIZE};
 use std::{borrow::Cow, io, pin::Pin};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -7,12 +7,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 pub enum Message<'a> {
     Handshake(u8),
     Patch(Cow<'a, Patch>),
+    Commit(LSN),
 }
 
 pub const PROTOCOL_VERSION: u8 = 1;
 
 const HANDSHAKE: u8 = 1;
 const PATCH: u8 = 2;
+const COMMIT: u8 = 3;
 
 const PATCH_WRITE: u8 = 1;
 const PATCH_RECLAIM: u8 = 2;
@@ -39,6 +41,10 @@ impl<'a> Message<'a> {
                         out.write_u64(*length as u64).await?;
                     }
                 }
+            }
+            Message::Commit(lsn) => {
+                out.write_u8(COMMIT).await?;
+                out.write_u64(*lsn).await?;
             }
         }
         Ok(())
@@ -71,6 +77,10 @@ impl<'a> Message<'a> {
                 }
                 _ => io_error("Invalid patch type"),
             },
+            COMMIT => {
+                let lsn = input.read_u64().await?;
+                Ok(Message::Commit(lsn))
+            }
             _ => io_error("Invalid discriminator"),
         }
     }
@@ -91,6 +101,8 @@ mod tests {
         let reclaim = Patch::Reclaim(20, 10);
         assert_read_write_eq(Message::Patch(Cow::Owned(write))).await?;
         assert_read_write_eq(Message::Patch(Cow::Owned(reclaim))).await?;
+
+        assert_read_write_eq(Message::Commit(100)).await?;
         Ok(())
     }
 

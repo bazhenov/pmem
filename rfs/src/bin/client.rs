@@ -13,11 +13,11 @@ async fn main() {
         .with(filter_layer)
         .init();
 
-    let (mut pool, handle) = replication::replica_connect("127.1:1111").await.unwrap();
+    let (mut pool, _) = replication::replica_connect("127.1:1111").await.unwrap();
 
     loop {
         let snapshot = pool.wait_for_commit();
-        println!("New snapshot");
+        println!("New snapshot LSN: {}", snapshot.lsn());
 
         let fs = Filesystem::open(snapshot);
         println!("{:?}", FsTree(&fs));
