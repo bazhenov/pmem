@@ -515,6 +515,7 @@ impl PagePool {
     }
 }
 
+#[derive(Clone)]
 pub struct PagePoolHandle {
     latest: Arc<Mutex<Arc<CommittedSnapshot>>>,
     notify: CommitNotify,
@@ -577,6 +578,11 @@ impl CommitNotify {
 
     pub fn last_seen_lsn(&self) -> u64 {
         self.last_seen_lsn
+    }
+
+    pub fn pages(&self) -> PageNo {
+        // TODO is this correct? Can the number of pages change?
+        self.snapshot.lock().unwrap().pages()
     }
 }
 
@@ -689,6 +695,10 @@ impl CommittedSnapshot {
 
     pub fn lsn(&self) -> LSN {
         self.lsn
+    }
+
+    pub fn pages(&self) -> PageNo {
+        self.pages
     }
 }
 

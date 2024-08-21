@@ -5,16 +5,21 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(Debug, PartialEq)]
 pub enum Message<'a> {
-    Handshake(u8),
+    // Hello message from client, contains protocol version
+    ClientHello(u8),
+
+    // Hello message from server, contains protocol version and number of pages
+    ServerHello(u8, u32),
     Patch(Cow<'a, Patch>),
     Commit(LSN),
 }
 
 pub const PROTOCOL_VERSION: u8 = 1;
 
-const HANDSHAKE: u8 = 1;
-const PATCH: u8 = 2;
-const COMMIT: u8 = 3;
+const CLIENT_HELLO: u8 = 1;
+const SERVER_HELLO: u8 = 2;
+const PATCH: u8 = 3;
+const COMMIT: u8 = 4;
 
 const PATCH_WRITE: u8 = 1;
 const PATCH_RECLAIM: u8 = 2;
@@ -22,9 +27,14 @@ const PATCH_RECLAIM: u8 = 2;
 impl<'a> Message<'a> {
     pub async fn write_to(&self, mut out: Pin<&mut impl AsyncWriteExt>) -> io::Result<()> {
         match self {
-            Message::Handshake(v) => {
-                out.write_u8(HANDSHAKE).await?;
-                out.write_u8(*v).await?;
+            Message::ClientHello(version) => {
+                out.write_u8(CLIENT_HELLO).await?;
+                out.write_u8(*version).await?;
+            }
+            Message::ServerHello(version, pages) => {
+                out.write_u8(SERVER_HELLO).await?;
+                out.write_u8(*version).await?;
+                out.write_u32(*pages).await?;
             }
             Message::Patch(p) => {
                 out.write_u8(PATCH).await?;
@@ -54,9 +64,14 @@ impl<'a> Message<'a> {
         let discriminator = input.read_u8().await?;
 
         match discriminator {
-            HANDSHAKE => {
+            CLIENT_HELLO => {
                 let version = input.read_u8().await?;
-                Ok(Message::Handshake(version))
+                Ok(Message::ClientHello(version))
+            }
+            SERVER_HELLO => {
+                let version = input.read_u8().await?;
+                let pages = input.read_u32().await?;
+                Ok(Message::ServerHello(version, pages))
             }
             PATCH => match input.read_u8().await? {
                 PATCH_WRITE => {
@@ -95,7 +110,8 @@ mod tests {
     use super::*;
     #[tokio::test]
     async fn check_serialization() -> io::Result<()> {
-        assert_read_write_eq(Message::Handshake(10)).await?;
+        assert_read_write_eq(Message::ClientHello(10)).await?;
+        assert_read_write_eq(Message::ServerHello(10, 20)).await?;
 
         let write = Patch::Write(10, vec![0, 1, 2, 3]);
         let reclaim = Patch::Reclaim(20, 10);

@@ -33,11 +33,11 @@ pub async fn accept_loop(listener: TcpListener, notify: CommitNotify) -> io::Res
 
 #[instrument(skip(socket, notify), fields(addr = %socket.peer_addr().unwrap()))]
 async fn server_worker(mut socket: TcpStream, mut notify: CommitNotify) -> io::Result<()> {
-    Message::Handshake(PROTOCOL_VERSION)
+    Message::ServerHello(PROTOCOL_VERSION, notify.pages())
         .write_to(pin!(&mut socket))
         .await?;
     let msg = Message::read_from(pin!(&mut socket)).await?;
-    let Message::Handshake(v) = msg else {
+    let Message::ClientHello(v) = msg else {
         return io_error("Invalid handshake message");
     };
     if v != PROTOCOL_VERSION {
@@ -106,20 +106,32 @@ impl PoolReplica {
 pub async fn replica_connect(
     addr: impl ToSocketAddrs + Debug,
 ) -> io::Result<(PagePoolHandle, JoinHandle<io::Result<()>>)> {
-    let pool = PagePool::default();
+    let mut socket = TcpStream::connect(&addr).await?;
+    trace!(addr = ?addr, "Connected to remote");
+    Message::ClientHello(PROTOCOL_VERSION)
+        .write_to(pin!(&mut socket))
+        .await?;
+
+    let msg = Message::read_from(pin!(&mut socket)).await?;
+    let Message::ServerHello(version, pages) = msg else {
+        return io_error("Invalid handshake response");
+    };
+    if version != PROTOCOL_VERSION {
+        return io_error("Invalid protocol version");
+    }
+
+    let pool = PagePool::new(pages as usize);
     let read_handle = pool.handle();
 
-    let client = ReplicationClient::connect(&addr).await?;
-    trace!(addr = ?addr, "Connected to remote");
-    let join_handle = tokio::spawn(client_worker(client, pool));
+    let join_handle = tokio::spawn(client_worker(socket, pool));
 
     Ok((read_handle, join_handle))
 }
 
-#[instrument(skip(client, pool), fields(addr = %client.socket.peer_addr().unwrap()))]
-async fn client_worker(mut client: ReplicationClient, mut pool: PagePool) -> io::Result<()> {
+#[instrument(skip(client, pool), fields(addr = %client.peer_addr().unwrap()))]
+async fn client_worker(mut client: TcpStream, mut pool: PagePool) -> io::Result<()> {
     loop {
-        let (lsn, snapshot) = client.next_snapshot().await?;
+        let (lsn, snapshot) = next_snapshot(&mut client).await?;
         trace!(
             lsn = lsn,
             patches = snapshot.len(),
@@ -139,33 +151,14 @@ async fn client_worker(mut client: ReplicationClient, mut pool: PagePool) -> io:
     }
 }
 
-pub struct ReplicationClient {
-    socket: TcpStream,
-}
-
-impl ReplicationClient {
-    pub async fn connect(addr: impl ToSocketAddrs) -> io::Result<Self> {
-        let mut socket = TcpStream::connect(addr).await?;
-        Message::Handshake(PROTOCOL_VERSION)
-            .write_to(pin!(&mut socket))
-            .await?;
-
+pub async fn next_snapshot(mut socket: &mut TcpStream) -> io::Result<(LSN, Vec<Patch>)> {
+    let mut patches = vec![];
+    loop {
         let msg = Message::read_from(pin!(&mut socket)).await?;
-        if msg != Message::Handshake(PROTOCOL_VERSION) {
-            return io_error("Invalid handshake response");
-        }
-        Ok(Self { socket })
-    }
-
-    pub async fn next_snapshot(&mut self) -> io::Result<(LSN, Vec<Patch>)> {
-        let mut patches = vec![];
-        loop {
-            let msg = Message::read_from(pin!(&mut self.socket)).await?;
-            match msg {
-                Message::Patch(p) => patches.push(p.into_owned()),
-                Message::Commit(lsn) => return Ok((lsn, patches)),
-                _ => return io_error("Invalid message type"),
-            }
+        match msg {
+            Message::Patch(p) => patches.push(p.into_owned()),
+            Message::Commit(lsn) => return Ok((lsn, patches)),
+            _ => return io_error("Invalid message type"),
         }
     }
 }
