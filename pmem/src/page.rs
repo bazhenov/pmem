@@ -12,7 +12,7 @@
 //!   interface for interacting with the page memory.
 //! - [`Snapshot`]: A snapshot represents the state of the page pool at a specific moment.
 //!   It can be modified independently of the pool, and later committed back to the pool to update its state.
-//! - [`CommitedSnapshot`]: A snapshot that has been committed to the page pool. It is immutable and can be
+//! - [`CommittedSnapshot`]: A snapshot that has been committed to the page pool. It is immutable and can be
 //!   used to read data from the pool.
 //! - [`Patch`]: A modification recorded in a snapshot. It consists of the address where the modification starts and
 //!   the bytes that were written.
@@ -753,7 +753,7 @@ impl Snapshot {
 
     /// Returns the log sequence number (LSN) of the committed snapshot that this snapshot is based on.
     #[cfg(test)]
-    fn commited_lsn(&self) -> u64 {
+    fn committed_lsn(&self) -> u64 {
         self.base.lsn
     }
 }
@@ -1239,7 +1239,7 @@ mod tests {
         let mut pool = PagePool::new(1);
         let mut n1 = pool.commit_notify();
         let mut n2 = pool.commit_notify();
-        let current_lsn = pool.snapshot().commited_lsn();
+        let current_lsn = pool.snapshot().committed_lsn();
 
         thread::spawn(move || {
             let mut snapshot = pool.snapshot();
@@ -1281,7 +1281,7 @@ mod tests {
         let mut pool = PagePool::new(1);
         let mut handle = pool.handle();
 
-        let latest_lsn = pool.snapshot().commited_lsn();
+        let latest_lsn = pool.snapshot().committed_lsn();
         let snapshot = thread::spawn(move || handle.wait_for_lsn(latest_lsn + 5));
 
         for i in 0..10 {
