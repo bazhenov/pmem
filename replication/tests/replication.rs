@@ -64,7 +64,7 @@ impl MasterAndReplica {
 
     async fn with_pool(pool: PagePool) -> io::Result<Self> {
         let notify = pool.commit_notify();
-        let (master_addr, _) = start_replication_server("127.1:0", notify).await?;
+        let (master_addr, _) = start_replication_server("127.0.0.1:0", notify).await?;
         let (replica, replica_ctrl) = replica_connect(master_addr).await?;
         Ok(Self {
             master_pool: pool,

@@ -13,7 +13,9 @@ async fn main() {
         .with(filter_layer)
         .init();
 
-    let (mut pool, _) = replication::replica_connect("127.1:1111").await.unwrap();
+    let (mut pool, _) = replication::replica_connect("127.0.0.1:1111")
+        .await
+        .unwrap();
 
     loop {
         let snapshot = pool.wait_for_commit();
