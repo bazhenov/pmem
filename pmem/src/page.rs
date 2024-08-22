@@ -8,20 +8,22 @@
 //!
 //! ## Concepts
 //!
-//! - **Page Pool**: A collection of pages that can be snapshot, modified, and committed. It acts as the primary
+//! - [`PagePool`]: A collection of pages that can be snapshot, modified, and committed. It acts as the primary
 //!   interface for interacting with the page memory.
-//! - **Snapshot**: A snapshot represents the state of the page pool at a specific moment.
+//! - [`Snapshot`]: A snapshot represents the state of the page pool at a specific moment.
 //!   It can be modified independently of the pool, and later committed back to the pool to update its state.
-//! - **Commit**: The act of applying the changes made in a snapshot back to the page pool, updating the pool's state
-//!   to reflect those changes.
-//! - **Patch**: A modification recorded in a snapshot. It consists of the address where the modification starts and
+//! - [`CommitedSnapshot`]: A snapshot that has been committed to the page pool. It is immutable and can be
+//!   used to read data from the pool.
+//! - [`Patch`]: A modification recorded in a snapshot. It consists of the address where the modification starts and
 //!   the bytes that were written.
+//! - [`PagePoolHandle`]: A read view of the page pool that can be used to read data from the pool and
+//!   wait for new snapshots to be committed.
 //!
 //! ## Usage
 //!
 //! The module is designed to be used as follows:
 //!
-//! 1. **Initialization**: Create a `PagePool` with a specified number of pages.
+//! 1. **Initialization**: Create a new `PagePool`.
 //! 2. **Snapshotting**: Create a snapshot of the current state of the `PagePool`.
 //! 3. **Modification**: Use the snapshot to perform modifications. Each modification is recorded as a patch.
 //! 4. **Commit**: Commit the snapshot back to the `PagePool`, applying all the patches and updating the pool's state.
@@ -31,10 +33,10 @@
 //! ```rust
 //! use pmem::page::{PagePool, TxWrite};
 //!
-//! let mut pool = PagePool::new(5); // Initialize a pool with 5 pages
+//! let mut pool = PagePool::new(5);    // Initialize a pool with 5 pages
 //! let mut snapshot = pool.snapshot(); // Create a snapshot of the current state
-//! snapshot.write(0, &[1, 2, 3, 4]); // Write 4 bytes at offset 0.
-//! pool.commit(snapshot); // Commit the changes back to the pool
+//! snapshot.write(0, &[1, 2, 3, 4]);   // Write 4 bytes at offset 0.
+//! pool.commit(snapshot);              // Commit the changes back to the pool
 //! ```
 //!
 //! ## Safety and Correctness
@@ -437,17 +439,11 @@ impl PagePool {
     }
 
     /// Returns a snapshot of the page pool at a specific LSN **or newer**.
-    /// TODO: this method should return CommitedSnapshot instead of Snapshot
-    pub fn snapshot_at(&self, lsn: u64) -> Result<Snapshot, Error> {
+    pub fn snapshot_at(&self, lsn: u64) -> Result<Arc<CommittedSnapshot>, Error> {
         let latest = self.latest.lock().unwrap();
-        let base = latest
+        latest
             .find_at_lsn(lsn)
-            .ok_or(Error::NoSnapshot(lsn, latest.lsn))?;
-        Ok(Snapshot {
-            patches: vec![],
-            base,
-            pages: latest.pages,
-        })
+            .ok_or(Error::NoSnapshot(lsn, latest.lsn))
     }
 
     /// Commits the changes made in a snapshot back to the page pool.
