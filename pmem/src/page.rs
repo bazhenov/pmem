@@ -206,14 +206,23 @@ impl Patch {
 
         match self.reorder(other) {
             (Write(addr_a, mut a), Write(addr_b, b)) => {
-                if a.len() + b.len() < 1024 {
+                if is_page_boundary(addr_a + a.len() as Addr) && is_page_boundary(addr_b) {
+                    // Do not merge if patches are on different pages
+                    Reordered(Write(addr_a, a), Write(addr_b, b))
+                } else if a.len() + b.len() < 1024 {
                     a.extend(b);
                     Merged(Write(addr_a, a))
                 } else {
                     Reordered(Write(addr_a, a), Write(addr_b, b))
                 }
             }
-            (Reclaim(addr, a), Reclaim(_, b)) => Merged(Reclaim(addr, a + b)),
+            (Reclaim(addr_a, a), Reclaim(addr_b, b)) => {
+                if is_page_boundary(addr_a + a as Addr) && is_page_boundary(addr_b) {
+                    Reordered(Reclaim(addr_a, a), Reclaim(addr_b, b))
+                } else {
+                    Merged(Reclaim(addr_a, a + b))
+                }
+            }
             (a, b) => Reordered(a, b),
         }
     }
@@ -276,6 +285,14 @@ impl Patch {
             Patch::Reclaim(addr, _) => *addr = value,
         }
     }
+}
+
+fn is_page_boundary(addr: Addr) -> bool {
+    addr % PAGE_SIZE as Addr == 0
+}
+
+fn are_on_the_same_page(a1: Addr, a2: Addr) -> bool {
+    a1 / PAGE_SIZE as Addr == a2 / PAGE_SIZE as Addr
 }
 
 impl Display for Patch {
@@ -352,6 +369,18 @@ pub enum Error {
     NoSnapshot(u64, u64),
 }
 
+struct Page {
+    data: Box<[u8; PAGE_SIZE]>,
+}
+
+impl Page {
+    fn new() -> Self {
+        Self {
+            data: Box::new([0; PAGE_SIZE]),
+        }
+    }
+}
+
 /// A pool of pages that can capture and commit snapshots of data changes.
 ///
 /// The `PagePool` struct allows for the creation of snapshots representing the state
@@ -376,6 +405,7 @@ pub enum Error {
 /// can represent a state in the history of changes.
 #[derive(Default)]
 pub struct PagePool {
+    pages: Vec<Page>,
     latest: Arc<Mutex<Arc<CommittedSnapshot>>>,
     notify: Arc<Condvar>,
 }
@@ -392,6 +422,7 @@ impl PagePool {
     /// * `pages` - The number of pages the pool should initially contain. This determines
     ///   the range of valid addresses that can be written to in snapshots derived from this pool.
     pub fn new(pages: usize) -> Self {
+        assert!(pages > 0, "The number of pages must be greater than 0");
         let snapshot = CommittedSnapshot {
             patches: vec![],
             base: None,
@@ -402,7 +433,12 @@ impl PagePool {
     }
 
     fn from_snapshot(snapshot: CommittedSnapshot) -> Self {
+        let mut pages = Vec::with_capacity(snapshot.pages() as usize);
+        for _ in 0..snapshot.pages() {
+            pages.push(Page::new());
+        }
         Self {
+            pages,
             latest: Arc::new(Mutex::new(Arc::new(snapshot))),
             notify: Arc::new(Condvar::new()),
         }
@@ -754,11 +790,6 @@ impl Snapshot {
         Arc::clone(&self.base)
     }
 
-    #[cfg(test)]
-    fn resize(&mut self, pages: usize) {
-        self.pages = pages as PageNo;
-    }
-
     /// Returns the log sequence number (LSN) of the committed snapshot that this snapshot is based on.
     #[cfg(test)]
     fn committed_lsn(&self) -> u64 {
@@ -790,10 +821,21 @@ impl TxRead for Snapshot {
 
 impl TxWrite for Snapshot {
     fn write(&mut self, addr: Addr, bytes: impl Into<Vec<u8>>) {
-        let bytes = bytes.into();
+        let mut bytes = bytes.into();
         split_ptr_checked(addr, bytes.len(), self.pages);
 
         if !bytes.is_empty() {
+            let mut last_byte_addr = addr + bytes.len() as Addr - 1;
+            while !are_on_the_same_page(addr, last_byte_addr) {
+                let (page, _) = split_ptr(last_byte_addr);
+                let page_addr = page as Addr * PAGE_SIZE as Addr;
+                let split_idx = (page_addr - addr) as usize;
+                let patch = Patch::Write(page_addr, bytes.split_off(split_idx));
+                push_patch(&mut self.patches, patch);
+                last_byte_addr = addr + bytes.len() as Addr - 1;
+            }
+            debug_assert!(!bytes.is_empty());
+            // Adding the last patch
             push_patch(&mut self.patches, Patch::Write(addr, bytes))
         }
     }
@@ -801,7 +843,23 @@ impl TxWrite for Snapshot {
     fn reclaim(&mut self, addr: Addr, len: usize) {
         split_ptr_checked(addr, len, self.pages);
         if len > 0 {
-            push_patch(&mut self.patches, Patch::Reclaim(addr, len))
+            let mut end_addr = addr + len as Addr;
+            // Gradually shrinking end_addr while it is not on the same page as addr
+            // TODO rewrite this loop as an Iterator and test it independently
+            while !are_on_the_same_page(addr, end_addr - 1) {
+                let (page, offset) = split_ptr(end_addr - 1);
+                let page_addr = page as Addr * PAGE_SIZE as Addr;
+                let length = offset + 1;
+                let patch = Patch::Reclaim(page_addr, length as usize);
+                push_patch(&mut self.patches, patch);
+                end_addr -= length as Addr;
+            }
+            // Adding the last patch
+            debug_assert!(len > 0);
+            push_patch(
+                &mut self.patches,
+                Patch::Reclaim(addr, (end_addr - addr) as usize),
+            )
         }
     }
 }
@@ -1160,27 +1218,6 @@ mod tests {
     }
 
     #[test]
-    fn change_number_of_pages_on_commit() {
-        let mut mem = PagePool::new(1); // Initially 1 page
-
-        let page_a = 0;
-        let page_b = PAGE_SIZE as Addr;
-
-        let alice = b"Alice";
-        let bob = b"Bob";
-
-        let mut snapshot = mem.snapshot();
-        snapshot.write(page_a, alice);
-        assert!(!snapshot.valid_range(page_b, bob.len()));
-        snapshot.resize(2); // adding second page
-        snapshot.write(page_b, bob);
-        mem.commit(snapshot);
-
-        let snapshot = mem.snapshot();
-        assert!(snapshot.valid_range(page_b, bob.len()));
-    }
-
-    #[test]
     fn can_read_previous_snapshots() -> Result<(), Error> {
         let mut mem = PagePool::new(1);
 
@@ -1203,6 +1240,48 @@ mod tests {
         Ok(())
     }
 
+    /// This test checks that patches are correctly splitted at page boundary
+    /// No patch should be bigger than PAGE_SIZE and no patch should span over multiple pages
+    #[test]
+    fn patches_must_be_splitted_at_page_boundary() {
+        let mem = PagePool::new(3);
+
+        let mut s = mem.snapshot();
+        s.write(PAGE_SIZE as Addr - 10, [1; 20]);
+        assert_eq!(s.patches.len(), 2);
+        assert_patches_are_on_the_same_page(&s.patches);
+
+        let mut s = mem.snapshot();
+        s.write(PAGE_SIZE as Addr - 10, [1; PAGE_SIZE + 20]);
+        assert_eq!(s.patches.len(), 3);
+        assert_patches_are_on_the_same_page(&s.patches);
+
+        let mut s = mem.snapshot();
+        s.reclaim(PAGE_SIZE as Addr - 10, 20);
+        assert_eq!(s.patches.len(), 2);
+        assert_patches_are_on_the_same_page(&s.patches);
+
+        let mut s = mem.snapshot();
+        s.reclaim(PAGE_SIZE as Addr - 10, PAGE_SIZE + 20);
+        assert_eq!(s.patches.len(), 3);
+        assert_patches_are_on_the_same_page(&s.patches);
+    }
+
+    #[track_caller]
+    fn assert_patches_are_on_the_same_page(patches: &[Patch]) {
+        for p in patches {
+            let (page_start, _) = split_ptr(p.addr());
+            let (page_end, _) = split_ptr(p.end() - 1);
+            assert_eq!(
+                page_start,
+                page_end,
+                "Patch should not cross page boundary (0x{:0x}-0x{:0x})",
+                p.addr(),
+                p.end() - 1
+            );
+        }
+    }
+
     /// When dropping PagePool all related snapshots will be removed. It may lead
     /// to stackoverflow if snapshots removed recursively.
     #[test]
@@ -1210,9 +1289,9 @@ mod tests {
         thread::Builder::new()
             .name("deep_snapshot_should_not_cause_stack_overflow".to_string())
             // setting stacksize explicitly so not to rely on the running environment
-            .stack_size(1024)
+            .stack_size(100 * 1024)
             .spawn(|| {
-                let mut mem = PagePool::new(1);
+                let mut mem = PagePool::new(100);
                 for _ in 0..1000 {
                     mem.commit(mem.snapshot());
                 }

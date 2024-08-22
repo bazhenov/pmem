@@ -1678,7 +1678,7 @@ mod tests {
 
             #[test]
             fn can_write_file(ops in vec(any_write_operation(), 0..10)) {
-                let pool = PagePool::new(1024 * 1024);
+                let pool = PagePool::with_capacity(1024 * 1024);
                 let mut fs = Filesystem::allocate(pool.snapshot());
 
                 let tmp_dir = TempDir::new()?;
