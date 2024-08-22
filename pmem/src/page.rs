@@ -44,7 +44,7 @@
 //! The module ensures safety and correctness through the following mechanisms:
 //!
 //! - **Immutability of Committed Snapshots**: Once a snapshot is committed, it becomes immutable, ensuring that
-//!   any reference to its data remains valid and unchanged until corresponding `Rc` reference is held.
+//!   any reference to its data remains valid and unchanged until corresponding `Arc` reference is held.
 //! - **Linear Snapshot History**: The module enforces a linear history of snapshots, preventing branches in the
 //!   snapshot history and ensuring consistency of changes proposed in snapshots.
 //!
@@ -61,7 +61,8 @@ use std::{
     sync::{Arc, Condvar, Mutex},
 };
 
-pub const PAGE_SIZE: usize = 1 << 16; // 64Kib
+pub const PAGE_SIZE_BITS: usize = 16;
+pub const PAGE_SIZE: usize = 1 << PAGE_SIZE_BITS; // 64Kib
 pub type Addr = u64;
 pub type PageOffset = u32;
 pub type PageNo = u32;
@@ -987,7 +988,6 @@ fn is_valid_ptr(addr: Addr, len: usize, pages: u32) -> bool {
 }
 
 fn split_ptr(addr: Addr) -> (PageNo, PageOffset) {
-    const PAGE_SIZE_BITS: u32 = PAGE_SIZE.trailing_zeros();
     let page_no = (addr >> PAGE_SIZE_BITS) & 0xFFFF_FFFF;
     let offset = addr & (PAGE_SIZE - 1) as u64;
     (page_no.try_into().unwrap(), offset.try_into().unwrap())
