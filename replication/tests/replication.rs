@@ -5,8 +5,6 @@ use replication::{replica_connect, start_replication_server};
 use std::{io, net::SocketAddr, sync::Arc};
 use tokio::task::{spawn_blocking, JoinHandle};
 
-mod tracing;
-
 #[tokio::test]
 async fn check_replication_simple_case() -> io::Result<()> {
     let mut net = MasterAndReplica::new().await?;

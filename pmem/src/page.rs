@@ -16,8 +16,8 @@
 //!   used to read data from the pool.
 //! - [`Patch`]: A modification recorded in a snapshot. It consists of the address where the modification starts and
 //!   the bytes that were written.
-//! - [`PagePoolHandle`]: A read view of the page pool that can be used to read data from the pool and
-//!   wait for new snapshots to be committed.
+//! - [`PagePoolHandle`]: A read-only view of the page pool that can be used to read data from the pool and
+//!   wait for new snapshots to be committed. It's useful for concurrent access to the pool.
 //!
 //! ## Usage
 //!
@@ -27,17 +27,25 @@
 //! 2. **Snapshotting**: Create a snapshot of the current state of the `PagePool`.
 //! 3. **Modification**: Use the snapshot to perform modifications. Each modification is recorded as a patch.
 //! 4. **Commit**: Commit the snapshot back to the `PagePool`, applying all the patches and updating the pool's state.
+//! 5. **Concurrent Access**: Optionally, create a `PagePoolHandle` for read-only access to the pool from other threads.
 //!
 //! ## Example
 //!
 //! ```rust
-//! use pmem::page::{PagePool, TxWrite};
+//! use pmem::page::{PagePool, TxRead, TxWrite};
 //!
 //! let mut pool = PagePool::new(5);    // Initialize a pool with 5 pages
 //! let mut snapshot = pool.snapshot(); // Create a snapshot of the current state
-//! snapshot.write(0, &[1, 2, 3, 4]);   // Write 4 bytes at offset 0.
+//! snapshot.write(0, &[1, 2, 3, 4]);   // Write 4 bytes at offset 0 (uses TxWrite trait)
 //! pool.commit(snapshot);              // Commit the changes back to the pool
+//!
+//! // Create a handle for concurrent read-only access
+//! let handle = pool.handle();
+//! let committed_snapshot = handle.snapshot();
+//! assert_eq!(committed_snapshot.read(0, 4), vec![1, 2, 3, 4]); // Read using TxRead trait
 //! ```
+//!
+//! The [`TxRead`] and [`TxWrite`] traits provide methods for reading from and writing to snapshots, respectively.
 //!
 //! ## Safety and Correctness
 //!

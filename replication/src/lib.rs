@@ -3,7 +3,7 @@ use protocol::{Message, PROTOCOL_VERSION};
 use std::{borrow::Cow, fmt::Debug, io, net::SocketAddr, pin::pin, sync::Arc, thread};
 use tokio::{
     net::{TcpListener, TcpStream, ToSocketAddrs},
-    sync::{self, oneshot},
+    sync,
     task::JoinHandle,
 };
 use tracing::{info, instrument, trace};
@@ -67,17 +67,6 @@ async fn server_worker(mut socket: TcpStream, mut notify: CommitNotify) -> io::R
         }
     }
     Ok(())
-}
-
-pub struct ShutdownSignal(oneshot::Sender<()>, JoinHandle<io::Result<()>>);
-
-impl ShutdownSignal {
-    pub fn shutdown(self) -> JoinHandle<io::Result<()>> {
-        // we can safely ignore the error. send() returns an error only if the receiver has been dropped
-        // and the worker has already shutdown
-        let _ = self.0.send(());
-        self.1
-    }
 }
 
 pub struct PoolReplica {
