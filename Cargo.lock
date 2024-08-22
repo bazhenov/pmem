@@ -633,7 +633,6 @@ dependencies = [
  "rand",
  "tango-bench",
  "thiserror",
- "tokio",
 ]
 
 [[package]]
@@ -803,6 +802,8 @@ version = "0.1.0"
 dependencies = [
  "pmem",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -815,6 +816,7 @@ dependencies = [
  "pmem-derive",
  "proptest",
  "rand",
+ "replication",
  "tango-bench",
  "tempfile",
  "thiserror",

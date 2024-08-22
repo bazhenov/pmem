@@ -5,4 +5,14 @@ edition = "2021"
 
 [dependencies]
 pmem = { workspace = true }
-tokio = { workspace = true, features = ["net", "io-util", "macros"] }
+tokio = { workspace = true, features = [
+    "net",
+    "io-util",
+    "macros",
+    "rt",
+    "sync",
+] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
