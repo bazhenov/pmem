@@ -8,7 +8,6 @@ use tokio::task::{spawn_blocking, JoinHandle};
 mod tracing;
 
 #[tokio::test]
-#[cfg(not(miri))]
 async fn check_replication_simple_case() -> io::Result<()> {
     let mut net = MasterAndReplica::new().await?;
 
@@ -19,7 +18,6 @@ async fn check_replication_simple_case() -> io::Result<()> {
 }
 
 #[tokio::test]
-#[cfg(not(miri))]
 async fn check_replication_work_if_connected_later() -> io::Result<()> {
     let mut net = MasterAndReplica::new().await?;
 
@@ -32,7 +30,6 @@ async fn check_replication_work_if_connected_later() -> io::Result<()> {
 }
 
 #[tokio::test]
-#[cfg(not(miri))]
 async fn check_replication_can_resize_pool() -> io::Result<()> {
     let mut net = MasterAndReplica::with_pool(PagePool::new(2)).await?;
 

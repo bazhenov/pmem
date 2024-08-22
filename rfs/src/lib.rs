@@ -1430,7 +1430,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)]
     #[should_panic(expected = "NoSpaceLeft")]
     fn no_space_left() {
         // Maximum file size is 5184 bytes in test environment. So in order to trigger NoSpaceLeft
@@ -1650,7 +1649,6 @@ mod tests {
             .init();
     }
 
-    #[cfg(not(miri))]
     mod proptests {
         use super::*;
         use pmem::page::PagePool;

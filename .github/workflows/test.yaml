@@ -45,5 +45,7 @@ jobs:
         with:
           components: "miri"
       - uses: Swatinem/rust-cache@v2
+        # Miri can not test all crates with isolation, and we are only interested in pmem
+        # as it is the most critical one
       - name: miri
-        run: cargo +nightly miri test
+        run: cargo +nightly miri test -p pmem
