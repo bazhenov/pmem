@@ -825,41 +825,23 @@ impl TxWrite for Snapshot {
         split_ptr_checked(addr, bytes.len(), self.pages);
 
         if !bytes.is_empty() {
-            let mut last_byte_addr = addr + bytes.len() as Addr - 1;
-            while !are_on_the_same_page(addr, last_byte_addr) {
-                let (page, _) = split_ptr(last_byte_addr);
-                let page_addr = page as Addr * PAGE_SIZE as Addr;
-                let split_idx = (page_addr - addr) as usize;
-                let patch = Patch::Write(page_addr, bytes.split_off(split_idx));
+            let segments = PageSegments::new(addr, bytes.len());
+            // Iterating in reverse order so it is more effecient to split the bytes Vec
+            for (addr, range) in segments.rev() {
+                let patch = Patch::Write(addr, bytes.split_off(range.start));
                 push_patch(&mut self.patches, patch);
-                last_byte_addr = addr + bytes.len() as Addr - 1;
             }
-            debug_assert!(!bytes.is_empty());
-            // Adding the last patch
-            push_patch(&mut self.patches, Patch::Write(addr, bytes))
         }
     }
 
     fn reclaim(&mut self, addr: Addr, len: usize) {
         split_ptr_checked(addr, len, self.pages);
         if len > 0 {
-            let mut end_addr = addr + len as Addr;
-            // Gradually shrinking end_addr while it is not on the same page as addr
-            // TODO rewrite this loop as an Iterator and test it independently
-            while !are_on_the_same_page(addr, end_addr - 1) {
-                let (page, offset) = split_ptr(end_addr - 1);
-                let page_addr = page as Addr * PAGE_SIZE as Addr;
-                let length = offset + 1;
-                let patch = Patch::Reclaim(page_addr, length as usize);
+            let segments = PageSegments::new(addr, len).rev();
+            for (addr, range) in segments {
+                let patch = Patch::Reclaim(addr, range.len());
                 push_patch(&mut self.patches, patch);
-                end_addr -= length as Addr;
             }
-            // Adding the last patch
-            debug_assert!(len > 0);
-            push_patch(
-                &mut self.patches,
-                Patch::Reclaim(addr, (end_addr - addr) as usize),
-            )
         }
     }
 }
@@ -870,6 +852,14 @@ impl TxWrite for Snapshot {
 /// 2. All patches are non-overlapping
 fn push_patch(patches: &mut Vec<Patch>, patch: Patch) {
     assert!(patch.len() > 0, "Patch should not be empty");
+    debug_assert!(
+        patch.len() <= PAGE_SIZE,
+        "Page cannot be larger than a page"
+    );
+    debug_assert!(
+        are_on_the_same_page(patch.addr(), patch.end() - 1),
+        "Patch must not cross page boundary"
+    );
     let connected = find_connected_ranges(patches, &patch);
 
     if connected.is_empty() {
