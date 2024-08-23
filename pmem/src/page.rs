@@ -1066,6 +1066,90 @@ fn intersects(patch: &Patch, range: &Range<usize>) -> bool {
     start < range.end && end > range.start
 }
 
+/// Iterator over page segments for a given address and size.
+///
+/// Because data is stored in pages when you want to read or write data you must must always align
+/// operations to page boundaries. This iterator provides a way to calculate page numbers, and corresponding
+/// offsets to copy to/from the page.
+///
+/// Page segments are represented by following tuple:
+/// - address – the page address for the next operation
+/// - range – the range within slice to operate on (relative to base address)
+///
+/// # Example
+///
+/// This example will read data without any cross-page operations.
+///
+/// ```nocompile
+/// use crate::PageSegments;
+/// use crate::PAGE_SIZE;
+///
+/// let base_addr = 0x1000;
+/// let size = 0x100;
+/// let buffer = vec![0; size];
+///
+/// let segments = PageSegments::new(base_addr, size);
+/// for (addr, range) in segments {
+///     let result = tx.read(addr, range.len());
+///     buffer[range].copy_from_slice(&result);
+/// }
+/// ```
+struct PageSegments {
+    base_addr: Addr,
+    start_addr: Addr,
+    end_addr: Addr,
+}
+
+impl PageSegments {
+    fn new(base_addr: Addr, size: usize) -> Self {
+        PageSegments {
+            base_addr,
+            start_addr: base_addr,
+            end_addr: base_addr + size as Addr,
+        }
+    }
+}
+
+impl Iterator for PageSegments {
+    type Item = (Addr, Range<usize>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.end_addr == self.start_addr {
+            return None;
+        }
+        let len = if are_on_the_same_page(self.start_addr, self.end_addr - 1) {
+            self.end_addr - self.start_addr
+        } else {
+            let (page, _) = split_ptr(self.start_addr);
+            let next_page_addr = (page + 1) as Addr * PAGE_SIZE as Addr;
+            next_page_addr - self.start_addr
+        };
+        let offset = (self.start_addr - self.base_addr) as usize;
+        let addr = self.start_addr;
+        self.start_addr += len as Addr;
+        Some((addr, offset..(offset + len as usize)))
+    }
+}
+
+impl DoubleEndedIterator for PageSegments {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.end_addr == self.start_addr {
+            return None;
+        }
+        let len = if are_on_the_same_page(self.start_addr, self.end_addr - 1) {
+            (self.end_addr - self.start_addr) as usize
+        } else {
+            let (page, _) = split_ptr(self.end_addr - 1);
+            let page_start_addr = page as Addr * PAGE_SIZE as Addr;
+            (self.end_addr - page_start_addr) as usize
+        };
+        let offset = (self.end_addr - self.base_addr - len as Addr) as usize;
+        let end_addr = self.end_addr;
+        self.end_addr -= len as Addr;
+        Some((end_addr - len as Addr, offset..(offset + len)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1381,6 +1465,33 @@ mod tests {
         assert_eq!(snapshot.lsn(), latest_lsn + 5);
     }
 
+    #[test]
+    fn check_iterator_over_page_segments() {
+        assert_eq!(PageSegments::new(10, 0).collect::<Vec<_>>(), vec![]);
+
+        assert_eq!(
+            PageSegments::new(0, 10).collect::<Vec<_>>(),
+            vec![(0, 0..10)]
+        );
+
+        assert_eq!(
+            PageSegments::new(PAGE_SIZE as Addr / 2, PAGE_SIZE).collect::<Vec<_>>(),
+            vec![
+                (PAGE_SIZE as Addr / 2, 0..PAGE_SIZE / 2),
+                (PAGE_SIZE as Addr, PAGE_SIZE / 2..PAGE_SIZE),
+            ]
+        );
+
+        assert_eq!(
+            PageSegments::new(1, 2 * PAGE_SIZE).collect::<Vec<_>>(),
+            vec![
+                (1, 0..PAGE_SIZE - 1),
+                (PAGE_SIZE as Addr, (PAGE_SIZE - 1)..(2 * PAGE_SIZE - 1)),
+                (2 * PAGE_SIZE as Addr, (2 * PAGE_SIZE - 1)..(2 * PAGE_SIZE)),
+            ]
+        );
+    }
+
     mod patch {
         use super::*;
         use Patch::*;
@@ -1587,6 +1698,33 @@ mod tests {
                 ..ProptestConfig::default()
             })]
 
+            #[test]
+            fn page_segments_len((addr, len) in any_addr_and_len()) {
+                let interval = PageSegments::new(addr, len);
+                let len_sum = interval.map(|(_, slice_range)| slice_range.len()).sum::<usize>();
+                prop_assert_eq!(len_sum, len);
+            }
+
+            #[test]
+            fn page_segments_are_connected((addr, len) in any_addr_and_len()) {
+                let segments = PageSegments::new(addr, len)
+                    .map(|(_, slice_range)| slice_range)
+                    .collect::<Vec<_>>();
+                for i in segments.windows(2) {
+                    prop_assert_eq!(i[0].end, i[1].start);
+                }
+            }
+
+            #[test]
+            fn page_segments_are_equivalent_to_reverted((addr, len) in any_addr_and_len()) {
+                let segments = PageSegments::new(addr, len).collect::<Vec<_>>();
+
+                let mut segments_rev = PageSegments::new(addr, len).rev().collect::<Vec<_>>();
+                segments_rev.sort_by_key(|(addr, _)| *addr);
+
+                prop_assert_eq!(segments, segments_rev);
+            }
+
             /// This test uses "shadow writes" to check if snapshot writing and reading
             /// algorithms are consistent. We do it by mirroring all patches to a shadow buffer sequentially.
             /// In the end, the final snapshot state should be equal to the shadow buffer.
@@ -1727,6 +1865,10 @@ mod tests {
 
         fn any_range() -> impl Strategy<Value = Range<u32>> {
             (0u32..10, 1u32..5).prop_map(|(offset, length)| offset..(offset + length))
+        }
+
+        fn any_addr_and_len() -> impl Strategy<Value = (Addr, usize)> {
+            (0..100 * PAGE_SIZE as Addr, 0..20 * PAGE_SIZE)
         }
 
         fn any_non_intersecting_ranges() -> impl Strategy<Value = Vec<Range<u32>>> {
