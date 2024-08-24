@@ -36,13 +36,15 @@
 //! use pmem::page::{PagePool, TxRead, TxWrite};
 //!
 //! let mut pool = PagePool::new(5);    // Initialize a pool with 5 pages
+//!
+//! // Create a handle for concurrent read-only access
+//! let mut handle = pool.handle();
+//!
 //! let mut snapshot = pool.snapshot(); // Create a snapshot of the current state
 //! snapshot.write(0, &[1, 2, 3, 4]);   // Write 4 bytes at offset 0 (uses TxWrite trait)
 //! pool.commit(snapshot);              // Commit the changes back to the pool
 //!
-//! // Create a handle for concurrent read-only access
-//! let handle = pool.handle();
-//! let committed_snapshot = handle.snapshot();
+//! let committed_snapshot = handle.wait_for_commit();
 //! assert_eq!(committed_snapshot.read(0, 4), vec![1, 2, 3, 4]); // Read using TxRead trait
 //! ```
 //!
@@ -489,14 +491,6 @@ impl PagePool {
         }
     }
 
-    /// Returns a snapshot of the page pool at a specific LSN **or newer**.
-    pub fn snapshot_at(&self, lsn: u64) -> Result<Arc<CommittedSnapshot>, Error> {
-        let latest = self.latest.lock().unwrap();
-        latest
-            .find_at_lsn(lsn)
-            .ok_or(Error::NoSnapshot(lsn, latest.lsn))
-    }
-
     /// Commits the changes made in a snapshot back to the page pool.
     ///
     /// This method updates the state of the page pool to reflect the modifications
@@ -650,20 +644,6 @@ pub struct PagePoolHandle {
 }
 
 impl PagePoolHandle {
-    pub fn snapshot(&self) -> Arc<CommittedSnapshot> {
-        Arc::clone(&self.latest.lock().unwrap())
-    }
-
-    pub fn snapshot_at(&self, lsn: u64) -> Result<Arc<CommittedSnapshot>, Error> {
-        let latest = {
-            // Explicit scope to drop lock early
-            Arc::clone(&self.latest.lock().unwrap())
-        };
-        latest
-            .find_at_lsn(lsn)
-            .ok_or(Error::NoSnapshot(lsn, latest.lsn))
-    }
-
     pub fn wait_for_commit(&mut self) -> Arc<CommittedSnapshot> {
         self.notify.next_snapshot()
     }
