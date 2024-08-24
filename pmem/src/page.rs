@@ -479,16 +479,13 @@ impl PagePool {
         let base = self.latest.lock().unwrap();
         let pages = base.pages;
 
-        let undo_log = (*self.undo_log)
-            .as_ref()
-            .map(|u| u.next.load_full())
-            .expect("Undo log is None missing");
+        debug_assert!(self.undo_log.is_some());
         Snapshot {
             patches: vec![],
             base: Arc::clone(&base),
             pages_count: pages,
             pages: Arc::clone(&self.pages),
-            undo_log,
+            undo_log: Arc::clone(&self.undo_log),
         }
     }
 
@@ -927,7 +924,9 @@ impl TxRead for Snapshot {
         apply_patches(&self.patches, addr as usize, &mut buf, &mut buf_mask);
 
         // Applying with undo log
-        let mut log = Arc::clone(&self.undo_log);
+        // We need to skip first entry in undo log, because it is describing how to undo the changes
+        // of previously applied transaction.
+        let mut log = (*self.undo_log).as_ref().unwrap().next.load_full();
         while let Some(undo) = log.as_ref() {
             apply_patches(&undo.patches, addr as usize, &mut buf, &mut buf_mask);
             log = undo.next.load_full();
@@ -1283,6 +1282,24 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_should_provide_repeatable_read_isolation() {
+        let mut mem = PagePool::default();
+
+        let mut hide = mem.snapshot();
+        hide.write(0, b"Hide");
+        mem.commit(hide);
+        let hide = mem.snapshot();
+
+        let mut jekyll = mem.snapshot();
+        jekyll.write(0, b"Jekyll");
+        mem.commit(jekyll);
+        let jekyll = mem.snapshot();
+
+        assert_eq!(&*jekyll.read(0, 6), b"Jekyll");
+        assert_eq!(&*hide.read(0, 6), b"Hide\0\0");
+    }
+
+    #[test]
     fn patch_page() {
         let mut mem = PagePool::from("Hello panic!");
 
@@ -1392,29 +1409,6 @@ mod tests {
         PagePool::default()
             .snapshot()
             .reclaim(PAGE_SIZE as Addr - 10, 20);
-    }
-
-    #[test]
-    fn can_read_previous_snapshots() -> Result<(), Error> {
-        let mut mem = PagePool::new(1);
-
-        let mut a = mem.snapshot();
-        a.write(0, [1]);
-        let a_lsn = mem.commit(a);
-
-        let mut b = mem.snapshot();
-        b.write(0, [2]);
-        let b_lsn = mem.commit(b);
-
-        assert!(b_lsn >= a_lsn);
-
-        let a = mem.snapshot_at(a_lsn)?;
-        assert_eq!(&*a.read(0, 1), &[1]);
-
-        let b = mem.snapshot_at(b_lsn)?;
-        assert_eq!(&*b.read(0, 1), &[2]);
-
-        Ok(())
     }
 
     /// When dropping PagePool all related snapshots will be removed. It may lead
