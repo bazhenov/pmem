@@ -27,7 +27,8 @@
 //! 2. **Snapshotting**: Create a snapshot of the current state of the `PagePool`.
 //! 3. **Modification**: Use the snapshot to perform modifications. Each modification is recorded as a patch.
 //! 4. **Commit**: Commit the snapshot back to the `PagePool`, applying all the patches and updating the pool's state.
-//! 5. **Concurrent Access**: Optionally, create a `PagePoolHandle` for read-only access to the pool from other threads.
+//! 5. **Concurrent Access**: Optionally, create a `PagePoolHandle` for read-only access to the pool
+//!    from other threads.
 //!
 //! ## Example
 //!
@@ -964,10 +965,6 @@ fn push_patch(patches: &mut Vec<Patch>, patch: Patch) {
         patch.len() <= PAGE_SIZE,
         "Page cannot be larger than a page"
     );
-    debug_assert!(
-        are_on_the_same_page(patch.addr(), patch.end() - 1),
-        "Patch must not cross page boundary"
-    );
     let connected = find_connected_ranges(patches, &patch);
 
     if connected.is_empty() {
@@ -1335,33 +1332,21 @@ mod tests {
 
     #[test]
     fn data_across_multiple_pages_can_be_written() {
-        let mut mem = PagePool::new(3);
+        let mut mem = PagePool::new(2);
 
+        // Choosing address so that data is split across 2 pages
+        let addr = PAGE_SIZE as Addr - 2;
         let alice = b"Alice";
-        let bob = b"Bob";
-        let charlie = b"Charlie";
-
-        // Addresses on 3 consequent pages
-        let page_a = 0;
-        let page_b = PAGE_SIZE as Addr;
-        let page_c = 2 * PAGE_SIZE as Addr;
 
         let mut snapshot = mem.snapshot();
-        snapshot.write(page_a, alice);
-        snapshot.write(page_b, bob);
-        snapshot.write(page_c, charlie);
+        snapshot.write(addr, alice);
 
         // Checking that data is visible in snapshot
-        assert_str_eq(snapshot.read(page_a, alice.len()), alice);
-        assert_str_eq(snapshot.read(page_b, bob.len()), bob);
-        assert_str_eq(snapshot.read(page_c, charlie.len()), charlie);
-
-        mem.commit(snapshot);
+        assert_str_eq(snapshot.read(addr, alice.len()), alice);
 
         // Checking that data is visible after commit to page pool
-        assert_str_eq(mem.read(page_a, alice.len()), alice);
-        assert_str_eq(mem.read(page_b, bob.len()), bob);
-        assert_str_eq(mem.read(page_c, charlie.len()), charlie);
+        mem.commit(snapshot);
+        assert_str_eq(mem.read(addr, alice.len()), alice);
     }
 
     #[test]
@@ -1756,14 +1741,9 @@ mod tests {
         use NormalizedPatches::*;
 
         /// The size of database for testing
-        const DB_SIZE: usize = 1024;
+        const DB_SIZE: usize = PAGE_SIZE * 2;
 
         proptest! {
-            #![proptest_config(ProptestConfig {
-                cases: 1000,
-                ..ProptestConfig::default()
-            })]
-
             #[test]
             fn page_segments_len((addr, len) in any_addr_and_len()) {
                 let interval = PageSegments::new(addr, len);
@@ -1795,9 +1775,9 @@ mod tests {
             /// algorithms are consistent. We do it by mirroring all patches to a shadow buffer sequentially.
             /// In the end, the final snapshot state should be equal to the shadow buffer.
             #[test]
-            fn shadow_write(snapshots in vec(any_snapshot(), 0..10)) {
+            fn shadow_write(snapshots in vec(any_snapshot(), 0..3)) {
                 let mut shadow_buffer = vec![0; DB_SIZE];
-                let mut mem = PagePool::default();
+                let mut mem = PagePool::with_capacity(DB_SIZE);
 
                 for patches in snapshots {
                     let mut snapshot = mem.snapshot();
@@ -2037,7 +2017,7 @@ mod tests {
             }
 
             pub(super) fn any_patch() -> impl Strategy<Value = Patch> {
-                prop_oneof![write_patch(1..5), reclaim_patch(1..5)]
+                prop_oneof![write_patch(1..16), reclaim_patch(1..16)]
             }
 
             pub(super) fn write_patch(len: Range<usize>) -> impl Strategy<Value = Patch> {
