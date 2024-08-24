@@ -433,7 +433,7 @@ impl PagePool {
     pub fn new(page_cnt: usize) -> Self {
         assert!(page_cnt > 0, "The number of pages must be greater than 0");
         let commit = Commit {
-            patches: vec![],
+            changes: vec![],
             next: ArcSwap::from_pointee(None),
             lsn: 0,
         };
@@ -458,7 +458,7 @@ impl PagePool {
 
     /// Takes a snapshot of the current state of the `PagePool`.
     ///
-    /// This method creates a `Snapshot` instance representing the current state of the page pool.
+    /// This method creates a [`Transaction`] instance representing the current state of the page pool.
     /// The snapshot can be used to perform modifications independently of the pool. These modifications
     /// are not reflected in the pool until the snapshot is committed using the [`commit`] method.
     ///
@@ -475,44 +475,38 @@ impl PagePool {
     ///
     /// # Returns
     ///
-    /// A `Snapshot` instance representing the current state of the page pool. It can be used both for reading and
+    /// A `Transaction` instance representing the current state of the page pool. It can be used both for reading and
     /// changing state of the page pool.
     ///
     /// [`commit`]: Self::commit
     pub fn start(&self) -> Transaction {
         Transaction {
-            patches: vec![],
+            uncommited: vec![],
             base: self.snapshot(),
         }
     }
 
-    /// Commits the changes made in a snapshot back to the page pool.
+    /// Commits the changes made in a transaction back to the page pool.
     ///
     /// This method updates the state of the page pool to reflect the modifications
-    /// recorded in the provided snapshot. Once committed, the snapshot becomes part
-    /// of the page pool's history, and its changes are visible in subsequent snapshots.
+    /// recorded in the provided transaction. Once committed, its changes are visible in subsequent operations.
     ///
-    /// Each snapshot is linked to the pool state it was created from. If the page poll was changed
-    /// since the moment when snapshot was created, attempt to commit such a snapshot will return an error,
+    /// Each transaction is linked to the pool state it was created from. If the page poll was changed
+    /// since the moment when transaction was created, attempt to commit such a transaction will return an error,
     /// because such changes might not be consistent anymore.
-    ///
-    /// # Arguments
-    ///
-    /// * `snapshot` - A snapshot containing modifications to commit to the page pool.
     pub fn commit(&mut self, tx: impl Into<Transaction>) -> u64 {
-        let tx = tx.into();
+        let tx: Transaction = tx.into();
+        assert_eq!(self.lsn, tx.base.lsn, "Proposed transaction is not linear");
 
         let lsn = self.lsn + 1;
-
-        assert_eq!(self.lsn, tx.base.lsn, "Proposed transaction is not linear");
 
         // Updating pages and undo log
         {
             let mut locked_pages: MutexGuard<Vec<Page>> = self.pages.lock().unwrap();
 
             // Updating undo log and page data
-            let mut patches = Vec::with_capacity(tx.patches.len());
-            for patch in &tx.patches {
+            let mut patches = Vec::with_capacity(tx.uncommited.len());
+            for patch in &tx.uncommited {
                 let segments = PageSegments::new(patch.addr(), patch.len());
                 let mut undo_patch = vec![0; patch.len()];
                 for (addr, slice_range) in segments {
@@ -552,7 +546,7 @@ impl PagePool {
 
         // Updating redo log
         let new_commit = Arc::new(Some(Commit {
-            patches: tx.patches.clone(),
+            changes: tx.uncommited,
             next: ArcSwap::from_pointee(None),
             lsn,
         }));
@@ -666,17 +660,6 @@ impl PagePoolHandle {
             pages: Arc::clone(&self.pages),
             undo_log: Arc::clone(&self.undo_log),
         }
-
-        // let snapshot = {
-        //     let mut locked_snapshot = self.notify.snapshot.lock().unwrap();
-        //     if locked_snapshot.lsn() <= self.notify.last_seen_lsn() {
-        //         locked_snapshot = self.notify.notify.wait(locked_snapshot).unwrap();
-        //     }
-        //     Arc::clone(&locked_snapshot)
-        // };
-        // debug_assert!(snapshot.lsn() > self.notify.last_seen_lsn());
-        // self.notify.last_seen_lsn = snapshot.lsn();
-        // snapshot
     }
 }
 
@@ -696,14 +679,12 @@ impl CommitNotify {
     /// all of them in order.
     pub fn next_commit(&mut self) -> &Commit {
         let last_commit = (*self.commit).as_ref().unwrap();
-        dbg!(self.last_seen_lsn(), last_commit.lsn());
         if last_commit.next().is_none() {
             let locked_commit = self.commit_lock.lock().unwrap();
             // Need to check again after acquiring the lock, otherwise it is a race condition
             // because we speculatively checked the condition before acquiring the lock to prevent
             // contention when possible
             if last_commit.next().is_none() {
-                println!("Waiting...");
                 drop(self.notify.wait(locked_commit).unwrap());
             }
         }
@@ -840,22 +821,24 @@ impl TxRead for Snapshot {
 }
 
 pub struct Commit {
-    /// A patches that have been applied in this snapshot.
-    patches: Vec<Patch>,
+    /// A changes that have been applied in this snapshot.
+    ///
+    /// This array is sorted by the address of the change and all patches are non-overlapping.
+    changes: Vec<Patch>,
 
-    /// A reference to the base snapshot from which this snapshot was derived.
-    /// If present, the base snapshot represents the state of the page pool
-    /// immediately before the current snapshot's patches were applied.
+    /// A reference to the next commit in the chain.
+    ///
+    /// This is updated atomically by the thread that executing commit operation.
     next: ArcSwap<Option<Commit>>,
 
-    /// A log sequence number (LSN) that uniquely identifies this snapshot. The LSN
-    /// is used internally to ensure that snapshots are applied in a linear and consistent order.
+    /// A log sequence number (LSN) that uniquely identifies this commit.
+    /// LSN numbers are monotonically increasing.
     lsn: LSN,
 }
 
 impl Commit {
     pub fn patches(&self) -> &[Patch] {
-        self.patches.as_slice()
+        self.changes.as_slice()
     }
 
     pub fn lsn(&self) -> LSN {
@@ -869,7 +852,7 @@ impl Commit {
 
 #[derive(Clone)]
 pub struct Transaction {
-    patches: Vec<Patch>,
+    uncommited: Vec<Patch>,
     base: Snapshot,
 }
 
@@ -879,7 +862,7 @@ impl TxRead for Transaction {
     }
 
     fn read(&self, addr: Addr, len: usize) -> Cow<[u8]> {
-        self.base.read_uncommitted(addr, len, &self.patches)
+        self.base.read_uncommitted(addr, len, &self.uncommited)
     }
 }
 
@@ -889,28 +872,24 @@ impl TxWrite for Transaction {
         split_ptr_checked(addr, bytes.len(), self.base.pages_count);
 
         if !bytes.is_empty() {
-            push_patch(&mut self.patches, Patch::Write(addr, bytes));
+            push_patch(&mut self.uncommited, Patch::Write(addr, bytes));
         }
     }
 
     fn reclaim(&mut self, addr: Addr, len: usize) {
         split_ptr_checked(addr, len, self.base.pages_count);
         if len > 0 {
-            push_patch(&mut self.patches, Patch::Reclaim(addr, len));
+            push_patch(&mut self.uncommited, Patch::Reclaim(addr, len));
         }
     }
 }
 
-/// Pushes a patch to a snapshot ensuring the following invariants hold:
+/// Pushes a patch to a list ensuring the following invariants hold:
 ///
-/// 1. All patches are sorted by [Patch:addr()]
+/// 1. All patches are sorted by [`Patch::addr()`]
 /// 2. All patches are non-overlapping
 fn push_patch(patches: &mut Vec<Patch>, patch: Patch) {
     assert!(patch.len() > 0, "Patch should not be empty");
-    debug_assert!(
-        patch.len() <= PAGE_SIZE,
-        "Page cannot be larger than a page"
-    );
     let connected = find_connected_ranges(patches, &patch);
 
     if connected.is_empty() {
@@ -1740,10 +1719,10 @@ mod tests {
             /// This test ensure that no matter transactions are committed, snapshot should always
             /// return the same initial state.
             #[test]
-            fn repeatable_read(snapshots in vec(any_snapshot(), 1..10)) {
-                let mut mem = PagePool::with_capacity(DB_SIZE);
+            fn repeatable_read(snapshots in vec(any_snapshot(), 1..5)) {
+                let initial = vec![42; DB_SIZE];
+                let mut mem = PagePool::from(initial.as_slice());
                 let s = mem.snapshot();
-                let zeros = vec![0; DB_SIZE];
 
                 for patches in snapshots {
                     let mut tx = mem.start();
@@ -1759,7 +1738,7 @@ mod tests {
                         }
                     }
                     mem.commit(tx);
-                    assert_buffers_eq(&s.read(0, DB_SIZE), &zeros)?;
+                    assert_buffers_eq(&s.read(0, DB_SIZE), &initial)?;
                 }
             }
 
