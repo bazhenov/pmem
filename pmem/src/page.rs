@@ -604,6 +604,19 @@ impl PagePool {
         }
     }
 
+    pub fn snapshot(&self) -> Snap {
+        let base = self.latest.lock().unwrap();
+        let pages = base.pages;
+
+        debug_assert!(self.undo_log.is_some());
+        Snap {
+            base_lsn: self.lsn,
+            pages_count: pages,
+            pages: Arc::clone(&self.pages),
+            undo_log: Arc::clone(&self.undo_log),
+        }
+    }
+
     #[cfg(test)]
     fn read(&self, addr: Addr, len: usize) -> Cow<[u8]> {
         #[allow(clippy::single_range_in_vec_init)]
@@ -859,6 +872,69 @@ impl Drop for Snapshot {
                 .map(|mut base| base.base.take())
                 .unwrap_or(None);
         }
+    }
+}
+
+struct Snap {
+    pages_count: PageNo,
+    undo_log: Arc<Option<UndoEntry>>,
+    pages: Arc<Mutex<Vec<Page>>>,
+    base_lsn: LSN,
+}
+
+impl Snap {
+    fn read_uncommited(&self, addr: Addr, len: usize, uncommited: &[Patch]) -> Cow<[u8]> {
+        split_ptr_checked(addr, len, self.pages_count);
+
+        // Because apply_patches() is implementing first patch wins logic, the correct order of reading
+        // data at a given LSN is following:
+        //
+        // 1. Read whatever data is in the pages.
+        // 2. Apply changes from own patches. Any transaction should see its own not yet committed cnanges.
+        // 3. Apply changes from undo log, to restore the state of the page that is possibly changed
+        //    by concurrently committed transaction. This is needed to maintain REPETABLE READ
+        //    isolation guarantee.
+        let mut buf = vec![0; len];
+
+        // Reading the pages
+        {
+            let mut locked_pages = self.pages.lock().unwrap();
+            for (addr, range) in PageSegments::new(addr, len) {
+                let (page_no, offset) = split_ptr(addr);
+                let offset = offset as usize;
+                if let Some(page) = find_page(&mut locked_pages, page_no) {
+                    let len = range.len();
+                    buf[range].copy_from_slice(&page.data[offset..offset + len]);
+                }
+            }
+        }
+
+        #[allow(clippy::single_range_in_vec_init)]
+        let mut buf_mask = vec![0..len];
+
+        // Apply own uncommitted changes
+        apply_patches(uncommited, addr as usize, &mut buf, &mut buf_mask);
+
+        // Applying with undo log
+        // We need to skip first entry in undo log, because it is describing how to undo the changes
+        // of previously applied transaction.
+        let mut log = (*self.undo_log).as_ref().unwrap().next.load_full();
+        while let Some(undo) = log.as_ref() {
+            apply_patches(&undo.patches, addr as usize, &mut buf, &mut buf_mask);
+            log = undo.next.load_full();
+        }
+
+        Cow::Owned(buf)
+    }
+}
+
+impl TxRead for Snap {
+    fn valid_range(&self, addr: Addr, len: usize) -> bool {
+        is_valid_ptr(addr, len, self.pages_count)
+    }
+
+    fn read(&self, addr: Addr, len: usize) -> Cow<[u8]> {
+        self.read_uncommited(addr, len, &[])
     }
 }
 
@@ -1298,6 +1374,8 @@ mod tests {
     fn snapshot_should_provide_repeatable_read_isolation() {
         let mut mem = PagePool::default();
 
+        let zero = mem.snapshot();
+
         let mut hide = mem.start();
         hide.write(0, b"Hide");
         mem.commit(hide);
@@ -1308,8 +1386,9 @@ mod tests {
         mem.commit(jekyll);
         let jekyll = mem.start();
 
-        assert_eq!(&*jekyll.read(0, 6), b"Jekyll");
+        assert_eq!(&*zero.read(0, 6), b"\0\0\0\0\0\0");
         assert_eq!(&*hide.read(0, 6), b"Hide\0\0");
+        assert_eq!(&*jekyll.read(0, 6), b"Jekyll");
     }
 
     #[test]
@@ -1798,6 +1877,32 @@ mod tests {
                 }
 
                 assert_buffers_eq(&mem.read(0, DB_SIZE), shadow_buffer.as_slice())?;
+            }
+
+            /// This test ensure that no matter transactions are committed, snapshot should always
+            /// return the same initial state.
+            #[test]
+            fn repeatable_read(snapshots in vec(any_snapshot(), 1..10)) {
+                let mut mem = PagePool::with_capacity(DB_SIZE);
+                let s = mem.snapshot();
+                let zeros = vec![0; DB_SIZE];
+
+                for patches in snapshots {
+                    let mut tx = mem.start();
+                    for patch in patches {
+                        match patch {
+                            Patch::Write(offset, bytes) => {
+                                tx.write(offset, bytes);
+                            },
+                            Patch::Reclaim(offset, len) => {
+                                tx.reclaim(offset, len);
+
+                            }
+                        }
+                    }
+                    mem.commit(tx);
+                    assert_buffers_eq(&s.read(0, DB_SIZE), &zeros)?;
+                }
             }
 
             #[test]
