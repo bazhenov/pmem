@@ -913,9 +913,10 @@ impl TxRead for Snapshot {
         // data at a given LSN is following:
         //
         // 1. Read whatever data is in the pages.
-        // 2. Apply changes from own patches. Any transaction should see its own not yet commited cnanges.
-        // 3. Apply changes from undo log, to restore the state of the page that is possibly chaged
-        //    by concurrently commited transaction. This is needed to maintain REPETABLE READ isolation guarantee.
+        // 2. Apply changes from own patches. Any transaction should see its own not yet committed cnanges.
+        // 3. Apply changes from undo log, to restore the state of the page that is possibly changed
+        //    by concurrently committed transaction. This is needed to maintain REPETABLE READ
+        //    isolation guarantee.
         let mut buf = vec![0; len];
 
         // Reading the pages
@@ -957,7 +958,7 @@ impl TxWrite for Snapshot {
 
         if !bytes.is_empty() {
             let segments = PageSegments::new(addr, bytes.len());
-            // Iterating in reverse order so it is more effecient to split the bytes Vec
+            // Iterating in reverse order so it is more efficient to split the bytes Vec
             for (addr, range) in segments.rev() {
                 let patch = Patch::Write(addr, bytes.split_off(range.start));
                 push_patch(&mut self.patches, patch);
@@ -1455,10 +1456,10 @@ mod tests {
         Ok(())
     }
 
-    /// This test checks that patches are correctly splitted at page boundary
+    /// This test checks that patches are correctly split at page boundary
     /// No patch should be bigger than PAGE_SIZE and no patch should span over multiple pages
     #[test]
-    fn patches_must_be_splitted_at_page_boundary() {
+    fn patches_must_be_split_at_page_boundary() {
         let mem = PagePool::new(3);
 
         let mut s = mem.snapshot();
