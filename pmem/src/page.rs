@@ -207,23 +207,14 @@ impl Patch {
 
         match self.reorder(other) {
             (Write(addr_a, mut a), Write(addr_b, b)) => {
-                if is_page_boundary(addr_a + a.len() as Addr) && is_page_boundary(addr_b) {
-                    // Do not merge if patches are on different pages
-                    Reordered(Write(addr_a, a), Write(addr_b, b))
-                } else if a.len() + b.len() < 1024 {
+                if a.len() + b.len() < PAGE_SIZE {
                     a.extend(b);
                     Merged(Write(addr_a, a))
                 } else {
                     Reordered(Write(addr_a, a), Write(addr_b, b))
                 }
             }
-            (Reclaim(addr_a, a), Reclaim(addr_b, b)) => {
-                if is_page_boundary(addr_a + a as Addr) && is_page_boundary(addr_b) {
-                    Reordered(Reclaim(addr_a, a), Reclaim(addr_b, b))
-                } else {
-                    Merged(Reclaim(addr_a, a + b))
-                }
-            }
+            (Reclaim(addr_a, a), Reclaim(_, b)) => Merged(Reclaim(addr_a, a + b)),
             (a, b) => Reordered(a, b),
         }
     }
@@ -286,10 +277,6 @@ impl Patch {
             Patch::Reclaim(addr, _) => *addr = value,
         }
     }
-}
-
-fn is_page_boundary(addr: Addr) -> bool {
-    addr % PAGE_SIZE as Addr == 0
 }
 
 fn are_on_the_same_page(a1: Addr, a2: Addr) -> bool {
@@ -939,12 +926,10 @@ impl TxRead for Snapshot {
         apply_patches(&self.patches, addr as usize, &mut buf, &mut buf_mask);
 
         // Applying with undo log
-        {
-            let mut log = Arc::clone(&self.undo_log);
-            while let Some(undo) = log.as_ref() {
-                apply_patches(&undo.patches, addr as usize, &mut buf, &mut buf_mask);
-                log = undo.next.load_full();
-            }
+        let mut log = Arc::clone(&self.undo_log);
+        while let Some(undo) = log.as_ref() {
+            apply_patches(&undo.patches, addr as usize, &mut buf, &mut buf_mask);
+            log = undo.next.load_full();
         }
 
         Cow::Owned(buf)
@@ -953,27 +938,29 @@ impl TxRead for Snapshot {
 
 impl TxWrite for Snapshot {
     fn write(&mut self, addr: Addr, bytes: impl Into<Vec<u8>>) {
-        let mut bytes = bytes.into();
+        let bytes = bytes.into();
         split_ptr_checked(addr, bytes.len(), self.pages_count);
 
         if !bytes.is_empty() {
-            let segments = PageSegments::new(addr, bytes.len());
-            // Iterating in reverse order so it is more efficient to split the bytes Vec
-            for (addr, range) in segments.rev() {
-                let patch = Patch::Write(addr, bytes.split_off(range.start));
-                push_patch(&mut self.patches, patch);
-            }
+            push_patch(&mut self.patches, Patch::Write(addr, bytes));
+            // let segments = PageSegments::new(addr, bytes.len());
+            // // Iterating in reverse order so it is more efficient to split the bytes Vec
+            // for (addr, range) in segments.rev() {
+            //     let patch = Patch::Write(addr, bytes.split_off(range.start));
+            //     push_patch(&mut self.patches, patch);
+            // }
         }
     }
 
     fn reclaim(&mut self, addr: Addr, len: usize) {
         split_ptr_checked(addr, len, self.pages_count);
         if len > 0 {
-            let segments = PageSegments::new(addr, len).rev();
-            for (addr, range) in segments {
-                let patch = Patch::Reclaim(addr, range.len());
-                push_patch(&mut self.patches, patch);
-            }
+            push_patch(&mut self.patches, Patch::Reclaim(addr, len));
+            // let segments = PageSegments::new(addr, len).rev();
+            // for (addr, range) in segments {
+            //     let patch = Patch::Reclaim(addr, range.len());
+            //     push_patch(&mut self.patches, patch);
+            // }
         }
     }
 }
@@ -1454,48 +1441,6 @@ mod tests {
         assert_eq!(&*b.read(0, 1), &[2]);
 
         Ok(())
-    }
-
-    /// This test checks that patches are correctly split at page boundary
-    /// No patch should be bigger than PAGE_SIZE and no patch should span over multiple pages
-    #[test]
-    fn patches_must_be_split_at_page_boundary() {
-        let mem = PagePool::new(3);
-
-        let mut s = mem.snapshot();
-        s.write(PAGE_SIZE as Addr - 10, [1; 20]);
-        assert_eq!(s.patches.len(), 2);
-        assert_patches_are_on_the_same_page(&s.patches);
-
-        let mut s = mem.snapshot();
-        s.write(PAGE_SIZE as Addr - 10, [1; PAGE_SIZE + 20]);
-        assert_eq!(s.patches.len(), 3);
-        assert_patches_are_on_the_same_page(&s.patches);
-
-        let mut s = mem.snapshot();
-        s.reclaim(PAGE_SIZE as Addr - 10, 20);
-        assert_eq!(s.patches.len(), 2);
-        assert_patches_are_on_the_same_page(&s.patches);
-
-        let mut s = mem.snapshot();
-        s.reclaim(PAGE_SIZE as Addr - 10, PAGE_SIZE + 20);
-        assert_eq!(s.patches.len(), 3);
-        assert_patches_are_on_the_same_page(&s.patches);
-    }
-
-    #[track_caller]
-    fn assert_patches_are_on_the_same_page(patches: &[Patch]) {
-        for p in patches {
-            let (page_start, _) = split_ptr(p.addr());
-            let (page_end, _) = split_ptr(p.end() - 1);
-            assert_eq!(
-                page_start,
-                page_end,
-                "Patch should not cross page boundary (0x{:0x}-0x{:0x})",
-                p.addr(),
-                p.end() - 1
-            );
-        }
     }
 
     /// When dropping PagePool all related snapshots will be removed. It may lead
