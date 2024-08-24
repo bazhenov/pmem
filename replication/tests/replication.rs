@@ -54,7 +54,7 @@ struct MasterAndReplica {
 
 impl MasterAndReplica {
     async fn new() -> io::Result<Self> {
-        Self::with_pool(PagePool::default()).await
+        Self::with_pool(PagePool::new(1)).await
     }
 
     async fn with_pool(pool: PagePool) -> io::Result<Self> {

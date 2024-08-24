@@ -1560,7 +1560,7 @@ mod tests {
     }
 
     fn create_fs() -> (Filesystem<Snapshot>, PagePool) {
-        let page_pool = PagePool::default();
+        let page_pool = PagePool::new(1);
         (Filesystem::allocate(page_pool.snapshot()), page_pool)
     }
 
