@@ -410,7 +410,6 @@ pub struct PagePool {
     /// that [`UndoEntry::next`] which is [`ArcSwap`] should contains `Option` to be able
     /// to stop reference chain at some point and we can not have both `Arc<T>` and `Arc<Option<T>>` as the same time.
     undo_log: Arc<Option<UndoEntry>>,
-    commit_lock: Arc<Mutex<()>>,
     commit_log: Arc<Option<Commit>>,
 
     /// A log sequence number (LSN) that uniquely identifies this snapshot. The LSN
@@ -445,7 +444,6 @@ impl PagePool {
             pages: Arc::new(Mutex::new(pages)),
             undo_log: Arc::new(Some(UndoEntry::default())),
             commit_log: Arc::new(Some(commit)),
-            commit_lock: Arc::new(Mutex::new(())),
             notify: Arc::new(Condvar::new()),
             lsn: 0,
         }
@@ -568,8 +566,8 @@ impl PagePool {
             last_seen_lsn: self.lsn,
             notify: Arc::clone(&self.notify),
             commit: Arc::clone(&self.commit_log),
-            commit_lock: Arc::clone(&self.commit_lock),
             pages_count: self.pages.lock().unwrap().len() as u32,
+            pages: Arc::clone(&self.pages),
         }
     }
 
@@ -665,7 +663,7 @@ impl PagePoolHandle {
 
 #[derive(Clone)]
 pub struct CommitNotify {
-    commit_lock: Arc<Mutex<()>>,
+    pages: Arc<Mutex<Vec<Page>>>,
     commit: Arc<Option<Commit>>,
     last_seen_lsn: u64,
     notify: Arc<Condvar>,
@@ -680,7 +678,7 @@ impl CommitNotify {
     pub fn next_commit(&mut self) -> &Commit {
         let last_commit = (*self.commit).as_ref().unwrap();
         if last_commit.next().is_none() {
-            let locked_commit = self.commit_lock.lock().unwrap();
+            let locked_commit = self.pages.lock().unwrap();
             // Need to check again after acquiring the lock, otherwise it is a race condition
             // because we speculatively checked the condition before acquiring the lock to prevent
             // contention when possible
