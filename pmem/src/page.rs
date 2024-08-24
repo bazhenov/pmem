@@ -678,12 +678,12 @@ impl CommitNotify {
     pub fn next_commit(&mut self) -> &Commit {
         let last_commit = (*self.commit).as_ref().unwrap();
         if last_commit.next().is_none() {
-            let locked_commit = self.pages.lock().unwrap();
+            let mut locked_commit = self.pages.lock().unwrap();
             // Need to check again after acquiring the lock, otherwise it is a race condition
             // because we speculatively checked the condition before acquiring the lock to prevent
             // contention when possible
-            if last_commit.next().is_none() {
-                drop(self.notify.wait(locked_commit).unwrap());
+            while last_commit.next().is_none() {
+                locked_commit = self.notify.wait(locked_commit).unwrap();
             }
         }
         // let last_commit = (*self.commit).as_ref().unwrap();
