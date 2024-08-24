@@ -420,7 +420,7 @@ pub struct PagePool {
     /// for the snapshot to be created. Unfortunately, this is not possible due to the fact
     /// that [`UndoLog::next`] which is [`ArcSwap`] should contains `Option` to be able
     /// to stop reference chain at some point and we can not have both `Arc<T>` and `Arc<Option<T>>` as the same time.
-    undo_log: Arc<Option<UndoLog>>,
+    undo_log: Arc<Option<UndoEntry>>,
     latest: Arc<Mutex<Arc<CommittedSnapshot>>>,
     lsn: LSN,
     notify: Arc<Condvar>,
@@ -451,7 +451,7 @@ impl PagePool {
         }
         Self {
             pages: Arc::new(Mutex::new(pages)),
-            undo_log: Arc::new(Some(UndoLog::default())),
+            undo_log: Arc::new(Some(UndoEntry::default())),
             latest: Arc::new(Mutex::new(Arc::new(snapshot))),
             notify: Arc::new(Condvar::new()),
             lsn: 0,
@@ -530,58 +530,52 @@ impl PagePool {
 
         let lsn = self.lsn + 1;
 
-        // Updating pages and undo log
-        {
-            let mut locked_pages: MutexGuard<Vec<Page>> = self.pages.lock().unwrap();
-
-            // Updating undo log
-            let mut undo_patches = Vec::with_capacity(snapshot.patches.len());
-            for patch in &snapshot.patches {
-                let segments = PageSegments::new(patch.addr(), patch.len());
-                let mut undo_patch = vec![0; patch.len()];
-                for (addr, range) in segments {
-                    let (page_no, offset) = split_ptr(addr);
-                    let offset = offset as usize;
-                    let page = find_or_create_page(&mut locked_pages, page_no);
-                    let len = range.len();
-                    undo_patch[range].copy_from_slice(&page.data[offset..(offset + len)]);
-                }
-                undo_patches.push(Patch::Write(patch.addr(), undo_patch));
-            }
-            let undo = Arc::new(Some(UndoLog {
-                patches: undo_patches,
-                next: ArcSwap::from_pointee(None),
-            }));
-            if let Some(prev) = self.undo_log.as_ref() {
-                prev.next.store(Arc::clone(&undo));
-            }
-            self.undo_log = undo;
-
-            // Updating page data
-            for patch in &snapshot.patches {
-                let segments = PageSegments::new(patch.addr(), patch.len());
-                for (addr, range) in segments {
-                    let (page_no, offset) = split_ptr(addr);
-                    let offset = offset as usize;
-                    let page = find_or_create_page(&mut locked_pages, page_no);
-                    let len = range.len();
-                    match patch {
-                        Patch::Write(_, data) => {
-                            page.data[offset..(offset + len)].copy_from_slice(&data[range])
-                        }
-                        Patch::Reclaim(..) => page.data[offset..(offset + len)].fill(0),
-                    }
-                }
-            }
-        }
-
-        // Updating redo log
         let mut latest = self.latest.lock().unwrap();
         assert!(
             Arc::ptr_eq(&latest, &snapshot.base),
             "Proposed snapshot is not linear"
         );
 
+        // Updating pages and undo log
+        {
+            let mut locked_pages: MutexGuard<Vec<Page>> = self.pages.lock().unwrap();
+
+            // Updating undo log and page data
+            let mut patches = Vec::with_capacity(snapshot.patches.len());
+            for patch in &snapshot.patches {
+                let segments = PageSegments::new(patch.addr(), patch.len());
+                let mut undo_patch = vec![0; patch.len()];
+                for (addr, slice_range) in segments {
+                    let (page_no, offset) = split_ptr(addr);
+                    let offset = offset as usize;
+                    let len = slice_range.len();
+                    let page_range = offset..(offset + len);
+
+                    let page = find_or_create_page(&mut locked_pages, page_no);
+
+                    // Forming undo patch
+                    undo_patch[slice_range.clone()].copy_from_slice(&page.data[page_range.clone()]);
+
+                    // Applying change to the page
+                    match patch {
+                        Patch::Write(_, data) => {
+                            page.data[page_range].copy_from_slice(&data[slice_range])
+                        }
+                        Patch::Reclaim(..) => page.data[page_range].fill(0),
+                    }
+                }
+                patches.push(Patch::Write(patch.addr(), undo_patch));
+            }
+            let undo = Arc::new(Some(UndoEntry::from(patches)));
+            (*self.undo_log)
+                .as_ref()
+                .expect("Undo log is missing")
+                .next
+                .store(Arc::clone(&undo));
+            self.undo_log = undo;
+        }
+
+        // Updating redo log
         let new_snapshot = Arc::new(CommittedSnapshot {
             patches: snapshot.patches,
             base: Some(Arc::clone(&latest)),
@@ -652,9 +646,16 @@ fn find_page<'a>(pages: &'a mut MutexGuard<Vec<Page>>, page: PageNo) -> Option<&
 }
 
 #[derive(Default)]
-struct UndoLog {
-    next: ArcSwap<Option<UndoLog>>,
+struct UndoEntry {
+    next: ArcSwap<Option<UndoEntry>>,
     patches: Vec<Patch>,
+}
+
+impl From<Vec<Patch>> for UndoEntry {
+    fn from(patches: Vec<Patch>) -> Self {
+        let next = ArcSwap::from_pointee(None);
+        Self { patches, next }
+    }
 }
 
 #[derive(Clone)]
@@ -884,7 +885,7 @@ pub struct Snapshot {
     patches: Vec<Patch>,
     base: Arc<CommittedSnapshot>,
     pages_count: PageNo,
-    undo_log: Arc<Option<UndoLog>>,
+    undo_log: Arc<Option<UndoEntry>>,
     pages: Arc<Mutex<Vec<Page>>>,
 }
 
