@@ -410,8 +410,11 @@ pub struct PagePool {
     /// that [`UndoEntry::next`] which is [`ArcSwap`] should contains `Option` to be able
     /// to stop reference chain at some point and we can not have both `Arc<T>` and `Arc<Option<T>>` as the same time.
     undo_log: Arc<Option<UndoEntry>>,
-    latest: Arc<Mutex<Arc<Snapshot>>>,
+    commit_lock: Arc<Mutex<()>>,
     commit_log: Arc<Option<Commit>>,
+
+    /// A log sequence number (LSN) that uniquely identifies this snapshot. The LSN
+    /// is used internally to ensure that snapshots are applied in a linear and consistent order.
     lsn: LSN,
     notify: Arc<Condvar>,
 }
@@ -427,28 +430,22 @@ impl PagePool {
     ///
     /// * `pages` - The number of pages the pool should initially contain. This determines
     ///   the range of valid addresses that can be written to in snapshots derived from this pool.
-    pub fn new(pages: usize) -> Self {
-        assert!(pages > 0, "The number of pages must be greater than 0");
-        let snapshot = Snapshot {
-            patches: vec![],
-            base: None,
-            pages: u32::try_from(pages).unwrap(),
-            lsn: 0,
-        };
+    pub fn new(page_cnt: usize) -> Self {
+        assert!(page_cnt > 0, "The number of pages must be greater than 0");
         let commit = Commit {
             patches: vec![],
             next: ArcSwap::from_pointee(None),
             lsn: 0,
         };
-        let mut pages = Vec::with_capacity(snapshot.pages() as usize);
-        for i in 0..snapshot.pages() {
-            pages.push(Page::new(i));
+        let mut pages = Vec::with_capacity(page_cnt);
+        for i in 0..page_cnt {
+            pages.push(Page::new(i as u32));
         }
         Self {
             pages: Arc::new(Mutex::new(pages)),
             undo_log: Arc::new(Some(UndoEntry::default())),
             commit_log: Arc::new(Some(commit)),
-            latest: Arc::new(Mutex::new(Arc::new(snapshot))),
+            commit_lock: Arc::new(Mutex::new(())),
             notify: Arc::new(Condvar::new()),
             lsn: 0,
         }
@@ -483,16 +480,9 @@ impl PagePool {
     ///
     /// [`commit`]: Self::commit
     pub fn start(&self) -> Transaction {
-        let base = self.latest.lock().unwrap();
-        let pages = base.pages;
-
-        debug_assert!(self.undo_log.is_some());
         Transaction {
             patches: vec![],
-            base_lsn: self.lsn,
-            pages_count: pages,
-            pages: Arc::clone(&self.pages),
-            undo_log: Arc::clone(&self.undo_log),
+            base: self.snapshot(),
         }
     }
 
@@ -514,12 +504,7 @@ impl PagePool {
 
         let lsn = self.lsn + 1;
 
-        let mut latest = self.latest.lock().unwrap();
-        assert_eq!(
-            latest.lsn(),
-            tx.base_lsn,
-            "Proposed transaction is not linear"
-        );
+        assert_eq!(self.lsn, tx.base.lsn, "Proposed transaction is not linear");
 
         // Updating pages and undo log
         {
@@ -551,7 +536,12 @@ impl PagePool {
                 }
                 patches.push(Patch::Write(patch.addr(), undo_patch));
             }
-            let undo = Arc::new(Some(UndoEntry::from(patches)));
+            let undo = UndoEntry {
+                next: ArcSwap::from_pointee(None),
+                patches,
+                lsn,
+            };
+            let undo = Arc::new(Some(undo));
             (*self.undo_log)
                 .as_ref()
                 .expect("Undo log is missing")
@@ -573,45 +563,37 @@ impl PagePool {
             .store(Arc::clone(&new_commit));
         self.commit_log = new_commit;
 
-        let new_snapshot = Arc::new(Snapshot {
-            patches: tx.patches,
-            base: Some(Arc::clone(&latest)),
-            pages: tx.pages_count,
-            lsn,
-        });
-
-        *latest = new_snapshot;
         self.lsn = lsn;
-        drop(latest);
 
         self.notify.notify_all();
         lsn
     }
 
     pub fn commit_notify(&self) -> CommitNotify {
-        let snapshot = self.latest.lock().unwrap();
         CommitNotify {
-            last_seen_lsn: snapshot.lsn,
+            last_seen_lsn: self.lsn,
             notify: Arc::clone(&self.notify),
             commit: Arc::clone(&self.commit_log),
-            snapshot: Arc::clone(&self.latest),
+            commit_lock: Arc::clone(&self.commit_lock),
+            pages_count: self.pages.lock().unwrap().len() as u32,
         }
     }
 
     pub fn handle(&self) -> PagePoolHandle {
         PagePoolHandle {
             notify: self.commit_notify(),
+            pages: Arc::clone(&self.pages),
+            pages_count: self.pages.lock().unwrap().len() as u32,
+            undo_log: Arc::clone(&self.undo_log),
         }
     }
 
-    pub fn snapshot(&self) -> Snap {
-        let base = self.latest.lock().unwrap();
-        let pages = base.pages;
-
+    pub fn snapshot(&self) -> Snapshot {
         debug_assert!(self.undo_log.is_some());
-        Snap {
-            base_lsn: self.lsn,
-            pages_count: pages,
+
+        Snapshot {
+            lsn: self.lsn,
+            pages_count: self.pages.lock().unwrap().len() as u32,
             pages: Arc::clone(&self.pages),
             undo_log: Arc::clone(&self.undo_log),
         }
@@ -619,15 +601,11 @@ impl PagePool {
 
     #[cfg(test)]
     fn read(&self, addr: Addr, len: usize) -> Cow<[u8]> {
-        #[allow(clippy::single_range_in_vec_init)]
         let mut buffer = vec![0; len];
-        #[allow(clippy::single_range_in_vec_init)]
-        let mut buf_ranges = vec![0..len];
-        let latest = {
-            // Explicit scope to drop lock early
-            Arc::clone(&self.latest.lock().unwrap())
-        };
-        latest.read_to_buf(addr, &mut buffer, &mut buf_ranges);
+
+        let snapshot = self.snapshot();
+        let buf = snapshot.read(addr, len);
+        buffer.copy_from_slice(&buf);
         Cow::Owned(buffer)
     }
 }
@@ -663,52 +641,55 @@ fn find_page<'a>(pages: &'a mut MutexGuard<Vec<Page>>, page: PageNo) -> Option<&
 struct UndoEntry {
     next: ArcSwap<Option<UndoEntry>>,
     patches: Vec<Patch>,
-}
-
-impl From<Vec<Patch>> for UndoEntry {
-    fn from(patches: Vec<Patch>) -> Self {
-        let next = ArcSwap::from_pointee(None);
-        Self { patches, next }
-    }
+    lsn: LSN,
 }
 
 #[derive(Clone)]
 pub struct PagePoolHandle {
     notify: CommitNotify,
+    pages_count: PageNo,
+    undo_log: Arc<Option<UndoEntry>>,
+    pages: Arc<Mutex<Vec<Page>>>,
 }
 
 impl PagePoolHandle {
-    pub fn wait_for_commit(&mut self) -> Arc<Snapshot> {
-        self.notify.next_snapshot()
+    /// Blocks until next snapshot is available and returns it
+    ///
+    /// The next snapshot is the one that is the most recent at the time this method is called.
+    /// It might be several snapshots ahead of the last seen snapshot.
+    pub fn wait_for_commit(&mut self) -> Snapshot {
+        let commit = self.notify.next_commit();
+
+        Snapshot {
+            lsn: commit.lsn,
+            pages_count: self.pages_count,
+            pages: Arc::clone(&self.pages),
+            undo_log: Arc::clone(&self.undo_log),
+        }
+
+        // let snapshot = {
+        //     let mut locked_snapshot = self.notify.snapshot.lock().unwrap();
+        //     if locked_snapshot.lsn() <= self.notify.last_seen_lsn() {
+        //         locked_snapshot = self.notify.notify.wait(locked_snapshot).unwrap();
+        //     }
+        //     Arc::clone(&locked_snapshot)
+        // };
+        // debug_assert!(snapshot.lsn() > self.notify.last_seen_lsn());
+        // self.notify.last_seen_lsn = snapshot.lsn();
+        // snapshot
     }
 }
 
 #[derive(Clone)]
 pub struct CommitNotify {
-    snapshot: Arc<Mutex<Arc<Snapshot>>>,
+    commit_lock: Arc<Mutex<()>>,
     commit: Arc<Option<Commit>>,
     last_seen_lsn: u64,
     notify: Arc<Condvar>,
+    pages_count: PageNo,
 }
 
 impl CommitNotify {
-    /// Blocks until next snapshot is available and returns it
-    ///
-    /// The next snapshot is the one that is the most recent at the time this method is called.
-    /// It might be several snapshots ahead of the last seen snapshot.
-    pub fn next_snapshot(&mut self) -> Arc<Snapshot> {
-        let snapshot = {
-            let mut locked_snapshot = self.snapshot.lock().unwrap();
-            if locked_snapshot.lsn() <= self.last_seen_lsn() {
-                locked_snapshot = self.notify.wait(locked_snapshot).unwrap();
-            }
-            Arc::clone(&locked_snapshot)
-        };
-        debug_assert!(snapshot.lsn() > self.last_seen_lsn());
-        self.last_seen_lsn = snapshot.lsn();
-        snapshot
-    }
-
     /// Blocks until next commit is available and returns it
     ///
     /// If several commits happened since the last call to this method, this function will return
@@ -717,7 +698,7 @@ impl CommitNotify {
         let last_commit = (*self.commit).as_ref().unwrap();
         dbg!(self.last_seen_lsn(), last_commit.lsn());
         if last_commit.next().is_none() {
-            let locked_commit = self.snapshot.lock().unwrap();
+            let locked_commit = self.commit_lock.lock().unwrap();
             // Need to check again after acquiring the lock, otherwise it is a race condition
             // because we speculatively checked the condition before acquiring the lock to prevent
             // contention when possible
@@ -739,7 +720,7 @@ impl CommitNotify {
 
     pub fn pages(&self) -> PageNo {
         // TODO is this correct? Can the number of pages change?
-        self.snapshot.lock().unwrap().pages()
+        self.pages_count
     }
 }
 
@@ -790,100 +771,14 @@ pub trait TxWrite: TxRead {
 /// by any changes made to the pool after the snapshot was taken.
 #[derive(Clone)]
 pub struct Snapshot {
-    /// A patches that have been applied in this snapshot.
-    patches: Vec<Patch>,
-
-    /// A reference to the base snapshot from which this snapshot was derived.
-    /// If present, the base snapshot represents the state of the page pool
-    /// immediately before the current snapshot's patches were applied.
-    base: Option<Arc<Snapshot>>,
-
-    /// The total number of pages represented by this snapshot. This is used to
-    /// validate read requests and ensure they do not exceed the bounds of the snapshot.
-    pages: PageNo,
-
-    /// A log sequence number (LSN) that uniquely identifies this snapshot. The LSN
-    /// is used internally to ensure that snapshots are applied in a linear and consistent order.
-    lsn: LSN,
-}
-
-impl Default for Snapshot {
-    fn default() -> Self {
-        Self {
-            patches: vec![],
-            base: None,
-            pages: 1,
-            lsn: 0,
-        }
-    }
-}
-
-impl Snapshot {
-    fn read_to_buf(self: &Arc<Self>, addr: Addr, buf: &mut [u8], buf_mask: &mut Vec<Range<usize>>) {
-        split_ptr_checked(addr, buf.len(), self.pages);
-
-        let mut snapshot = Some(Arc::clone(self));
-        while !buf_mask.is_empty() && snapshot.is_some() {
-            let s = snapshot.take().unwrap();
-
-            apply_patches(&s.patches, addr as usize, buf, buf_mask);
-            snapshot.clone_from(&s.base);
-        }
-    }
-
-    pub fn lsn(&self) -> LSN {
-        self.lsn
-    }
-
-    pub fn pages(&self) -> PageNo {
-        self.pages
-    }
-}
-
-impl TxRead for Arc<Snapshot> {
-    fn read(&self, addr: Addr, len: usize) -> Cow<[u8]> {
-        split_ptr_checked(addr, len, self.pages);
-
-        let mut buf = vec![0; len];
-        #[allow(clippy::single_range_in_vec_init)]
-        let mut buf_ranges = vec![0..len];
-
-        self.read_to_buf(addr, &mut buf, &mut buf_ranges);
-        Cow::Owned(buf)
-    }
-
-    fn valid_range(&self, addr: Addr, len: usize) -> bool {
-        is_valid_ptr(addr, len, self.pages)
-    }
-}
-
-impl Drop for Snapshot {
-    /// Custom drop logic is necessary here to prevent a stack overflow that could
-    /// occur due to recursive drop calls on a long chain of `Arc` references to base snapshot.
-    /// Each `Arc` decrement could potentially trigger the drop of another `Arc` in the chain,
-    /// leading to deep recursion.
-    ///
-    /// By explicitly unwrapping and handling the inner `Arc` references, we ensure that the drop sequence
-    /// is performed without any recursion
-    fn drop(&mut self) {
-        let mut next_base = self.base.take();
-        while let Some(base) = next_base {
-            next_base = Arc::try_unwrap(base)
-                .map(|mut base| base.base.take())
-                .unwrap_or(None);
-        }
-    }
-}
-
-struct Snap {
     pages_count: PageNo,
     undo_log: Arc<Option<UndoEntry>>,
     pages: Arc<Mutex<Vec<Page>>>,
-    base_lsn: LSN,
+    lsn: LSN,
 }
 
-impl Snap {
-    fn read_uncommited(&self, addr: Addr, len: usize, uncommited: &[Patch]) -> Cow<[u8]> {
+impl Snapshot {
+    fn read_uncommitted(&self, addr: Addr, len: usize, uncommitted: &[Patch]) -> Cow<[u8]> {
         split_ptr_checked(addr, len, self.pages_count);
 
         // Because apply_patches() is implementing first patch wins logic, the correct order of reading
@@ -913,28 +808,34 @@ impl Snap {
         let mut buf_mask = vec![0..len];
 
         // Apply own uncommitted changes
-        apply_patches(uncommited, addr as usize, &mut buf, &mut buf_mask);
+        apply_patches(uncommitted, addr as usize, &mut buf, &mut buf_mask);
 
         // Applying with undo log
         // We need to skip first entry in undo log, because it is describing how to undo the changes
         // of previously applied transaction.
         let mut log = (*self.undo_log).as_ref().unwrap().next.load_full();
         while let Some(undo) = log.as_ref() {
-            apply_patches(&undo.patches, addr as usize, &mut buf, &mut buf_mask);
+            if undo.lsn > self.lsn {
+                apply_patches(&undo.patches, addr as usize, &mut buf, &mut buf_mask);
+            }
             log = undo.next.load_full();
         }
 
         Cow::Owned(buf)
     }
+
+    pub fn lsn(&self) -> LSN {
+        self.lsn
+    }
 }
 
-impl TxRead for Snap {
+impl TxRead for Snapshot {
     fn valid_range(&self, addr: Addr, len: usize) -> bool {
         is_valid_ptr(addr, len, self.pages_count)
     }
 
     fn read(&self, addr: Addr, len: usize) -> Cow<[u8]> {
-        self.read_uncommited(addr, len, &[])
+        self.read_uncommitted(addr, len, &[])
     }
 }
 
@@ -969,66 +870,23 @@ impl Commit {
 #[derive(Clone)]
 pub struct Transaction {
     patches: Vec<Patch>,
-    pages_count: PageNo,
-    undo_log: Arc<Option<UndoEntry>>,
-    pages: Arc<Mutex<Vec<Page>>>,
-    base_lsn: LSN,
+    base: Snapshot,
 }
 
 impl TxRead for Transaction {
     fn valid_range(&self, addr: Addr, len: usize) -> bool {
-        is_valid_ptr(addr, len, self.pages_count)
+        self.base.valid_range(addr, len)
     }
 
     fn read(&self, addr: Addr, len: usize) -> Cow<[u8]> {
-        split_ptr_checked(addr, len, self.pages_count);
-
-        // Because apply_patches() is implementing first patch wins logic, the correct order of reading
-        // data at a given LSN is following:
-        //
-        // 1. Read whatever data is in the pages.
-        // 2. Apply changes from own patches. Any transaction should see its own not yet committed cnanges.
-        // 3. Apply changes from undo log, to restore the state of the page that is possibly changed
-        //    by concurrently committed transaction. This is needed to maintain REPETABLE READ
-        //    isolation guarantee.
-        let mut buf = vec![0; len];
-
-        // Reading the pages
-        {
-            let mut locked_pages = self.pages.lock().unwrap();
-            for (addr, range) in PageSegments::new(addr, len) {
-                let (page_no, offset) = split_ptr(addr);
-                let offset = offset as usize;
-                if let Some(page) = find_page(&mut locked_pages, page_no) {
-                    let len = range.len();
-                    buf[range].copy_from_slice(&page.data[offset..offset + len]);
-                }
-            }
-        }
-
-        #[allow(clippy::single_range_in_vec_init)]
-        let mut buf_mask = vec![0..len];
-
-        // Apply own uncommitted changes
-        apply_patches(&self.patches, addr as usize, &mut buf, &mut buf_mask);
-
-        // Applying with undo log
-        // We need to skip first entry in undo log, because it is describing how to undo the changes
-        // of previously applied transaction.
-        let mut log = (*self.undo_log).as_ref().unwrap().next.load_full();
-        while let Some(undo) = log.as_ref() {
-            apply_patches(&undo.patches, addr as usize, &mut buf, &mut buf_mask);
-            log = undo.next.load_full();
-        }
-
-        Cow::Owned(buf)
+        self.base.read_uncommitted(addr, len, &self.patches)
     }
 }
 
 impl TxWrite for Transaction {
     fn write(&mut self, addr: Addr, bytes: impl Into<Vec<u8>>) {
         let bytes = bytes.into();
-        split_ptr_checked(addr, bytes.len(), self.pages_count);
+        split_ptr_checked(addr, bytes.len(), self.base.pages_count);
 
         if !bytes.is_empty() {
             push_patch(&mut self.patches, Patch::Write(addr, bytes));
@@ -1036,7 +894,7 @@ impl TxWrite for Transaction {
     }
 
     fn reclaim(&mut self, addr: Addr, len: usize) {
-        split_ptr_checked(addr, len, self.pages_count);
+        split_ptr_checked(addr, len, self.base.pages_count);
         if len > 0 {
             push_patch(&mut self.patches, Patch::Reclaim(addr, len));
         }
@@ -2182,19 +2040,6 @@ mod tests {
         let a = String::from_utf8_lossy(a.as_ref());
         let b = String::from_utf8_lossy(b.as_ref());
         assert_eq!(a, b);
-    }
-
-    impl From<&[u8]> for Snapshot {
-        fn from(bytes: &[u8]) -> Self {
-            assert!(bytes.len() <= PAGE_SIZE, "String is too large");
-
-            Snapshot {
-                patches: vec![Patch::Write(0, bytes.to_vec())],
-                base: None,
-                pages: 1,
-                lsn: 1,
-            }
-        }
     }
 
     impl From<&str> for PagePool {

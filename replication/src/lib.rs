@@ -1,6 +1,6 @@
-use pmem::page::{CommitNotify, PagePool, PagePoolHandle, Patch, Snapshot, TxWrite, LSN};
+use pmem::page::{CommitNotify, PagePool, PagePoolHandle, Patch, TxWrite, LSN};
 use protocol::{Message, PROTOCOL_VERSION};
-use std::{borrow::Cow, fmt::Debug, io, net::SocketAddr, pin::pin, sync::Arc, thread};
+use std::{borrow::Cow, fmt::Debug, io, net::SocketAddr, pin::pin, thread};
 use tokio::{
     net::{TcpListener, TcpStream, ToSocketAddrs},
     sync,
@@ -69,29 +69,6 @@ async fn server_worker(mut socket: TcpStream, mut notify: CommitNotify) -> io::R
         Message::Commit(lsn).write_to(pin!(&mut socket)).await?;
     }
     Ok(())
-}
-
-pub struct PoolReplica {
-    pool: PagePool,
-    last_snapshot: Arc<Snapshot>,
-}
-
-impl PoolReplica {
-    pub fn new(pool: PagePool) -> Self {
-        let last_snapshot = Arc::new(Snapshot::default());
-        Self {
-            pool,
-            last_snapshot,
-        }
-    }
-
-    pub fn snapshot(&self) -> Arc<Snapshot> {
-        self.last_snapshot.clone()
-    }
-
-    pub fn commit_notify(&self) -> CommitNotify {
-        self.pool.commit_notify()
-    }
 }
 
 pub async fn replica_connect(
