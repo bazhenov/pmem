@@ -43,7 +43,7 @@ async fn main() {
         } else if cmd.trim() == "commit" {
             let mut s = state.lock().await;
             s.commit(&mut pool).await;
-            println!("Commited")
+            println!("Committed")
         } else {
             println!("Unknown command: {}", cmd)
         }

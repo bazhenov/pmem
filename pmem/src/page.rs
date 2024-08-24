@@ -10,9 +10,9 @@
 //!
 //! - [`PagePool`]: A collection of pages that can be snapshot, modified, and committed. It acts as the primary
 //!   interface for interacting with the page memory.
-//! - [`Snapshot`]: A snapshot represents the state of the page pool at a specific moment.
+//! - [`Transaction`]: A read/write session allowing modifications of the page pool.
 //!   It can be modified independently of the pool, and later committed back to the pool to update its state.
-//! - [`CommittedSnapshot`]: A snapshot that has been committed to the page pool. It is immutable and can be
+//! - [`Snapshot`]: A snapshot that has been committed to the page pool. It is immutable and can be
 //!   used to read data from the pool.
 //! - [`Patch`]: A modification recorded in a snapshot. It consists of the address where the modification starts and
 //!   the bytes that were written.
@@ -40,12 +40,12 @@
 //! // Create a handle for concurrent read-only access
 //! let mut handle = pool.handle();
 //!
-//! let mut snapshot = pool.snapshot(); // Create a snapshot of the current state
-//! snapshot.write(0, &[1, 2, 3, 4]);   // Write 4 bytes at offset 0 (uses TxWrite trait)
-//! pool.commit(snapshot);              // Commit the changes back to the pool
+//! let mut tx = pool.start();    // Create a new transaction
+//! tx.write(0, &[1, 2, 3, 4]);   // Write 4 bytes at offset 0
+//! pool.commit(tx);              // Commit the changes back to the pool
 //!
-//! let committed_snapshot = handle.wait_for_commit();
-//! assert_eq!(committed_snapshot.read(0, 4), vec![1, 2, 3, 4]); // Read using TxRead trait
+//! let snapshot = handle.wait_for_commit();
+//! assert_eq!(snapshot.read(0, 4), vec![1, 2, 3, 4]); // Read using TxRead trait
 //! ```
 //!
 //! The [`TxRead`] and [`TxWrite`] traits provide methods for reading from and writing to snapshots, respectively.
@@ -387,10 +387,10 @@ impl Page {
 ///
 /// ```
 /// # use pmem::page::{PagePool, TxWrite};
-/// let mut pool = PagePool::new(5);    // Initialize a pool with 5 pages
-/// let mut snapshot = pool.snapshot(); // Create a snapshot of the current state
-/// snapshot.write(0, &[0, 1, 2, 3]);   // Modify the snapshot
-/// pool.commit(snapshot);              // Commit the changes back to the pool
+/// let mut pool = PagePool::new(5);  // Initialize a pool with 5 pages
+/// let mut tx = pool.start();        // Create a new transaction
+/// tx.write(0, &[0, 1, 2, 3]);       // Modify the snapshot
+/// pool.commit(tx);                  // Commit the changes back to the pool
 /// ```
 ///
 /// This structure is particularly useful for systems that require consistent views of data
@@ -399,9 +399,9 @@ impl Page {
 pub struct PagePool {
     pages: Arc<Mutex<Vec<Page>>>,
 
-    /// Reference to the [`UndoEntry`] for the last commited transaction.
+    /// Reference to the [`UndoEntry`] for the last committed transaction.
     ///
-    /// When commiting a transaction, this is used to create a snapshot and subsequent commits
+    /// When committing a transaction, this is used to create a snapshot and subsequent commits
     /// will append undo log with the changes required to maintain REPEATABLE READ isolation level for the
     /// snapshot.
     ///
@@ -471,10 +471,9 @@ impl PagePool {
     ///
     /// ```
     /// # use pmem::page::PagePool;
-    /// # let mut pool = PagePool::new(5);
-    /// let snapshot = pool.snapshot();
-    /// // The snapshot can now be modified, and those modifications
-    /// // won't affect the original pool until committed.
+    /// let mut pool = PagePool::new(1);
+    /// let tx = pool.start();
+    /// // tx modifications won't affect the original pool until committed.
     /// ```
     ///
     /// # Returns
@@ -490,7 +489,7 @@ impl PagePool {
         debug_assert!(self.undo_log.is_some());
         Transaction {
             patches: vec![],
-            base: Arc::clone(&base),
+            base_lsn: self.lsn,
             pages_count: pages,
             pages: Arc::clone(&self.pages),
             undo_log: Arc::clone(&self.undo_log),
@@ -516,8 +515,9 @@ impl PagePool {
         let lsn = self.lsn + 1;
 
         let mut latest = self.latest.lock().unwrap();
-        assert!(
-            Arc::ptr_eq(&latest, &tx.base),
+        assert_eq!(
+            latest.lsn(),
+            tx.base_lsn,
             "Proposed transaction is not linear"
         );
 
@@ -682,8 +682,7 @@ impl CommitNotify {
     /// Blocks until next snapshot is available and returns it
     ///
     /// The next snapshot is the one that is the most recent at the time this method is called.
-    /// It might be several snapshots ahead of the last seen snapshot. All intermediate snapshots
-    /// can be seen by using [`CommittedSnapshot::find_at_lsn()`]
+    /// It might be several snapshots ahead of the last seen snapshot.
     pub fn next_snapshot(&mut self) -> Arc<Snapshot> {
         let snapshot = {
             let mut locked_snapshot = self.snapshot.lock().unwrap();
@@ -769,15 +768,13 @@ pub trait TxWrite: TxRead {
 
 /// Represents a committed snapshot of a page pool.
 ///
-/// A `CommittedSnapshot` captures the state of a page pool at a specific point in time,
+/// A `Snapshot` captures the state of a page pool at a specific point in time,
 /// including any patches (modifications) that have been applied up to that point. It serves
 /// as a read-only view into the historical state of the pool, allowing for consistent reads
 /// of pages as they existed at the time of the snapshot.
 ///
-/// Each `CommittedSnapshot` can optionally reference a base snapshot, forming a chain
-/// that represents the full history of modifications leading up to the current state.
-/// This chain is traversed backwards when reading from a snapshot to reconstruct the state
-/// of a page by applying patches in reverse chronological order.
+/// Snapshots are following repeatable read isolation level, meaning that they are not affected
+/// by any changes made to the pool after the snapshot was taken.
 #[derive(Clone)]
 pub struct Snapshot {
     /// A patches that have been applied in this snapshot.
@@ -896,10 +893,10 @@ impl Commit {
 #[derive(Clone)]
 pub struct Transaction {
     patches: Vec<Patch>,
-    base: Arc<Snapshot>,
     pages_count: PageNo,
     undo_log: Arc<Option<UndoEntry>>,
     pages: Arc<Mutex<Vec<Page>>>,
+    base_lsn: LSN,
 }
 
 impl TxRead for Transaction {
