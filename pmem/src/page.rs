@@ -399,19 +399,19 @@ impl Page {
 pub struct PagePool {
     pages: Arc<Mutex<Vec<Page>>>,
 
-    /// Contains reference the last position in UndoLog.
+    /// Reference to the [`UndoEntry`] for the last commited transaction.
     ///
-    /// UndoLog is referenced from old to new and only last position is stored in PagePool.
-    /// When creating a snapshot, the last position is used to create a snapshot and subsequent commits
-    /// will append undo log with the chaines required to maintain REPEATABLE READ isolation level for the
+    /// When commiting a transaction, this is used to create a snapshot and subsequent commits
+    /// will append undo log with the changes required to maintain REPEATABLE READ isolation level for the
     /// snapshot.
     ///
     /// Ideally [`Self::undo_log`] should not contain `Option`, because it is required to be present
     /// for the snapshot to be created. Unfortunately, this is not possible due to the fact
-    /// that [`UndoLog::next`] which is [`ArcSwap`] should contains `Option` to be able
+    /// that [`UndoEntry::next`] which is [`ArcSwap`] should contains `Option` to be able
     /// to stop reference chain at some point and we can not have both `Arc<T>` and `Arc<Option<T>>` as the same time.
     undo_log: Arc<Option<UndoEntry>>,
-    latest: Arc<Mutex<Arc<CommittedSnapshot>>>,
+    latest: Arc<Mutex<Arc<Snapshot>>>,
+    commit_log: Arc<Option<Commit>>,
     lsn: LSN,
     notify: Arc<Condvar>,
 }
@@ -429,10 +429,15 @@ impl PagePool {
     ///   the range of valid addresses that can be written to in snapshots derived from this pool.
     pub fn new(pages: usize) -> Self {
         assert!(pages > 0, "The number of pages must be greater than 0");
-        let snapshot = CommittedSnapshot {
+        let snapshot = Snapshot {
             patches: vec![],
             base: None,
             pages: u32::try_from(pages).unwrap(),
+            lsn: 0,
+        };
+        let commit = Commit {
+            patches: vec![],
+            next: ArcSwap::from_pointee(None),
             lsn: 0,
         };
         let mut pages = Vec::with_capacity(snapshot.pages() as usize);
@@ -442,6 +447,7 @@ impl PagePool {
         Self {
             pages: Arc::new(Mutex::new(pages)),
             undo_log: Arc::new(Some(UndoEntry::default())),
+            commit_log: Arc::new(Some(commit)),
             latest: Arc::new(Mutex::new(Arc::new(snapshot))),
             notify: Arc::new(Condvar::new()),
             lsn: 0,
@@ -477,12 +483,12 @@ impl PagePool {
     /// changing state of the page pool.
     ///
     /// [`commit`]: Self::commit
-    pub fn snapshot(&self) -> Snapshot {
+    pub fn start(&self) -> Transaction {
         let base = self.latest.lock().unwrap();
         let pages = base.pages;
 
         debug_assert!(self.undo_log.is_some());
-        Snapshot {
+        Transaction {
             patches: vec![],
             base: Arc::clone(&base),
             pages_count: pages,
@@ -504,15 +510,15 @@ impl PagePool {
     /// # Arguments
     ///
     /// * `snapshot` - A snapshot containing modifications to commit to the page pool.
-    pub fn commit(&mut self, snapshot: impl Into<Snapshot>) -> u64 {
-        let snapshot = snapshot.into();
+    pub fn commit(&mut self, tx: impl Into<Transaction>) -> u64 {
+        let tx = tx.into();
 
         let lsn = self.lsn + 1;
 
         let mut latest = self.latest.lock().unwrap();
         assert!(
-            Arc::ptr_eq(&latest, &snapshot.base),
-            "Proposed snapshot is not linear"
+            Arc::ptr_eq(&latest, &tx.base),
+            "Proposed transaction is not linear"
         );
 
         // Updating pages and undo log
@@ -520,8 +526,8 @@ impl PagePool {
             let mut locked_pages: MutexGuard<Vec<Page>> = self.pages.lock().unwrap();
 
             // Updating undo log and page data
-            let mut patches = Vec::with_capacity(snapshot.patches.len());
-            for patch in &snapshot.patches {
+            let mut patches = Vec::with_capacity(tx.patches.len());
+            for patch in &tx.patches {
                 let segments = PageSegments::new(patch.addr(), patch.len());
                 let mut undo_patch = vec![0; patch.len()];
                 for (addr, slice_range) in segments {
@@ -555,10 +561,22 @@ impl PagePool {
         }
 
         // Updating redo log
-        let new_snapshot = Arc::new(CommittedSnapshot {
-            patches: snapshot.patches,
+        let new_commit = Arc::new(Some(Commit {
+            patches: tx.patches.clone(),
+            next: ArcSwap::from_pointee(None),
+            lsn,
+        }));
+        (*self.commit_log)
+            .as_ref()
+            .expect("Commit log is missing")
+            .next
+            .store(Arc::clone(&new_commit));
+        self.commit_log = new_commit;
+
+        let new_snapshot = Arc::new(Snapshot {
+            patches: tx.patches,
             base: Some(Arc::clone(&latest)),
-            pages: snapshot.pages_count,
+            pages: tx.pages_count,
             lsn,
         });
 
@@ -575,13 +593,13 @@ impl PagePool {
         CommitNotify {
             last_seen_lsn: snapshot.lsn,
             notify: Arc::clone(&self.notify),
+            commit: Arc::clone(&self.commit_log),
             snapshot: Arc::clone(&self.latest),
         }
     }
 
     pub fn handle(&self) -> PagePoolHandle {
         PagePoolHandle {
-            latest: Arc::clone(&self.latest),
             notify: self.commit_notify(),
         }
     }
@@ -624,6 +642,10 @@ fn find_page<'a>(pages: &'a mut MutexGuard<Vec<Page>>, page: PageNo) -> Option<&
         .map(|idx| &mut pages[idx])
 }
 
+/// Describes a changes that need to be applied to the page to restore it to the state
+/// before particular transaction was committed.
+///
+/// `UndoEntry` is referenced from old to new and only last position is stored in [`PagePool`].
 #[derive(Default)]
 struct UndoEntry {
     next: ArcSwap<Option<UndoEntry>>,
@@ -639,28 +661,19 @@ impl From<Vec<Patch>> for UndoEntry {
 
 #[derive(Clone)]
 pub struct PagePoolHandle {
-    latest: Arc<Mutex<Arc<CommittedSnapshot>>>,
     notify: CommitNotify,
 }
 
 impl PagePoolHandle {
-    pub fn wait_for_commit(&mut self) -> Arc<CommittedSnapshot> {
+    pub fn wait_for_commit(&mut self) -> Arc<Snapshot> {
         self.notify.next_snapshot()
-    }
-
-    /// Waits for and returns an earliest snapshot with LSM equal or greater than a given LSN
-    pub fn wait_for_lsn(&mut self, expected_lsn: LSN) -> Arc<CommittedSnapshot> {
-        let mut snapshot = Arc::clone(&self.latest.lock().unwrap());
-        while snapshot.lsn() < expected_lsn {
-            snapshot = self.notify.next_snapshot();
-        }
-        snapshot.find_at_lsn(expected_lsn).unwrap()
     }
 }
 
 #[derive(Clone)]
 pub struct CommitNotify {
-    snapshot: Arc<Mutex<Arc<CommittedSnapshot>>>,
+    snapshot: Arc<Mutex<Arc<Snapshot>>>,
+    commit: Arc<Option<Commit>>,
     last_seen_lsn: u64,
     notify: Arc<Condvar>,
 }
@@ -671,7 +684,7 @@ impl CommitNotify {
     /// The next snapshot is the one that is the most recent at the time this method is called.
     /// It might be several snapshots ahead of the last seen snapshot. All intermediate snapshots
     /// can be seen by using [`CommittedSnapshot::find_at_lsn()`]
-    pub fn next_snapshot(&mut self) -> Arc<CommittedSnapshot> {
+    pub fn next_snapshot(&mut self) -> Arc<Snapshot> {
         let snapshot = {
             let mut locked_snapshot = self.snapshot.lock().unwrap();
             if locked_snapshot.lsn() <= self.last_seen_lsn() {
@@ -682,6 +695,30 @@ impl CommitNotify {
         debug_assert!(snapshot.lsn() > self.last_seen_lsn());
         self.last_seen_lsn = snapshot.lsn();
         snapshot
+    }
+
+    /// Blocks until next commit is available and returns it
+    ///
+    /// If several commits happened since the last call to this method, this function will return
+    /// all of them in order.
+    pub fn next_commit(&mut self) -> &Commit {
+        let last_commit = (*self.commit).as_ref().unwrap();
+        dbg!(self.last_seen_lsn(), last_commit.lsn());
+        if last_commit.next().is_none() {
+            let locked_commit = self.snapshot.lock().unwrap();
+            // Need to check again after acquiring the lock, otherwise it is a race condition
+            // because we speculatively checked the condition before acquiring the lock to prevent
+            // contention when possible
+            if last_commit.next().is_none() {
+                println!("Waiting...");
+                drop(self.notify.wait(locked_commit).unwrap());
+            }
+        }
+        // let last_commit = (*self.commit).as_ref().unwrap();
+        let next_commit = last_commit.next();
+        debug_assert!((*next_commit).as_ref().unwrap().lsn() > self.last_seen_lsn());
+        self.commit = Arc::clone(&next_commit);
+        (*self.commit).as_ref().unwrap()
     }
 
     pub fn last_seen_lsn(&self) -> u64 {
@@ -742,14 +779,14 @@ pub trait TxWrite: TxRead {
 /// This chain is traversed backwards when reading from a snapshot to reconstruct the state
 /// of a page by applying patches in reverse chronological order.
 #[derive(Clone)]
-pub struct CommittedSnapshot {
+pub struct Snapshot {
     /// A patches that have been applied in this snapshot.
     patches: Vec<Patch>,
 
     /// A reference to the base snapshot from which this snapshot was derived.
     /// If present, the base snapshot represents the state of the page pool
     /// immediately before the current snapshot's patches were applied.
-    base: Option<Arc<CommittedSnapshot>>,
+    base: Option<Arc<Snapshot>>,
 
     /// The total number of pages represented by this snapshot. This is used to
     /// validate read requests and ensure they do not exceed the bounds of the snapshot.
@@ -760,7 +797,7 @@ pub struct CommittedSnapshot {
     lsn: LSN,
 }
 
-impl Default for CommittedSnapshot {
+impl Default for Snapshot {
     fn default() -> Self {
         Self {
             patches: vec![],
@@ -771,11 +808,7 @@ impl Default for CommittedSnapshot {
     }
 }
 
-impl CommittedSnapshot {
-    pub fn patches(&self) -> &[Patch] {
-        self.patches.as_slice()
-    }
-
+impl Snapshot {
     fn read_to_buf(self: &Arc<Self>, addr: Addr, buf: &mut [u8], buf_mask: &mut Vec<Range<usize>>) {
         split_ptr_checked(addr, buf.len(), self.pages);
 
@@ -788,19 +821,6 @@ impl CommittedSnapshot {
         }
     }
 
-    /// Returns first snapshot in the chain that has LSN greater or equal to the provided LSN or newer.
-    pub fn find_at_lsn(self: &Arc<Self>, lsn: LSN) -> Option<Arc<Self>> {
-        let mut snapshot = self;
-        while let Some(s) = snapshot.base.as_ref() {
-            if s.lsn < lsn {
-                break;
-            } else {
-                snapshot = s;
-            }
-        }
-        (snapshot.lsn >= lsn).then(|| Arc::clone(snapshot))
-    }
-
     pub fn lsn(&self) -> LSN {
         self.lsn
     }
@@ -810,7 +830,7 @@ impl CommittedSnapshot {
     }
 }
 
-impl TxRead for Arc<CommittedSnapshot> {
+impl TxRead for Arc<Snapshot> {
     fn read(&self, addr: Addr, len: usize) -> Cow<[u8]> {
         split_ptr_checked(addr, len, self.pages);
 
@@ -827,7 +847,7 @@ impl TxRead for Arc<CommittedSnapshot> {
     }
 }
 
-impl Drop for CommittedSnapshot {
+impl Drop for Snapshot {
     /// Custom drop logic is necessary here to prevent a stack overflow that could
     /// occur due to recursive drop calls on a long chain of `Arc` references to base snapshot.
     /// Each `Arc` decrement could potentially trigger the drop of another `Arc` in the chain,
@@ -845,28 +865,44 @@ impl Drop for CommittedSnapshot {
     }
 }
 
-#[derive(Clone)]
-pub struct Snapshot {
+pub struct Commit {
+    /// A patches that have been applied in this snapshot.
     patches: Vec<Patch>,
-    base: Arc<CommittedSnapshot>,
+
+    /// A reference to the base snapshot from which this snapshot was derived.
+    /// If present, the base snapshot represents the state of the page pool
+    /// immediately before the current snapshot's patches were applied.
+    next: ArcSwap<Option<Commit>>,
+
+    /// A log sequence number (LSN) that uniquely identifies this snapshot. The LSN
+    /// is used internally to ensure that snapshots are applied in a linear and consistent order.
+    lsn: LSN,
+}
+
+impl Commit {
+    pub fn patches(&self) -> &[Patch] {
+        self.patches.as_slice()
+    }
+
+    pub fn lsn(&self) -> LSN {
+        self.lsn
+    }
+
+    pub fn next(&self) -> Arc<Option<Commit>> {
+        self.next.load_full()
+    }
+}
+
+#[derive(Clone)]
+pub struct Transaction {
+    patches: Vec<Patch>,
+    base: Arc<Snapshot>,
     pages_count: PageNo,
     undo_log: Arc<Option<UndoEntry>>,
     pages: Arc<Mutex<Vec<Page>>>,
 }
 
-impl Snapshot {
-    pub fn base(&self) -> Arc<CommittedSnapshot> {
-        Arc::clone(&self.base)
-    }
-
-    /// Returns the log sequence number (LSN) of the committed snapshot that this snapshot is based on.
-    #[cfg(test)]
-    fn committed_lsn(&self) -> u64 {
-        self.base.lsn
-    }
-}
-
-impl TxRead for Snapshot {
+impl TxRead for Transaction {
     fn valid_range(&self, addr: Addr, len: usize) -> bool {
         is_valid_ptr(addr, len, self.pages_count)
     }
@@ -916,7 +952,7 @@ impl TxRead for Snapshot {
     }
 }
 
-impl TxWrite for Snapshot {
+impl TxWrite for Transaction {
     fn write(&mut self, addr: Addr, bytes: impl Into<Vec<u8>>) {
         let bytes = bytes.into();
         split_ptr_checked(addr, bytes.len(), self.pages_count);
@@ -1235,17 +1271,17 @@ mod tests {
         // In several places in codebase we assume that first commit has LSN 1
         // and LSN 0 is synthetic LSN used for base empty snapshot
         let mut mem = PagePool::default();
-        let snapshot = mem.snapshot();
-        assert_eq!(mem.commit(snapshot), 1);
+        let tx = mem.start();
+        assert_eq!(mem.commit(tx), 1);
     }
 
     #[test]
     fn committed_changes_should_be_visible_on_a_page() {
         let mut mem = PagePool::from("Jekyll");
 
-        let mut snapshot = mem.snapshot();
-        snapshot.write(0, b"Hide");
-        mem.commit(snapshot);
+        let mut tx = mem.start();
+        tx.write(0, b"Hide");
+        mem.commit(tx);
 
         assert_str_eq(mem.read(0, 4), b"Hide");
     }
@@ -1254,10 +1290,10 @@ mod tests {
     fn uncommitted_changes_should_be_visible_only_on_the_snapshot() {
         let mem = PagePool::from("Jekyll");
 
-        let mut snapshot = mem.snapshot();
-        snapshot.write(0, b"Hide");
+        let mut tx = mem.start();
+        tx.write(0, b"Hide");
 
-        assert_str_eq(snapshot.read(0, 4), "Hide");
+        assert_str_eq(tx.read(0, 4), "Hide");
         assert_str_eq(mem.read(0, 6), "Jekyll");
     }
 
@@ -1265,15 +1301,15 @@ mod tests {
     fn snapshot_should_provide_repeatable_read_isolation() {
         let mut mem = PagePool::default();
 
-        let mut hide = mem.snapshot();
+        let mut hide = mem.start();
         hide.write(0, b"Hide");
         mem.commit(hide);
-        let hide = mem.snapshot();
+        let hide = mem.start();
 
-        let mut jekyll = mem.snapshot();
+        let mut jekyll = mem.start();
         jekyll.write(0, b"Jekyll");
         mem.commit(jekyll);
-        let jekyll = mem.snapshot();
+        let jekyll = mem.start();
 
         assert_eq!(&*jekyll.read(0, 6), b"Jekyll");
         assert_eq!(&*hide.read(0, 6), b"Hide\0\0");
@@ -1283,9 +1319,9 @@ mod tests {
     fn patch_page() {
         let mut mem = PagePool::from("Hello panic!");
 
-        let mut snapshot = mem.snapshot();
-        snapshot.write(6, b"world");
-        mem.commit(snapshot);
+        let mut tx = mem.start();
+        tx.write(6, b"world");
+        mem.commit(tx);
 
         assert_str_eq(mem.read(0, 12), "Hello world!");
         assert_str_eq(mem.read(0, 8), "Hello wo");
@@ -1299,13 +1335,13 @@ mod tests {
     fn test_regression() {
         let mut mem = PagePool::default();
 
-        let mut snapshot = mem.snapshot();
-        snapshot.write(70, [0, 0, 1]);
-        mem.commit(snapshot);
-        let mut snapshot = mem.snapshot();
-        snapshot.reclaim(71, 2);
-        snapshot.write(73, [0]);
-        mem.commit(snapshot);
+        let mut tx = mem.start();
+        tx.write(70, [0, 0, 1]);
+        mem.commit(tx);
+        let mut tx = mem.start();
+        tx.reclaim(71, 2);
+        tx.write(73, [0]);
+        mem.commit(tx);
 
         assert_eq!(mem.read(70, 4).as_ref(), [0, 0, 0, 0]);
     }
@@ -1314,15 +1350,15 @@ mod tests {
     fn test_regression2() {
         let mut mem = PagePool::default();
 
-        let mut snapshot = mem.snapshot();
-        snapshot.write(70, [0, 0, 1]);
-        mem.commit(snapshot);
-        let mut snapshot = mem.snapshot();
-        snapshot.write(0, [0]);
-        mem.commit(snapshot);
-        let mut snapshot = mem.snapshot();
-        snapshot.reclaim(71, 2);
-        mem.commit(snapshot);
+        let mut tx = mem.start();
+        tx.write(70, [0, 0, 1]);
+        mem.commit(tx);
+        let mut tx = mem.start();
+        tx.write(0, [0]);
+        mem.commit(tx);
+        let mut tx = mem.start();
+        tx.reclaim(71, 2);
+        mem.commit(tx);
 
         assert_eq!(mem.read(70, 4).as_ref(), [0, 0, 0, 0]);
     }
@@ -1335,14 +1371,14 @@ mod tests {
         let addr = PAGE_SIZE as Addr - 2;
         let alice = b"Alice";
 
-        let mut snapshot = mem.snapshot();
-        snapshot.write(addr, alice);
+        let mut tx = mem.start();
+        tx.write(addr, alice);
 
         // Checking that data is visible in snapshot
-        assert_str_eq(snapshot.read(addr, alice.len()), alice);
+        assert_str_eq(tx.read(addr, alice.len()), alice);
 
         // Checking that data is visible after commit to page pool
-        mem.commit(snapshot);
+        mem.commit(tx);
         assert_str_eq(mem.read(addr, alice.len()), alice);
     }
 
@@ -1351,8 +1387,8 @@ mod tests {
         let data = [1, 2, 3, 4, 5];
         let mem = PagePool::from(data.as_slice());
 
-        let snapshot = mem.snapshot();
-        assert_eq!(snapshot.read(0, 5), data.as_slice());
+        let tx = mem.start();
+        assert_eq!(tx.read(0, 5), data.as_slice());
     }
 
     #[test]
@@ -1360,26 +1396,24 @@ mod tests {
         let data = [1, 2, 3, 4, 5];
         let mem = PagePool::from(data.as_slice());
 
-        let mut snapshot = mem.snapshot();
-        snapshot.reclaim(1, 3);
+        let mut tx = mem.start();
+        tx.reclaim(1, 3);
 
-        assert_eq!(snapshot.read(0, 5), [1u8, 0, 0, 0, 5].as_slice());
+        assert_eq!(tx.read(0, 5), [1u8, 0, 0, 0, 5].as_slice());
     }
 
     #[test]
     #[should_panic(expected = "Address range is out of bounds")]
     fn must_panic_on_oob_read() {
         // reading in a such a way that start address is still valid, but end address is not
-        PagePool::default()
-            .snapshot()
-            .read(PAGE_SIZE as Addr - 10, 20);
+        PagePool::default().start().read(PAGE_SIZE as Addr - 10, 20);
     }
 
     #[test]
     #[should_panic(expected = "Address range is out of bounds")]
     fn must_panic_on_oob_write() {
         PagePool::default()
-            .snapshot()
+            .start()
             .write(PAGE_SIZE as Addr - 10, [0; 20]);
     }
 
@@ -1387,7 +1421,7 @@ mod tests {
     #[should_panic(expected = "Address range is out of bounds")]
     fn must_panic_on_oob_reclaim() {
         PagePool::default()
-            .snapshot()
+            .start()
             .reclaim(PAGE_SIZE as Addr - 10, 20);
     }
 
@@ -1402,7 +1436,7 @@ mod tests {
             .spawn(|| {
                 let mut mem = PagePool::new(100);
                 for _ in 0..1000 {
-                    mem.commit(mem.snapshot());
+                    mem.commit(mem.start());
                 }
             })
             .unwrap()
@@ -1417,9 +1451,9 @@ mod tests {
         let mut handle = pool.handle();
 
         let lsn = thread::spawn(move || {
-            let mut snapshot = pool.snapshot();
-            snapshot.write(0, [1, 2, 3, 4]);
-            pool.commit(snapshot)
+            let mut tx = pool.start();
+            tx.write(0, [1, 2, 3, 4]);
+            pool.commit(tx)
         });
 
         let commit = handle.wait_for_commit();
@@ -1435,19 +1469,20 @@ mod tests {
         let mut pool = PagePool::new(1);
         let mut n1 = pool.commit_notify();
         let mut n2 = pool.commit_notify();
-        let current_lsn = pool.snapshot().committed_lsn();
 
-        thread::spawn(move || {
-            let mut snapshot = pool.snapshot();
-            snapshot.write(0, [1]);
-            pool.commit(snapshot);
+        let lsn = thread::spawn(move || {
+            let mut tx = pool.start();
+            tx.write(0, [1]);
+            pool.commit(tx)
         });
 
-        let lsn2 = n2.next_snapshot().lsn;
-        let lsn1 = n1.next_snapshot().lsn;
+        let lsn2 = n2.next_commit().lsn();
+        let lsn1 = n1.next_commit().lsn();
 
-        assert_eq!(lsn1, current_lsn + 1);
-        assert_eq!(lsn2, current_lsn + 1);
+        let lsn = lsn.join().unwrap();
+
+        assert_eq!(lsn1, lsn);
+        assert_eq!(lsn2, lsn);
     }
 
     #[test]
@@ -1456,38 +1491,30 @@ mod tests {
         let mut notify = pool.commit_notify();
 
         for i in 1..=10 {
-            let mut snapshot = pool.snapshot();
-            snapshot.write(i, [i as u8]);
-            pool.commit(snapshot);
+            let mut tx = pool.start();
+            tx.write(i, [i as u8]);
+            pool.commit(tx);
         }
 
-        let snapshot = notify.next_snapshot();
-        assert_eq!(snapshot.lsn, 10);
-
         for lsn in 1..=10 {
-            let s = snapshot
-                .find_at_lsn(lsn)
-                .expect("Unable to find intermediate snapshot");
-            assert_eq!(&*s.read(lsn, 1), &[lsn as u8]);
+            let commit = notify.next_commit();
+            assert_eq!(lsn, commit.lsn());
         }
     }
 
     #[test]
-    fn can_wait_for_a_given_snapshot() {
+    fn can_wait_for_a_snapshot_in_a_thread() {
         let mut pool = PagePool::new(1);
-        let mut handle = pool.handle();
+        let mut notify = pool.commit_notify();
 
-        let latest_lsn = pool.snapshot().committed_lsn();
-        let snapshot = thread::spawn(move || handle.wait_for_lsn(latest_lsn + 5));
+        let lsn = thread::spawn(move || notify.next_commit().lsn());
 
-        for i in 0..10 {
-            let mut snapshot = pool.snapshot();
-            snapshot.write(0, [i]);
-            pool.commit(snapshot);
-        }
+        let mut tx = pool.start();
+        tx.write(0, [0]);
+        let expected_lsn = pool.commit(tx);
 
-        let snapshot = snapshot.join().unwrap();
-        assert_eq!(snapshot.lsn(), latest_lsn + 5);
+        let lsn = lsn.join().unwrap();
+        assert_eq!(lsn, expected_lsn);
     }
 
     #[test]
@@ -1754,23 +1781,23 @@ mod tests {
                 let mut mem = PagePool::with_capacity(DB_SIZE);
 
                 for patches in snapshots {
-                    let mut snapshot = mem.snapshot();
+                    let mut tx = mem.start();
                     for patch in patches {
                         let offset = patch.addr() as usize;
                         let range = offset..offset + patch.len();
                         match patch {
                             Patch::Write(offset, bytes) => {
                                 shadow_buffer[range].copy_from_slice(bytes.as_slice());
-                                snapshot.write(offset, bytes);
+                                tx.write(offset, bytes);
                             },
                             Patch::Reclaim(offset, len) => {
                                 shadow_buffer[range].fill(0);
-                                snapshot.reclaim(offset, len);
+                                tx.reclaim(offset, len);
 
                             }
                         }
                     }
-                    mem.commit(snapshot);
+                    mem.commit(tx);
                 }
 
                 assert_buffers_eq(&mem.read(0, DB_SIZE), shadow_buffer.as_slice())?;
@@ -2055,11 +2082,11 @@ mod tests {
         assert_eq!(a, b);
     }
 
-    impl From<&[u8]> for CommittedSnapshot {
+    impl From<&[u8]> for Snapshot {
         fn from(bytes: &[u8]) -> Self {
             assert!(bytes.len() <= PAGE_SIZE, "String is too large");
 
-            CommittedSnapshot {
+            Snapshot {
                 patches: vec![Patch::Write(0, bytes.to_vec())],
                 base: None,
                 pages: 1,
@@ -2078,9 +2105,9 @@ mod tests {
         fn from(value: &[u8]) -> Self {
             let capactiy = PAGE_SIZE.max(value.len());
             let mut pool = PagePool::with_capacity(capactiy);
-            let mut snapshot = pool.snapshot();
-            snapshot.write(0, value);
-            pool.commit(snapshot);
+            let mut tx = pool.start();
+            tx.write(0, value);
+            pool.commit(tx);
             pool
         }
     }

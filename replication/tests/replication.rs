@@ -1,8 +1,6 @@
-use pmem::page::{
-    Addr, CommittedSnapshot, PagePool, PagePoolHandle, Snapshot, TxRead, TxWrite, PAGE_SIZE,
-};
+use pmem::page::{Addr, PagePool, PagePoolHandle, Transaction, TxRead, TxWrite, PAGE_SIZE};
 use replication::{replica_connect, start_replication_server};
-use std::{io, net::SocketAddr, sync::Arc};
+use std::{io, net::SocketAddr};
 use tokio::task::{spawn_blocking, JoinHandle};
 
 #[tokio::test]
@@ -78,17 +76,18 @@ impl MasterAndReplica {
     }
 
     /// Write to master, wait for replica to catch up and returns corresponding snapshot from replica
-    async fn master_write(&mut self, f: impl Fn(&mut Snapshot)) -> Arc<CommittedSnapshot> {
-        let mut snapshot = self.master_pool.snapshot();
-        f(&mut snapshot);
-        let lsn = self.master_pool.commit(snapshot);
+    async fn master_write(&mut self, f: impl Fn(&mut Transaction)) -> impl TxRead {
+        let mut notify = self.master_pool.commit_notify();
+        let mut tx = self.master_pool.start();
+        f(&mut tx);
+        let lsn = self.master_pool.commit(tx);
 
-        let mut handle = self.replica_handle.clone();
         // Waiting for replica to catch up
         // We need to spawn_blocking here because replica.wait_for_commit() is a blocking call
         // if Runtime is not multithreaded it may block the only thread that is running server async tasks
-        spawn_blocking(move || handle.wait_for_lsn(lsn))
+        spawn_blocking(move || while notify.next_commit().lsn() < lsn {})
             .await
-            .unwrap()
+            .unwrap();
+        self.master_pool.start()
     }
 }

@@ -1073,7 +1073,7 @@ impl<'a, S: TxRead> fmt::Debug for FsTree<'a, S> {
 mod tests {
     use super::*;
     use fmt::Debug;
-    use pmem::page::{PagePool, Snapshot};
+    use pmem::page::{PagePool, Transaction};
     use std::{collections::HashSet, fs};
 
     macro_rules! assert_not_exists {
@@ -1328,16 +1328,16 @@ mod tests {
         let (mut fs_a, mut mem) = create_fs();
         mkdirs(&mut fs_a, &["/etc"]);
         mem.commit(fs_a.finish());
-        let snapshot_a = mem.snapshot();
+        let tx_a = mem.start();
 
-        let mut fs_b = Filesystem::open(mem.snapshot());
+        let mut fs_b = Filesystem::open(mem.start());
         fs_b.delete(&fs_b.get_root()?, "etc")?;
         mkdirs(&mut fs_b, &["/bin"]);
         mem.commit(fs_b.finish());
-        let snapshot_b = mem.snapshot();
+        let tx_b = mem.start();
 
-        let fs_a = Filesystem::open(snapshot_a);
-        let fs_b = Filesystem::open(snapshot_b);
+        let fs_a = Filesystem::open(tx_a);
+        let fs_b = Filesystem::open(tx_b);
 
         let (added, deleted) = fs_changes(&fs_a, &fs_b);
 
@@ -1559,9 +1559,9 @@ mod tests {
         }
     }
 
-    fn create_fs() -> (Filesystem<Snapshot>, PagePool) {
+    fn create_fs() -> (Filesystem<Transaction>, PagePool) {
         let page_pool = PagePool::new(1);
-        (Filesystem::allocate(page_pool.snapshot()), page_pool)
+        (Filesystem::allocate(page_pool.start()), page_pool)
     }
 
     /// A filesystem action that can be applied to a filesystem
@@ -1679,7 +1679,7 @@ mod tests {
             #[test]
             fn can_write_file(ops in vec(any_write_operation(), 0..10)) {
                 let pool = PagePool::with_capacity(1024 * 1024);
-                let mut fs = Filesystem::allocate(pool.snapshot());
+                let mut fs = Filesystem::allocate(pool.start());
 
                 let tmp_dir = TempDir::new()?;
                 let root = fs.get_root()?;

@@ -1,6 +1,6 @@
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use pmem::page::PagePool;
-use rfs::{nfs::RFS, ChangeKind, Filesystem};
+use rfs::{nfs::RFS, Filesystem};
 use std::io::{self, Write};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
@@ -17,12 +17,12 @@ async fn main() {
         .init();
 
     let mut pool = PagePool::with_capacity(100 * 1024 * 1024);
-    let tx = Filesystem::allocate(pool.snapshot()).finish();
+    let tx = Filesystem::allocate(pool.start()).finish();
     pool.commit(tx);
 
     let commit_notify = pool.commit_notify();
 
-    let rfs = RFS::new(pool.snapshot());
+    let rfs = RFS::new(pool.start());
     let state = rfs.state_handle();
     let listener = NFSTcpListener::bind(&format!("127.0.0.1:{HOSTPORT}"), rfs)
         .await
@@ -41,18 +41,9 @@ async fn main() {
         if cmd.trim() == "exit" {
             break;
         } else if cmd.trim() == "commit" {
-            let changes = {
-                let mut s = state.lock().await;
-                s.commit_and_get_changes(&mut pool).await
-            };
-            for change in changes {
-                let marker = match change.kind() {
-                    ChangeKind::Add => "A",
-                    ChangeKind::Delete => "D",
-                    ChangeKind::Update => "M",
-                };
-                println!("{} {}", marker, change.into_path().display());
-            }
+            let mut s = state.lock().await;
+            s.commit(&mut pool).await;
+            println!("Commited")
         } else {
             println!("Unknown command: {}", cmd)
         }

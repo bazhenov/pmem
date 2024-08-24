@@ -5,7 +5,7 @@
 //! $ mkdir mnt
 //! $ mount -t nfs -o nolocks,vers=3,tcp,port=11111,mountport=11111,soft 127.0.0.1:/ mnt/
 //! ```
-use crate::{Change, FileMeta, Filesystem, NodeType};
+use crate::{FileMeta, Filesystem, NodeType};
 use async_trait::async_trait;
 use nfsserve::{
     nfs::{
@@ -14,7 +14,7 @@ use nfsserve::{
     },
     vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities},
 };
-use pmem::page::{CommittedSnapshot, PagePool, Snapshot};
+use pmem::page::{PagePool, Transaction};
 use std::{
     io::{self, Read, Seek, SeekFrom, Write},
     mem,
@@ -30,28 +30,21 @@ pub struct RFS {
 }
 
 pub struct RfsState {
-    fs: Filesystem<Snapshot>,
-    prev_snapshot: Arc<CommittedSnapshot>,
+    fs: Filesystem<Transaction>,
 }
 
 impl RfsState {
-    pub async fn commit_and_get_changes(&mut self, pool: &mut PagePool) -> Vec<Change> {
-        let prev_fs = Filesystem::open(Arc::clone(&self.prev_snapshot));
-
-        let changes = self.fs.changes_from(&prev_fs).collect::<Vec<_>>();
-
-        let mut sw_fs = Filesystem::open(pool.snapshot());
+    pub async fn commit(&mut self, pool: &mut PagePool) {
+        let mut sw_fs = Filesystem::open(pool.start());
         mem::swap(&mut self.fs, &mut sw_fs);
         pool.commit(sw_fs.finish());
-        let new_snapshot = pool.snapshot();
-        self.fs = Filesystem::open(new_snapshot);
-
-        changes
+        let new_tx = pool.start();
+        self.fs = Filesystem::open(new_tx);
     }
 }
 
 impl Deref for RfsState {
-    type Target = Filesystem<Snapshot>;
+    type Target = Filesystem<Transaction>;
 
     fn deref(&self) -> &Self::Target {
         &self.fs
@@ -65,11 +58,10 @@ impl DerefMut for RfsState {
 }
 
 impl RFS {
-    pub fn new(snapshot: Snapshot) -> RFS {
-        let prev_snapshot = snapshot.base();
+    pub fn new(snapshot: Transaction) -> RFS {
         let fs = Filesystem::open(snapshot);
         let root = fs.get_root().unwrap();
-        let state = RfsState { fs, prev_snapshot };
+        let state = RfsState { fs };
         RFS {
             state: Arc::new(Mutex::new(state)),
             root_id: root.fid,

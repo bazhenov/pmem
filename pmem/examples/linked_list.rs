@@ -1,13 +1,13 @@
 use pmem::{
     memory,
-    page::{PagePool, Snapshot},
+    page::{PagePool, Transaction},
     Handle, Memory, Ptr,
 };
 use pmem_derive::Record;
 
 fn main() {
     let pool = PagePool::with_capacity(100 * 1024);
-    let memory = Memory::init(pool.snapshot());
+    let memory = Memory::init(pool.start());
 
     let mut list = LinkedList::allocate(memory);
     list.push_front(3);
@@ -24,7 +24,7 @@ fn main() {
 }
 
 struct LinkedList {
-    mem: Memory<Snapshot>,
+    mem: Memory<Transaction>,
     root: Handle<LinkedListNode>,
     ptr: Ptr<LinkedListNode>,
 }
@@ -41,18 +41,18 @@ struct ListNode {
 }
 
 impl LinkedList {
-    fn open(mem: Memory<Snapshot>, ptr: Ptr<LinkedListNode>) -> Self {
+    fn open(mem: Memory<Transaction>, ptr: Ptr<LinkedListNode>) -> Self {
         let root = mem.lookup(ptr).unwrap();
         Self { mem, root, ptr }
     }
 
-    fn allocate(mut mem: Memory<Snapshot>) -> Self {
+    fn allocate(mut mem: Memory<Transaction>) -> Self {
         let root = mem.write(LinkedListNode { first: None }).unwrap();
         let ptr = root.ptr();
         Self { mem, root, ptr }
     }
 
-    fn finish(mut self) -> Memory<Snapshot> {
+    fn finish(mut self) -> Memory<Transaction> {
         self.mem.update(&self.root).unwrap();
         self.mem
     }
@@ -91,7 +91,7 @@ impl LinkedList {
 }
 
 struct ListIterator<'a> {
-    tx: &'a Memory<Snapshot>,
+    tx: &'a Memory<Transaction>,
     ptr: Option<Ptr<ListNode>>,
 }
 

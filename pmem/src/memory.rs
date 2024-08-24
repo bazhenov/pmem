@@ -1,4 +1,4 @@
-use crate::page::{Addr, PageOffset, Snapshot, TxRead, TxWrite};
+use crate::page::{Addr, PageOffset, Transaction, TxRead, TxWrite};
 use pmem_derive::Record;
 use std::{
     any::type_name,
@@ -50,8 +50,8 @@ impl From<Error> for io::Error {
     }
 }
 
-pub struct Memory<S> {
-    snapshot: S,
+pub struct Memory<T> {
+    tx: T,
     mem_info: MemoryInfo,
 }
 
@@ -62,31 +62,31 @@ struct MemoryInfo {
 }
 
 impl MemoryInfo {
-    fn update(&self, snapshot: &mut impl TxWrite) {
+    fn update(&self, tx: &mut impl TxWrite) {
         let mut bytes = [0u8; Self::SIZE];
         self.write(&mut bytes)
             .expect("Unable to update memory info block");
-        snapshot.write(START_ADDR, bytes);
+        tx.write(START_ADDR, bytes);
     }
 }
 
-impl Memory<Snapshot> {
+impl Memory<Transaction> {
     #[cfg(test)]
     fn new() -> Self {
         let pool = crate::page::PagePool::default();
-        Self::init(pool.snapshot())
+        Self::init(pool.start())
     }
 }
 
 impl<S: TxRead> Memory<S> {
-    pub fn open(snapshot: S) -> Self {
-        let bytes = snapshot.read(START_ADDR, MemoryInfo::SIZE);
+    pub fn open(tx: S) -> Self {
+        let bytes = tx.read(START_ADDR, MemoryInfo::SIZE);
         let mem_info = MemoryInfo::read(&bytes).unwrap();
         assert!(
             mem_info.next_addr > 0,
             "Invalid memory info block. Maybe you forgot to call Memory::init()?"
         );
-        Self { snapshot, mem_info }
+        Self { tx, mem_info }
     }
 
     pub fn read_super_block<T: Record>(&self) -> Result<Handle<T>> {
@@ -141,27 +141,27 @@ impl<S: TxRead> Memory<S> {
     }
 
     fn read_uncommitted(&self, addr: Addr, len: usize) -> Cow<[u8]> {
-        self.snapshot.read(addr, len)
+        self.tx.read(addr, len)
     }
 }
 
 impl<S: TxWrite> Memory<S> {
-    pub fn init(mut snapshot: S) -> Self {
+    pub fn init(mut tx: S) -> Self {
         let next_addr = START_ADDR + MemoryInfo::SIZE as Addr;
 
         let mem_info = MemoryInfo { next_addr };
 
         let mut bytes = [0u8; MemoryInfo::SIZE];
         mem_info.write(&mut bytes).unwrap();
-        snapshot.write(START_ADDR, bytes);
+        tx.write(START_ADDR, bytes);
 
-        Self { snapshot, mem_info }
+        Self { tx, mem_info }
     }
 
     fn alloc_space(&mut self, size: usize) -> Result<Addr> {
         assert!(size > 0);
         let addr = self.mem_info.next_addr;
-        if !self.snapshot.valid_range(addr, size) {
+        if !self.tx.valid_range(addr, size) {
             return Err(Error::NoSpaceLeft);
         }
         self.mem_info.next_addr += size as Addr;
@@ -207,7 +207,7 @@ impl<S: TxWrite> Memory<S> {
         {
             let this = &mut *self;
             let addr = ptr.0.addr;
-            this.snapshot.write(addr, buffer)
+            this.tx.write(addr, buffer)
         };
         Ok(ptr)
     }
@@ -229,7 +229,7 @@ impl<S: TxWrite> Memory<S> {
         {
             let this = &mut *self;
             let addr = ptr.0.addr;
-            this.snapshot.write(addr, buffer)
+            this.tx.write(addr, buffer)
         };
         Ok(ptr)
     }
@@ -254,7 +254,7 @@ impl<S: TxWrite> Memory<S> {
         {
             let this = &mut *self;
             let addr = ptr.addr;
-            this.snapshot.write(addr, buffer)
+            this.tx.write(addr, buffer)
         };
         Ok((ptr, size))
     }
@@ -265,13 +265,13 @@ impl<S: TxWrite> Memory<S> {
     }
 
     pub fn reclaim<T>(&mut self, handle: Handle<T>) -> T {
-        self.snapshot.reclaim(handle.addr, handle.size);
+        self.tx.reclaim(handle.addr, handle.size);
         handle.into_inner()
     }
 
     pub fn finish(self) -> S {
         let Memory {
-            mut snapshot,
+            tx: mut snapshot,
             mem_info,
         } = self;
         mem_info.update(&mut snapshot);
@@ -587,7 +587,7 @@ mod tests {
     #[test]
     fn memory_can_persist_over_commits() -> Result<()> {
         let mut pool = PagePool::default();
-        let mut mem = Memory::init(pool.snapshot());
+        let mut mem = Memory::init(pool.start());
 
         let mut ptrs = vec![];
 
@@ -595,7 +595,7 @@ mod tests {
             let handle = mem.write(Value(i))?;
             ptrs.push(handle.ptr());
             pool.commit(mem.finish());
-            mem = Memory::open(pool.snapshot());
+            mem = Memory::open(pool.start());
         }
 
         for (i, ptr) in ptrs.into_iter().enumerate() {

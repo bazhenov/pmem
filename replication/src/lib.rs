@@ -1,4 +1,4 @@
-use pmem::page::{CommitNotify, CommittedSnapshot, PagePool, PagePoolHandle, Patch, TxWrite, LSN};
+use pmem::page::{CommitNotify, PagePool, PagePoolHandle, Patch, Snapshot, TxWrite, LSN};
 use protocol::{Message, PROTOCOL_VERSION};
 use std::{borrow::Cow, fmt::Debug, io, net::SocketAddr, pin::pin, sync::Arc, thread};
 use tokio::{
@@ -51,39 +51,41 @@ async fn server_worker(mut socket: TcpStream, mut notify: CommitNotify) -> io::R
     trace!(lsn = last_seen_lsn, "Starting log relay");
     let (tx, mut rx) = sync::mpsc::channel(1);
 
-    thread::spawn(move || while tx.blocking_send(notify.next_snapshot()).is_ok() {});
+    thread::spawn(move || {
+        let commit = notify.next_commit();
+        while tx
+            .blocking_send((commit.lsn(), commit.patches().to_vec()))
+            .is_ok()
+        {}
+    });
 
-    while let Some(snapshot) = rx.recv().await {
-        for lsn in last_seen_lsn..=snapshot.lsn() {
-            let next_snapshot = snapshot.find_at_lsn(lsn).unwrap();
-            let patches = next_snapshot.patches();
-            trace!(lsn = lsn, patches = patches.len(), "Sending snapshot");
-            for patch in patches {
-                Message::Patch(Cow::Borrowed(patch))
-                    .write_to(pin!(&mut socket))
-                    .await?;
-            }
-            Message::Commit(lsn).write_to(pin!(&mut socket)).await?;
+    while let Some((lsn, patches)) = rx.recv().await {
+        trace!(lsn = lsn, patches = patches.len(), "Sending snapshot");
+        for patch in patches {
+            Message::Patch(Cow::Owned(patch))
+                .write_to(pin!(&mut socket))
+                .await?;
         }
+        Message::Commit(lsn).write_to(pin!(&mut socket)).await?;
     }
     Ok(())
 }
 
 pub struct PoolReplica {
     pool: PagePool,
-    last_snapshot: Arc<CommittedSnapshot>,
+    last_snapshot: Arc<Snapshot>,
 }
 
 impl PoolReplica {
     pub fn new(pool: PagePool) -> Self {
-        let last_snapshot = Arc::new(CommittedSnapshot::default());
+        let last_snapshot = Arc::new(Snapshot::default());
         Self {
             pool,
             last_snapshot,
         }
     }
 
-    pub fn snapshot(&self) -> Arc<CommittedSnapshot> {
+    pub fn snapshot(&self) -> Arc<Snapshot> {
         self.last_snapshot.clone()
     }
 
@@ -127,15 +129,15 @@ async fn client_worker(mut client: TcpStream, mut pool: PagePool) -> io::Result<
             "Received snapshot from master"
         );
 
-        let mut s = pool.snapshot();
+        let mut tx = pool.start();
         for patch in snapshot {
             match patch {
-                Patch::Write(addr, bytes) => s.write(addr, bytes),
-                Patch::Reclaim(addr, len) => s.reclaim(addr, len),
+                Patch::Write(addr, bytes) => tx.write(addr, bytes),
+                Patch::Reclaim(addr, len) => tx.reclaim(addr, len),
             }
         }
 
-        let my_lsn = pool.commit(s);
+        let my_lsn = pool.commit(tx);
         trace!(lsn = lsn, my_lsn = my_lsn, "Committed snapshot");
     }
 }

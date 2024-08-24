@@ -145,7 +145,7 @@ fn create_deep_tree(
 
 fn create_fs() -> Filesystem<impl TxWrite> {
     let pool = PagePool::with_capacity(2usize.pow(32)); // 4GiB
-    Filesystem::allocate(pool.snapshot())
+    Filesystem::allocate(pool.start())
 }
 
 tango_benchmarks!(page_benchmarks());

@@ -24,8 +24,8 @@ fn bench_read(b: Bencher) -> Box<dyn Sampler> {
     let mem = generate_mem(&mut rng);
     b.iter(move || {
         let (addr, len) = random_segment(&mut rng, 0..DB_SIZE);
-        let snapshot = mem.snapshot();
-        let _ = black_box(snapshot.read(addr as Addr, len));
+        let tx = mem.start();
+        let _ = black_box(tx.read(addr as Addr, len));
     })
 }
 
@@ -36,10 +36,10 @@ fn bench_write(b: Bencher) -> Box<dyn Sampler> {
     rng.fill(&mut buffer[..]);
 
     let mem = PagePool::new(DB_SIZE / PAGE_SIZE + 1);
-    let mut snapshot = mem.snapshot();
+    let mut tx = mem.start();
     b.iter(move || {
         let (addr, len) = random_segment(&mut rng, 0..DB_SIZE);
-        snapshot.write(addr as Addr, &buffer[..len]);
+        tx.write(addr as Addr, &buffer[..len]);
     })
 }
 
@@ -53,9 +53,9 @@ fn bench_write_commit(b: Bencher) -> Box<dyn Sampler> {
 
     b.iter(move || {
         let (addr, len) = random_segment(&mut rng, 0..DB_SIZE);
-        let mut snapshot = mem.snapshot();
-        snapshot.write(addr as Addr, &buffer[..len]);
-        mem.commit(snapshot);
+        let mut tx = mem.start();
+        tx.write(addr as Addr, &buffer[..len]);
+        mem.commit(tx);
     })
 }
 
@@ -67,20 +67,20 @@ fn random_segment(rng: &mut SmallRng, mut range: Range<usize>) -> (usize, usize)
 }
 
 fn generate_mem(rng: &mut SmallRng) -> PagePool {
-    const SNAPSHOTS: usize = 100;
+    const TRANSACTIONS: usize = 100;
     const PATCHES: usize = 1000;
 
     let mut buffer = [0u8; DB_SIZE];
     rng.fill(&mut buffer[..]);
 
     let mut mem = PagePool::new(DB_SIZE / PAGE_SIZE + 1);
-    for _ in 0..SNAPSHOTS {
-        let mut snapshot = mem.snapshot();
+    for _ in 0..TRANSACTIONS {
+        let mut tx = mem.start();
         for _ in 0..PATCHES {
             let (addr, len) = random_segment(rng, 0..DB_SIZE);
-            snapshot.write(addr as Addr, &buffer[..len]);
+            tx.write(addr as Addr, &buffer[..len]);
         }
-        mem.commit(snapshot);
+        mem.commit(tx);
     }
     mem
 }
