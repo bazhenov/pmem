@@ -451,11 +451,7 @@ impl PagePool {
         }
         Self {
             pages: Arc::new(Mutex::new(pages)),
-            undo_log: Arc::new(Some(UndoLog {
-                next: ArcSwap::from_pointee(None),
-                lsn: 0,
-                patches: vec![],
-            })),
+            undo_log: Arc::new(Some(UndoLog::default())),
             latest: Arc::new(Mutex::new(Arc::new(snapshot))),
             notify: Arc::new(Condvar::new()),
             lsn: 0,
@@ -503,7 +499,6 @@ impl PagePool {
             patches: vec![],
             base: Arc::clone(&base),
             pages_count: pages,
-            lsn: self.lsn,
             pages: Arc::clone(&self.pages),
             undo_log,
         }
@@ -555,7 +550,6 @@ impl PagePool {
             }
             let undo = Arc::new(Some(UndoLog {
                 patches: undo_patches,
-                lsn: self.lsn,
                 next: ArcSwap::from_pointee(None),
             }));
             if let Some(prev) = self.undo_log.as_ref() {
@@ -657,9 +651,9 @@ fn find_page<'a>(pages: &'a mut MutexGuard<Vec<Page>>, page: PageNo) -> Option<&
         .map(|idx| &mut pages[idx])
 }
 
+#[derive(Default)]
 struct UndoLog {
     next: ArcSwap<Option<UndoLog>>,
-    lsn: LSN,
     patches: Vec<Patch>,
 }
 
@@ -890,7 +884,6 @@ pub struct Snapshot {
     patches: Vec<Patch>,
     base: Arc<CommittedSnapshot>,
     pages_count: PageNo,
-    lsn: LSN,
     undo_log: Arc<Option<UndoLog>>,
     pages: Arc<Mutex<Vec<Page>>>,
 }
