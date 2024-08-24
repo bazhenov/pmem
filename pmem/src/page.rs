@@ -481,7 +481,7 @@ impl PagePool {
     /// [`commit`]: Self::commit
     pub fn start(&self) -> Transaction {
         Transaction {
-            uncommited: vec![],
+            uncommitted: vec![],
             base: self.snapshot(),
         }
     }
@@ -505,8 +505,8 @@ impl PagePool {
             let mut locked_pages: MutexGuard<Vec<Page>> = self.pages.lock().unwrap();
 
             // Updating undo log and page data
-            let mut patches = Vec::with_capacity(tx.uncommited.len());
-            for patch in &tx.uncommited {
+            let mut patches = Vec::with_capacity(tx.uncommitted.len());
+            for patch in &tx.uncommitted {
                 let segments = PageSegments::new(patch.addr(), patch.len());
                 let mut undo_patch = vec![0; patch.len()];
                 for (addr, slice_range) in segments {
@@ -546,7 +546,7 @@ impl PagePool {
 
         // Updating redo log
         let new_commit = Arc::new(Some(Commit {
-            changes: tx.uncommited,
+            changes: tx.uncommitted,
             next: ArcSwap::from_pointee(None),
             lsn,
         }));
@@ -852,7 +852,7 @@ impl Commit {
 
 #[derive(Clone)]
 pub struct Transaction {
-    uncommited: Vec<Patch>,
+    uncommitted: Vec<Patch>,
     base: Snapshot,
 }
 
@@ -862,7 +862,7 @@ impl TxRead for Transaction {
     }
 
     fn read(&self, addr: Addr, len: usize) -> Cow<[u8]> {
-        self.base.read_uncommitted(addr, len, &self.uncommited)
+        self.base.read_uncommitted(addr, len, &self.uncommitted)
     }
 }
 
@@ -872,14 +872,14 @@ impl TxWrite for Transaction {
         split_ptr_checked(addr, bytes.len(), self.base.pages_count);
 
         if !bytes.is_empty() {
-            push_patch(&mut self.uncommited, Patch::Write(addr, bytes));
+            push_patch(&mut self.uncommitted, Patch::Write(addr, bytes));
         }
     }
 
     fn reclaim(&mut self, addr: Addr, len: usize) {
         split_ptr_checked(addr, len, self.base.pages_count);
         if len > 0 {
-            push_patch(&mut self.uncommited, Patch::Reclaim(addr, len));
+            push_patch(&mut self.uncommitted, Patch::Reclaim(addr, len));
         }
     }
 }
