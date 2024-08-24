@@ -943,12 +943,6 @@ impl TxWrite for Snapshot {
 
         if !bytes.is_empty() {
             push_patch(&mut self.patches, Patch::Write(addr, bytes));
-            // let segments = PageSegments::new(addr, bytes.len());
-            // // Iterating in reverse order so it is more efficient to split the bytes Vec
-            // for (addr, range) in segments.rev() {
-            //     let patch = Patch::Write(addr, bytes.split_off(range.start));
-            //     push_patch(&mut self.patches, patch);
-            // }
         }
     }
 
@@ -956,11 +950,6 @@ impl TxWrite for Snapshot {
         split_ptr_checked(addr, len, self.pages_count);
         if len > 0 {
             push_patch(&mut self.patches, Patch::Reclaim(addr, len));
-            // let segments = PageSegments::new(addr, len).rev();
-            // for (addr, range) in segments {
-            //     let patch = Patch::Reclaim(addr, range.len());
-            //     push_patch(&mut self.patches, patch);
-            // }
         }
     }
 }
