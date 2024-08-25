@@ -61,6 +61,7 @@ use arc_swap::ArcSwap;
 use std::{
     borrow::Cow,
     fmt::{self, Display, Formatter},
+    io,
     ops::Range,
     sync::{Arc, Condvar, Mutex},
 };
@@ -484,10 +485,13 @@ impl PagePool {
     /// Each transaction is linked to the pool state it was created from. If the page poll was changed
     /// since the moment when transaction was created, attempt to commit such a transaction will return an
     /// [`Result::Err`], because such changes might not be consistent anymore.
-    pub fn commit(&mut self, tx: impl Into<Transaction>) -> Result<u64, u64> {
+    pub fn commit(&mut self, tx: impl Into<Transaction>) -> io::Result<u64> {
         let tx: Transaction = tx.into();
         if tx.base.lsn != self.lsn {
-            return Err(self.lsn);
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "The pool was changed since the transaction was created",
+            ));
         }
 
         let lsn = self.lsn + 1;
@@ -506,7 +510,7 @@ impl PagePool {
                     let len = slice_range.len();
                     let page_range = offset..(offset + len);
 
-                    let page = locked_pages.read_page_mut(page_no).unwrap();
+                    let page = locked_pages.read_page_mut(page_no)?;
 
                     // Forming undo patch
                     undo_patch[slice_range.clone()].copy_from_slice(&page[page_range.clone()]);
@@ -520,6 +524,8 @@ impl PagePool {
                     }
                 }
                 patches.push(Patch::Write(patch.addr(), undo_patch));
+
+                locked_pages.flush()?;
             }
             let undo = Arc::new(Some(UndoEntry {
                 next: ArcSwap::from_pointee(None),
