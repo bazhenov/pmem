@@ -1327,13 +1327,13 @@ mod tests {
     fn detect_changes() -> Result<()> {
         let (mut fs_a, mut mem) = create_fs();
         mkdirs(&mut fs_a, &["/etc"]);
-        mem.commit(fs_a.finish());
+        mem.commit(fs_a.finish()).unwrap();
         let tx_a = mem.start();
 
         let mut fs_b = Filesystem::open(mem.start());
         fs_b.delete(&fs_b.get_root()?, "etc")?;
         mkdirs(&mut fs_b, &["/bin"]);
-        mem.commit(fs_b.finish());
+        mem.commit(fs_b.finish()).unwrap();
         let tx_b = mem.start();
 
         let fs_a = Filesystem::open(tx_a);

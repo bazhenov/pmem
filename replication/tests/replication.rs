@@ -80,7 +80,7 @@ impl MasterAndReplica {
         let mut notify = self.master_pool.commit_notify();
         let mut tx = self.master_pool.start();
         f(&mut tx);
-        let lsn = self.master_pool.commit(tx);
+        let lsn = self.master_pool.commit(tx).unwrap();
 
         // Waiting for replica to catch up
         // We need to spawn_blocking here because replica.wait_for_commit() is a blocking call

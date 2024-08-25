@@ -18,7 +18,7 @@ async fn main() {
 
     let mut pool = PagePool::with_capacity(100 * 1024 * 1024);
     let tx = Filesystem::allocate(pool.start()).finish();
-    pool.commit(tx);
+    pool.commit(tx).unwrap();
 
     let commit_notify = pool.commit_notify();
 

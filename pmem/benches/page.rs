@@ -55,7 +55,7 @@ fn bench_write_commit(b: Bencher) -> Box<dyn Sampler> {
         let (addr, len) = random_segment(&mut rng, 0..DB_SIZE);
         let mut tx = mem.start();
         tx.write(addr as Addr, &buffer[..len]);
-        mem.commit(tx);
+        mem.commit(tx).unwrap();
     })
 }
 
@@ -80,7 +80,7 @@ fn generate_mem(rng: &mut SmallRng) -> PagePool {
             let (addr, len) = random_segment(rng, 0..DB_SIZE);
             tx.write(addr as Addr, &buffer[..len]);
         }
-        mem.commit(tx);
+        mem.commit(tx).unwrap();
     }
     mem
 }

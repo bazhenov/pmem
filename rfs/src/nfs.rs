@@ -37,7 +37,7 @@ impl RfsState {
     pub async fn commit(&mut self, pool: &mut PagePool) {
         let mut sw_fs = Filesystem::open(pool.start());
         mem::swap(&mut self.fs, &mut sw_fs);
-        pool.commit(sw_fs.finish());
+        pool.commit(sw_fs.finish()).unwrap();
         let new_tx = pool.start();
         self.fs = Filesystem::open(new_tx);
     }

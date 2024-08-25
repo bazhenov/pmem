@@ -114,7 +114,7 @@ async fn client_worker(mut client: TcpStream, mut pool: PagePool) -> io::Result<
             }
         }
 
-        let my_lsn = pool.commit(tx);
+        let my_lsn = pool.commit(tx).unwrap();
         trace!(lsn = lsn, my_lsn = my_lsn, "Committed snapshot");
     }
 }

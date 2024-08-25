@@ -493,11 +493,13 @@ impl PagePool {
     /// recorded in the provided transaction. Once committed, its changes are visible in subsequent operations.
     ///
     /// Each transaction is linked to the pool state it was created from. If the page poll was changed
-    /// since the moment when transaction was created, attempt to commit such a transaction will return an error,
-    /// because such changes might not be consistent anymore.
-    pub fn commit(&mut self, tx: impl Into<Transaction>) -> u64 {
+    /// since the moment when transaction was created, attempt to commit such a transaction will return an
+    /// [`Result::Err`], because such changes might not be consistent anymore.
+    pub fn commit(&mut self, tx: impl Into<Transaction>) -> Result<u64, u64> {
         let tx: Transaction = tx.into();
-        assert_eq!(self.lsn, tx.base.lsn, "Proposed transaction is not linear");
+        if tx.base.lsn != self.lsn {
+            return Err(self.lsn);
+        }
 
         let lsn = self.lsn + 1;
 
@@ -505,7 +507,6 @@ impl PagePool {
         {
             let mut locked_pages: MutexGuard<Vec<Page>> = self.pages.lock().unwrap();
 
-            // Updating undo log and page data
             let mut patches = Vec::with_capacity(tx.uncommitted.len());
             for patch in &tx.uncommitted {
                 let segments = PageSegments::new(patch.addr(), patch.len());
@@ -531,12 +532,11 @@ impl PagePool {
                 }
                 patches.push(Patch::Write(patch.addr(), undo_patch));
             }
-            let undo = UndoEntry {
+            let undo = Arc::new(Some(UndoEntry {
                 next: ArcSwap::from_pointee(None),
                 patches,
                 lsn,
-            };
-            let undo = Arc::new(Some(undo));
+            }));
             (*self.undo_log)
                 .as_ref()
                 .expect("Undo log is missing")
@@ -559,9 +559,8 @@ impl PagePool {
         self.commit_log = new_commit;
 
         self.lsn = lsn;
-
         self.notify.notify_all();
-        lsn
+        Ok(lsn)
     }
 
     pub fn commit_notify(&self) -> CommitNotify {
@@ -1185,7 +1184,20 @@ mod tests {
         // and LSN 0 is synthetic LSN used for base empty snapshot
         let mut mem = PagePool::default();
         let tx = mem.start();
-        assert_eq!(mem.commit(tx), 1);
+        assert_eq!(mem.commit(tx).unwrap(), 1);
+    }
+
+    #[test]
+    fn non_linear_commits_must_be_rejected() {
+        let mut mem = PagePool::default();
+        let mut tx1 = mem.start();
+        let mut tx2 = mem.start();
+
+        tx1.write(0, b"Hello");
+        mem.commit(tx1).unwrap();
+
+        tx2.write(0, b"World");
+        assert!(mem.commit(tx2).is_err());
     }
 
     #[test]
@@ -1194,7 +1206,7 @@ mod tests {
 
         let mut tx = mem.start();
         tx.write(0, b"Hide");
-        mem.commit(tx);
+        mem.commit(tx).unwrap();
 
         assert_str_eq(mem.read(0, 4), b"Hide");
     }
@@ -1218,12 +1230,12 @@ mod tests {
 
         let mut hide = mem.start();
         hide.write(0, b"Hide");
-        mem.commit(hide);
+        mem.commit(hide).unwrap();
         let hide = mem.start();
 
         let mut jekyll = mem.start();
         jekyll.write(0, b"Jekyll");
-        mem.commit(jekyll);
+        mem.commit(jekyll).unwrap();
         let jekyll = mem.start();
 
         assert_eq!(&*zero.read(0, 6), b"\0\0\0\0\0\0");
@@ -1237,7 +1249,7 @@ mod tests {
 
         let mut tx = mem.start();
         tx.write(6, b"world");
-        mem.commit(tx);
+        mem.commit(tx).unwrap();
 
         assert_str_eq(mem.read(0, 12), "Hello world!");
         assert_str_eq(mem.read(0, 8), "Hello wo");
@@ -1253,11 +1265,11 @@ mod tests {
 
         let mut tx = mem.start();
         tx.write(70, [0, 0, 1]);
-        mem.commit(tx);
+        mem.commit(tx).unwrap();
         let mut tx = mem.start();
         tx.reclaim(71, 2);
         tx.write(73, [0]);
-        mem.commit(tx);
+        mem.commit(tx).unwrap();
 
         assert_eq!(mem.read(70, 4).as_ref(), [0, 0, 0, 0]);
     }
@@ -1268,13 +1280,13 @@ mod tests {
 
         let mut tx = mem.start();
         tx.write(70, [0, 0, 1]);
-        mem.commit(tx);
+        mem.commit(tx).unwrap();
         let mut tx = mem.start();
         tx.write(0, [0]);
-        mem.commit(tx);
+        mem.commit(tx).unwrap();
         let mut tx = mem.start();
         tx.reclaim(71, 2);
-        mem.commit(tx);
+        mem.commit(tx).unwrap();
 
         assert_eq!(mem.read(70, 4).as_ref(), [0, 0, 0, 0]);
     }
@@ -1294,7 +1306,7 @@ mod tests {
         assert_str_eq(tx.read(addr, alice.len()), alice);
 
         // Checking that data is visible after commit to page pool
-        mem.commit(tx);
+        mem.commit(tx).unwrap();
         assert_str_eq(mem.read(addr, alice.len()), alice);
     }
 
@@ -1352,7 +1364,7 @@ mod tests {
             .spawn(|| {
                 let mut mem = PagePool::new(100);
                 for _ in 0..1000 {
-                    mem.commit(mem.start());
+                    mem.commit(mem.start()).unwrap();
                 }
             })
             .unwrap()
@@ -1369,7 +1381,7 @@ mod tests {
         let lsn = thread::spawn(move || {
             let mut tx = pool.start();
             tx.write(0, [1, 2, 3, 4]);
-            pool.commit(tx)
+            pool.commit(tx).unwrap()
         });
 
         let commit = handle.wait_for_commit();
@@ -1389,7 +1401,7 @@ mod tests {
         let lsn = thread::spawn(move || {
             let mut tx = pool.start();
             tx.write(0, [1]);
-            pool.commit(tx)
+            pool.commit(tx).unwrap()
         });
 
         let lsn2 = n2.next_commit().lsn();
@@ -1409,7 +1421,7 @@ mod tests {
         for i in 1..=10 {
             let mut tx = pool.start();
             tx.write(i, [i as u8]);
-            pool.commit(tx);
+            pool.commit(tx).unwrap();
         }
 
         for lsn in 1..=10 {
@@ -1427,7 +1439,7 @@ mod tests {
 
         let mut tx = pool.start();
         tx.write(0, [0]);
-        let expected_lsn = pool.commit(tx);
+        let expected_lsn = pool.commit(tx).unwrap();
 
         let lsn = lsn.join().unwrap();
         assert_eq!(lsn, expected_lsn);
@@ -1713,7 +1725,7 @@ mod tests {
                             }
                         }
                     }
-                    mem.commit(tx);
+                    mem.commit(tx).unwrap();
                 }
 
                 assert_buffers_eq(&mem.read(0, DB_SIZE), shadow_buffer.as_slice())?;
@@ -1740,7 +1752,7 @@ mod tests {
                             }
                         }
                     }
-                    mem.commit(tx);
+                    mem.commit(tx).unwrap();
                     assert_buffers_eq(&s.read(0, DB_SIZE), &initial)?;
                 }
             }
@@ -2036,7 +2048,7 @@ mod tests {
             let mut pool = PagePool::with_capacity(capactiy);
             let mut tx = pool.start();
             tx.write(0, value);
-            pool.commit(tx);
+            pool.commit(tx).unwrap();
             pool
         }
     }

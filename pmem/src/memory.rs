@@ -594,7 +594,7 @@ mod tests {
         for i in 0..10 {
             let handle = mem.write(Value(i))?;
             ptrs.push(handle.ptr());
-            pool.commit(mem.finish());
+            pool.commit(mem.finish()).unwrap();
             mem = Memory::open(pool.start());
         }
 
