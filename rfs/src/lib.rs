@@ -722,6 +722,8 @@ impl<'a, S: TxRead> Read for File<'a, S> {
             .min(bytes_left_in_block)
             .min(bytes_left_in_file as usize);
 
+        // TODO: profiling results show that get_current_block() is bottleneck of this function
+        //       in order to improve performance we need to read multiple blocks at once
         let block = self.get_current_block()?;
         buf[..len].copy_from_slice(&block[offset..offset + len]);
 
