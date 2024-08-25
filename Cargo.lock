@@ -632,6 +632,7 @@ dependencies = [
  "proptest",
  "rand",
  "tango-bench",
+ "tempfile",
  "thiserror",
 ]
 
