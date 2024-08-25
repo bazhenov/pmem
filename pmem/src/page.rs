@@ -1735,7 +1735,8 @@ mod tests {
             /// return the same initial state.
             #[test]
             fn repeatable_read(snapshots in vec(any_snapshot(), 1..5)) {
-                let initial = vec![42; DB_SIZE];
+                const VALUE: u8 = 42;
+                let initial = vec![VALUE; DB_SIZE];
                 let mut mem = PagePool::from(initial.as_slice());
                 let s = mem.snapshot();
 
@@ -1748,12 +1749,13 @@ mod tests {
                             },
                             Patch::Reclaim(offset, len) => {
                                 tx.reclaim(offset, len);
-
                             }
                         }
                     }
+
+                    prop_assert!(s.read(0, DB_SIZE).iter().all(|b| *b == VALUE));
                     mem.commit(tx).unwrap();
-                    assert_buffers_eq(&s.read(0, DB_SIZE), &initial)?;
+                    prop_assert!(s.read(0, DB_SIZE).iter().all(|b| *b == VALUE));
                 }
             }
 
