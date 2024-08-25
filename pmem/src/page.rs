@@ -1,20 +1,20 @@
-//! # Page Management
+//! # Page Management Module
 //!
 //! This module provides a system for managing and manipulating snapshots of a memory. It is designed
 //! to facilitate operations on persistent memory (pmem), allowing for efficient snapshots, modifications, and commits
-//! of data changes. The core functionality revolves around the `PagePool` structure, which manages a pool of pages,
-//! and the `Snapshot` structure, which represents a modifiable snapshot of the page pool's state at a given point
+//! of data changes. The core functionality revolves around the [`PagePool`] structure, which manages a pool of pages,
+//! and the [`Transaction`] structure, which represents a modifiable session of the page pool's state at a given point
 //! in time.
 //!
 //! ## Concepts
 //!
-//! - [`PagePool`]: A collection of pages that can be snapshot, modified, and committed. It acts as the primary
+//! - [`PagePool`]: A collection of pages that can be snapshoted, modified, and committed. It acts as the primary
 //!   interface for interacting with the page memory.
 //! - [`Transaction`]: A read/write session allowing modifications of the page pool.
 //!   It can be modified independently of the pool, and later committed back to the pool to update its state.
-//! - [`Snapshot`]: A snapshot that has been committed to the page pool. It is immutable and can be
-//!   used to read data from the pool.
-//! - [`Patch`]: A modification recorded in a snapshot. It consists of the address where the modification starts and
+//! - [`Snapshot`]: A frozen state of the page pool at some point in time. It is immutable and only can be
+//!   used to read data.
+//! - [`Patch`]: A modification recorded in a transaction. It consists of the address where the modification starts and
 //!   the bytes that were written.
 //! - [`PagePoolHandle`]: A read-only view of the page pool that can be used to read data from the pool and
 //!   wait for new snapshots to be committed. It's useful for concurrent access to the pool.
@@ -23,11 +23,12 @@
 //!
 //! The module is designed to be used as follows:
 //!
-//! 1. **Initialization**: Create a new `PagePool`.
-//! 2. **Snapshotting**: Create a snapshot of the current state of the `PagePool`.
-//! 3. **Modification**: Use the snapshot to perform modifications. Each modification is recorded as a patch.
-//! 4. **Commit**: Commit the snapshot back to the `PagePool`, applying all the patches and updating the pool's state.
-//! 5. **Concurrent Access**: Optionally, create a `PagePoolHandle` for read-only access to the pool
+//! 1. **Initialization**: Create a new [`PagePool`].
+//! 2. **Transactioning**: Create a [`Transaction`] of the current state.
+//! 3. **Modification**: Use the [`Transaction`] to perform modifications. Each modification is recorded as a patch.
+//! 4. **Commit**: Commit the snapshot back to the [`PagePool`], applying all the patches and updating
+//!    the pool's state.
+//! 5. **Concurrent Access**: Optionally, create a [`PagePoolHandle`] for read-only access to the pool
 //!    from other threads.
 //!
 //! ## Example
@@ -49,15 +50,6 @@
 //! ```
 //!
 //! The [`TxRead`] and [`TxWrite`] traits provide methods for reading from and writing to snapshots, respectively.
-//!
-//! ## Safety and Correctness
-//!
-//! The module ensures safety and correctness through the following mechanisms:
-//!
-//! - **Immutability of Committed Snapshots**: Once a snapshot is committed, it becomes immutable, ensuring that
-//!   any reference to its data remains valid and unchanged until corresponding `Arc` reference is held.
-//! - **Linear Snapshot History**: The module enforces a linear history of snapshots, preventing branches in the
-//!   snapshot history and ensuring consistency of changes proposed in snapshots.
 //!
 //! ## Performance Considerations
 //!
@@ -374,23 +366,40 @@ impl Page {
     }
 }
 
-/// A pool of pages that can capture and commit snapshots of data changes.
+/// A logically contiguous set of pages that can be transacted on.
 ///
-/// The `PagePool` struct allows for the creation of snapshots representing the state
-/// of a set of pages at a particular point in time. These snapshots can then be modified
-/// and eventually committed back to the pool, updating the pool's state to reflect the changes
-/// made in the snapshot.
+/// The `PagePool` struct allows for the creation of:
+///
+/// - [`Snapshot`] – readonly views of the pool's state at a particular point in time.
+/// - [`Transaction`] - mutable views of the pool's state that can be modified and
+///   eventually committed back to the pool.
 ///
 /// # Examples
 ///
-/// Basic usage:
+/// Modify the contents of a pool using a transaction:
 ///
 /// ```
-/// # use pmem::page::{PagePool, TxWrite};
+/// use pmem::page::{PagePool, TxWrite};
+///
 /// let mut pool = PagePool::new(5);  // Initialize a pool with 5 pages
 /// let mut tx = pool.start();        // Create a new transaction
 /// tx.write(0, &[0, 1, 2, 3]);       // Modify the snapshot
 /// pool.commit(tx);                  // Commit the changes back to the pool
+/// ```
+///
+/// Creating a snapshot of the pool:
+/// ```
+/// use pmem::page::{PagePool, TxWrite, TxRead};
+///
+/// let mut pool = PagePool::new(5);
+/// let snapshot = pool.snapshot();   // Create a new snapshot
+///
+/// let mut tx = pool.start();
+/// tx.write(0, &[0, 1, 2, 3]);
+/// pool.commit(tx);
+///
+/// // The snapshot remains unchanged even after committing changes to the pool
+/// assert_eq!(&*snapshot.read(0, 4), &[0, 0, 0, 0]);
 /// ```
 ///
 /// This structure is particularly useful for systems that require consistent views of data
@@ -405,9 +414,9 @@ pub struct PagePool {
     /// will append undo log with the changes required to maintain REPEATABLE READ isolation level for the
     /// snapshot.
     ///
-    /// Ideally [`Self::undo_log`] should not contain `Option`, because it is required to be present
+    /// Ideally it should not contain `Option`, because it is required to be present
     /// for the snapshot to be created. Unfortunately, this is not possible due to the fact
-    /// that [`UndoEntry::next`] which is [`ArcSwap`] should contains `Option` to be able
+    /// that [`UndoEntry::next`] which is [`ArcSwap`] must contains `Option` to be able
     /// to stop reference chain at some point and we can not have both `Arc<T>` and `Arc<Option<T>>` as the same time.
     undo_log: Arc<Option<UndoEntry>>,
     commit_log: Arc<Option<Commit>>,
@@ -454,10 +463,9 @@ impl PagePool {
         Self::new(pages)
     }
 
-    /// Takes a snapshot of the current state of the `PagePool`.
+    /// Creates a new transaction over the current state of the page pool.
     ///
-    /// This method creates a [`Transaction`] instance representing the current state of the page pool.
-    /// The snapshot can be used to perform modifications independently of the pool. These modifications
+    /// The transaction can be used to perform modifications independently of the pool. These modifications
     /// are not reflected in the pool until the snapshot is committed using the [`commit`] method.
     ///
     /// # Examples
@@ -470,11 +478,6 @@ impl PagePool {
     /// let tx = pool.start();
     /// // tx modifications won't affect the original pool until committed.
     /// ```
-    ///
-    /// # Returns
-    ///
-    /// A `Transaction` instance representing the current state of the page pool. It can be used both for reading and
-    /// changing state of the page pool.
     ///
     /// [`commit`]: Self::commit
     pub fn start(&self) -> Transaction {
@@ -571,6 +574,7 @@ impl PagePool {
         }
     }
 
+    /// Creates read-only handle to the page pool that may be used to read data from it from different threads.
     pub fn handle(&self) -> PagePoolHandle {
         PagePoolHandle {
             notify: self.commit_notify(),
@@ -629,6 +633,7 @@ fn find_page<'a>(pages: &'a mut MutexGuard<Vec<Page>>, page: PageNo) -> Option<&
 /// before particular transaction was committed.
 ///
 /// `UndoEntry` is referenced from old to new and only last position is stored in [`PagePool`].
+/// It enables automatic cleanup of old entries that are not referenced anymore by any snapshot or transaction.
 #[derive(Default)]
 struct UndoEntry {
     next: ArcSwap<Option<UndoEntry>>,
@@ -686,7 +691,6 @@ impl CommitNotify {
                 locked_commit = self.notify.wait(locked_commit).unwrap();
             }
         }
-        // let last_commit = (*self.commit).as_ref().unwrap();
         let next_commit = last_commit.next();
         debug_assert!((*next_commit).as_ref().unwrap().lsn() > self.last_seen_lsn());
         self.commit = Arc::clone(&next_commit);
@@ -739,7 +743,7 @@ pub trait TxWrite: TxRead {
     fn reclaim(&mut self, addr: Addr, len: usize);
 }
 
-/// Represents a committed snapshot of a page pool.
+/// Represents a committed snapshot of a page pool. Created by [`PagePool::snapshot`] method.
 ///
 /// A `Snapshot` captures the state of a page pool at a specific point in time,
 /// including any patches (modifications) that have been applied up to that point. It serves
@@ -757,17 +761,18 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    // Main mathod that implements MVCC read logic of the system.
+    //
+    // Because [`apply_patches()`] is implementing first patch wins logic, the correct order of reading
+    // data at a given LSN is following:
+    //
+    // 1. Read whatever data is in the pages.
+    // 2. Apply changes from own patches. Any transaction should see its own not yet committed cnanges.
+    // 3. Apply changes from undo log, to restore the state of the page that is possibly changed
+    //    by concurrently committed transaction. This is needed to maintain REPETABLE READ
+    //    isolation guarantee.
     fn read_uncommitted(&self, addr: Addr, len: usize, uncommitted: &[Patch]) -> Cow<[u8]> {
         split_ptr_checked(addr, len, self.pages_count);
-
-        // Because apply_patches() is implementing first patch wins logic, the correct order of reading
-        // data at a given LSN is following:
-        //
-        // 1. Read whatever data is in the pages.
-        // 2. Apply changes from own patches. Any transaction should see its own not yet committed cnanges.
-        // 3. Apply changes from undo log, to restore the state of the page that is possibly changed
-        //    by concurrently committed transaction. This is needed to maintain REPETABLE READ
-        //    isolation guarantee.
         let mut buf = vec![0; len];
 
         // Reading the pages
