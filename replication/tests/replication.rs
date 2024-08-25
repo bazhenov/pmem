@@ -83,8 +83,8 @@ impl MasterAndReplica {
         let lsn = self.master_pool.commit(tx).unwrap();
 
         // Waiting for replica to catch up
-        // We need to spawn_blocking here because replica.wait_for_commit() is a blocking call
-        // if Runtime is not multithreaded it may block the only thread that is running server async tasks
+        // We need to spawn_blocking here because `next_commit()` is a blocking call
+        // if `Runtime` is not multithreaded it may block the only thread that is running server async tasks
         spawn_blocking(move || while notify.next_commit().lsn() < lsn {})
             .await
             .unwrap();

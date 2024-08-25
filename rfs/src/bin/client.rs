@@ -18,7 +18,7 @@ async fn main() {
         .unwrap();
 
     loop {
-        let snapshot = pool.wait_for_commit();
+        let snapshot = pool.wait();
         println!("New snapshot LSN: {}", snapshot.lsn());
 
         let fs = Filesystem::open(snapshot);

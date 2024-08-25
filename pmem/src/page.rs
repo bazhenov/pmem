@@ -45,7 +45,7 @@
 //! tx.write(0, &[1, 2, 3, 4]);   // Write 4 bytes at offset 0
 //! pool.commit(tx);              // Commit the changes back to the pool
 //!
-//! let snapshot = handle.wait_for_commit();
+//! let snapshot = handle.wait();
 //! assert_eq!(snapshot.read(0, 4), vec![1, 2, 3, 4]); // Read using TxRead trait
 //! ```
 //!
@@ -636,7 +636,7 @@ impl PagePoolHandle {
     ///
     /// The next snapshot is the one that is the most recent at the time this method is called.
     /// It might be several snapshots ahead of the last seen snapshot.
-    pub fn wait_for_commit(&mut self) -> Snapshot {
+    pub fn wait(&mut self) -> Snapshot {
         let commit = self.notify.next_commit();
 
         Snapshot {
@@ -1367,7 +1367,7 @@ mod tests {
             pool.commit(tx).unwrap()
         });
 
-        let commit = handle.wait_for_commit();
+        let commit = handle.wait();
         let bytes = commit.read(0, 4);
 
         let lsn = lsn.join().unwrap();
