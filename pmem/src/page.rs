@@ -760,7 +760,7 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    // Main mathod that implements MVCC read logic of the system.
+    // Main method that implements MVCC read logic of the system.
     //
     // Because [`apply_patches()`] is implementing first patch wins logic, the correct order of reading
     // data at a given LSN is following:
