@@ -60,11 +60,12 @@
 use arc_swap::ArcSwap;
 use std::{
     borrow::Cow,
-    collections::BTreeMap,
     fmt::{self, Display, Formatter},
     ops::Range,
     sync::{Arc, Condvar, Mutex},
 };
+
+use crate::driver::{MemoryDriver, PageDriver};
 
 pub const PAGE_SIZE_BITS: usize = 16;
 pub const PAGE_SIZE: usize = 1 << PAGE_SIZE_BITS; // 64Kib
@@ -353,18 +354,6 @@ pub enum Error {
     NoSnapshot(u64, u64),
 }
 
-pub(crate) struct Page {
-    data: Box<[u8; PAGE_SIZE]>,
-}
-
-impl Page {
-    pub(crate) fn new() -> Self {
-        Self {
-            data: Box::new([0; PAGE_SIZE]),
-        }
-    }
-}
-
 /// A logically contiguous set of pages that can be transacted on.
 ///
 /// The `PagePool` struct allows for the creation of:
@@ -405,7 +394,7 @@ impl Page {
 /// at different points in time, or for implementing undo/redo functionality where each snapshot
 /// can represent a state in the history of changes.
 pub struct PagePool {
-    pages: Arc<Mutex<BTreeMap<PageNo, Page>>>,
+    pages: Arc<Mutex<Box<dyn PageDriver>>>,
     pages_count: PageNo,
 
     /// Reference to the [`UndoEntry`] for the last committed transaction.
@@ -424,7 +413,9 @@ pub struct PagePool {
     /// A log sequence number (LSN) that uniquely identifies this snapshot. The LSN
     /// is used internally to ensure that snapshots are applied in a linear and consistent order.
     lsn: LSN,
-    notify: Arc<Condvar>,
+
+    /// Condition variable used to notify waiting threads that a new commit has been completed.
+    commit_notify: Arc<(Mutex<()>, Condvar)>,
 }
 
 impl PagePool {
@@ -445,13 +436,12 @@ impl PagePool {
             next: ArcSwap::from_pointee(None),
             lsn: 0,
         };
-        let pages = BTreeMap::new();
         Self {
-            pages: Arc::new(Mutex::new(pages)),
+            pages: Arc::new(Mutex::new(Box::new(MemoryDriver::default()))),
             pages_count: page_cnt as PageNo,
             undo_log: Arc::new(Some(UndoEntry::default())),
             commit_log: Arc::new(Some(commit)),
-            notify: Arc::new(Condvar::new()),
+            commit_notify: Arc::new((Mutex::new(()), Condvar::new())),
             lsn: 0,
         }
     }
@@ -516,17 +506,17 @@ impl PagePool {
                     let len = slice_range.len();
                     let page_range = offset..(offset + len);
 
-                    let page = locked_pages.entry(page_no).or_insert_with(Page::new);
+                    let page = locked_pages.read_page_mut(page_no).unwrap();
 
                     // Forming undo patch
-                    undo_patch[slice_range.clone()].copy_from_slice(&page.data[page_range.clone()]);
+                    undo_patch[slice_range.clone()].copy_from_slice(&page[page_range.clone()]);
 
                     // Applying change to the page
                     match patch {
                         Patch::Write(_, data) => {
-                            page.data[page_range].copy_from_slice(&data[slice_range])
+                            page[page_range].copy_from_slice(&data[slice_range])
                         }
-                        Patch::Reclaim(..) => page.data[page_range].fill(0),
+                        Patch::Reclaim(..) => page[page_range].fill(0),
                     }
                 }
                 patches.push(Patch::Write(patch.addr(), undo_patch));
@@ -558,17 +548,16 @@ impl PagePool {
         self.commit_log = new_commit;
 
         self.lsn = lsn;
-        self.notify.notify_all();
+        self.commit_notify.1.notify_all();
         Ok(lsn)
     }
 
     pub fn commit_notify(&self) -> CommitNotify {
         CommitNotify {
             last_seen_lsn: self.lsn,
-            notify: Arc::clone(&self.notify),
+            commit_notify: Arc::clone(&self.commit_notify),
             commit: Arc::clone(&self.commit_log),
             pages_count: self.pages_count,
-            pages: Arc::clone(&self.pages),
         }
     }
 
@@ -628,7 +617,7 @@ pub struct PagePoolHandle {
     notify: CommitNotify,
     pages_count: PageNo,
     undo_log: Arc<Option<UndoEntry>>,
-    pages: Arc<Mutex<BTreeMap<PageNo, Page>>>,
+    pages: Arc<Mutex<Box<dyn PageDriver>>>,
 }
 
 impl PagePoolHandle {
@@ -650,10 +639,9 @@ impl PagePoolHandle {
 
 #[derive(Clone)]
 pub struct CommitNotify {
-    pages: Arc<Mutex<BTreeMap<PageNo, Page>>>,
     commit: Arc<Option<Commit>>,
     last_seen_lsn: u64,
-    notify: Arc<Condvar>,
+    commit_notify: Arc<(Mutex<()>, Condvar)>,
     pages_count: PageNo,
 }
 
@@ -665,12 +653,12 @@ impl CommitNotify {
     pub fn next_commit(&mut self) -> &Commit {
         let last_commit = (*self.commit).as_ref().unwrap();
         if last_commit.next().is_none() {
-            let mut locked_commit = self.pages.lock().unwrap();
+            let mut locked_commit = self.commit_notify.0.lock().unwrap();
             // Need to check again after acquiring the lock, otherwise it is a race condition
             // because we speculatively checked the condition before acquiring the lock to prevent
             // contention when possible
             while last_commit.next().is_none() {
-                locked_commit = self.notify.wait(locked_commit).unwrap();
+                locked_commit = self.commit_notify.1.wait(locked_commit).unwrap();
             }
         }
         let next_commit = last_commit.next();
@@ -738,7 +726,7 @@ pub trait TxWrite: TxRead {
 pub struct Snapshot {
     pages_count: PageNo,
     undo_log: Arc<Option<UndoEntry>>,
-    pages: Arc<Mutex<BTreeMap<PageNo, Page>>>,
+    pages: Arc<Mutex<Box<dyn PageDriver>>>,
     lsn: LSN,
 }
 
@@ -763,9 +751,9 @@ impl Snapshot {
             for (addr, range) in PageSegments::new(addr, len) {
                 let (page_no, offset) = split_ptr(addr);
                 let offset = offset as usize;
-                if let Some(page) = locked_pages.get_mut(&page_no) {
+                if let Some(page) = locked_pages.read_page(page_no).unwrap() {
                     let len = range.len();
-                    buf[range].copy_from_slice(&page.data[offset..offset + len]);
+                    buf[range].copy_from_slice(&page[offset..offset + len]);
                 }
             }
         }
