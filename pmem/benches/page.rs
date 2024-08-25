@@ -35,7 +35,7 @@ fn bench_write(b: Bencher) -> Box<dyn Sampler> {
     let mut buffer = [0u8; DB_SIZE];
     rng.fill(&mut buffer[..]);
 
-    let mem = PagePool::new(DB_SIZE / PAGE_SIZE + 1);
+    let mem = PagePool::new((DB_SIZE / PAGE_SIZE + 1) as u32);
     let mut tx = mem.start();
     b.iter(move || {
         let (addr, len) = random_segment(&mut rng, 0..DB_SIZE);
@@ -49,7 +49,7 @@ fn bench_write_commit(b: Bencher) -> Box<dyn Sampler> {
     let mut buffer = [0u8; DB_SIZE];
     rng.fill(&mut buffer[..]);
 
-    let mut mem = PagePool::new(DB_SIZE / PAGE_SIZE + 1);
+    let mut mem = PagePool::new((DB_SIZE / PAGE_SIZE + 1) as u32);
 
     b.iter(move || {
         let (addr, len) = random_segment(&mut rng, 0..DB_SIZE);
@@ -73,7 +73,7 @@ fn generate_mem(rng: &mut SmallRng) -> PagePool {
     let mut buffer = [0u8; DB_SIZE];
     rng.fill(&mut buffer[..]);
 
-    let mut mem = PagePool::new(DB_SIZE / PAGE_SIZE + 1);
+    let mut mem = PagePool::new((DB_SIZE / PAGE_SIZE + 1) as u32);
     for _ in 0..TRANSACTIONS {
         let mut tx = mem.start();
         for _ in 0..PATCHES {

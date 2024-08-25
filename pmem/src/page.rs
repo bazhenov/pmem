@@ -60,9 +60,10 @@
 use arc_swap::ArcSwap;
 use std::{
     borrow::Cow,
+    collections::BTreeMap,
     fmt::{self, Display, Formatter},
     ops::Range,
-    sync::{Arc, Condvar, Mutex, MutexGuard},
+    sync::{Arc, Condvar, Mutex},
 };
 
 pub const PAGE_SIZE_BITS: usize = 16;
@@ -353,15 +354,13 @@ pub enum Error {
 }
 
 struct Page {
-    page_no: PageNo,
     data: Box<[u8; PAGE_SIZE]>,
 }
 
 impl Page {
-    fn new(page_no: PageNo) -> Self {
+    fn new() -> Self {
         Self {
             data: Box::new([0; PAGE_SIZE]),
-            page_no,
         }
     }
 }
@@ -406,7 +405,8 @@ impl Page {
 /// at different points in time, or for implementing undo/redo functionality where each snapshot
 /// can represent a state in the history of changes.
 pub struct PagePool {
-    pages: Arc<Mutex<Vec<Page>>>,
+    pages: Arc<Mutex<BTreeMap<PageNo, Page>>>,
+    pages_count: PageNo,
 
     /// Reference to the [`UndoEntry`] for the last committed transaction.
     ///
@@ -438,19 +438,17 @@ impl PagePool {
     ///
     /// * `pages` - The number of pages the pool should initially contain. This determines
     ///   the range of valid addresses that can be written to in snapshots derived from this pool.
-    pub fn new(page_cnt: usize) -> Self {
+    pub fn new(page_cnt: PageNo) -> Self {
         assert!(page_cnt > 0, "The number of pages must be greater than 0");
         let commit = Commit {
             changes: vec![],
             next: ArcSwap::from_pointee(None),
             lsn: 0,
         };
-        let mut pages = Vec::with_capacity(page_cnt);
-        for i in 0..page_cnt {
-            pages.push(Page::new(i as u32));
-        }
+        let pages = BTreeMap::new();
         Self {
             pages: Arc::new(Mutex::new(pages)),
+            pages_count: page_cnt as PageNo,
             undo_log: Arc::new(Some(UndoEntry::default())),
             commit_log: Arc::new(Some(commit)),
             notify: Arc::new(Condvar::new()),
@@ -460,6 +458,7 @@ impl PagePool {
 
     pub fn with_capacity(bytes: usize) -> Self {
         let pages = (bytes + PAGE_SIZE) / PAGE_SIZE;
+        let pages = u32::try_from(pages).expect("Too large capacity for the page pool");
         Self::new(pages)
     }
 
@@ -505,7 +504,7 @@ impl PagePool {
 
         // Updating pages and undo log
         {
-            let mut locked_pages: MutexGuard<Vec<Page>> = self.pages.lock().unwrap();
+            let mut locked_pages = self.pages.lock().unwrap();
 
             let mut patches = Vec::with_capacity(tx.uncommitted.len());
             for patch in &tx.uncommitted {
@@ -517,7 +516,7 @@ impl PagePool {
                     let len = slice_range.len();
                     let page_range = offset..(offset + len);
 
-                    let page = find_or_create_page(&mut locked_pages, page_no);
+                    let page = locked_pages.entry(page_no).or_insert_with(Page::new);
 
                     // Forming undo patch
                     undo_patch[slice_range.clone()].copy_from_slice(&page.data[page_range.clone()]);
@@ -568,7 +567,7 @@ impl PagePool {
             last_seen_lsn: self.lsn,
             notify: Arc::clone(&self.notify),
             commit: Arc::clone(&self.commit_log),
-            pages_count: self.pages.lock().unwrap().len() as u32,
+            pages_count: self.pages_count,
             pages: Arc::clone(&self.pages),
         }
     }
@@ -578,7 +577,7 @@ impl PagePool {
         PagePoolHandle {
             notify: self.commit_notify(),
             pages: Arc::clone(&self.pages),
-            pages_count: self.pages.lock().unwrap().len() as u32,
+            pages_count: self.pages_count,
             undo_log: Arc::clone(&self.undo_log),
         }
     }
@@ -588,7 +587,7 @@ impl PagePool {
 
         Snapshot {
             lsn: self.lsn,
-            pages_count: self.pages.lock().unwrap().len() as u32,
+            pages_count: self.pages_count,
             pages: Arc::clone(&self.pages),
             undo_log: Arc::clone(&self.undo_log),
         }
@@ -612,22 +611,6 @@ impl Default for PagePool {
     }
 }
 
-fn find_or_create_page<'a>(pages: &'a mut MutexGuard<Vec<Page>>, page: PageNo) -> &'a mut Page {
-    let result = pages.binary_search_by_key(&page, |p| p.page_no);
-    if let Err(idx) = result {
-        pages.insert(idx, Page::new(page));
-    }
-    let idx = result.unwrap_or_else(|idx| idx);
-    &mut pages[idx]
-}
-
-fn find_page<'a>(pages: &'a mut MutexGuard<Vec<Page>>, page: PageNo) -> Option<&'a mut Page> {
-    pages
-        .binary_search_by_key(&page, |p| p.page_no)
-        .ok()
-        .map(|idx| &mut pages[idx])
-}
-
 /// Describes a changes that need to be applied to the page to restore it to the state
 /// before particular transaction was committed.
 ///
@@ -645,7 +628,7 @@ pub struct PagePoolHandle {
     notify: CommitNotify,
     pages_count: PageNo,
     undo_log: Arc<Option<UndoEntry>>,
-    pages: Arc<Mutex<Vec<Page>>>,
+    pages: Arc<Mutex<BTreeMap<PageNo, Page>>>,
 }
 
 impl PagePoolHandle {
@@ -667,7 +650,7 @@ impl PagePoolHandle {
 
 #[derive(Clone)]
 pub struct CommitNotify {
-    pages: Arc<Mutex<Vec<Page>>>,
+    pages: Arc<Mutex<BTreeMap<PageNo, Page>>>,
     commit: Arc<Option<Commit>>,
     last_seen_lsn: u64,
     notify: Arc<Condvar>,
@@ -755,7 +738,7 @@ pub trait TxWrite: TxRead {
 pub struct Snapshot {
     pages_count: PageNo,
     undo_log: Arc<Option<UndoEntry>>,
-    pages: Arc<Mutex<Vec<Page>>>,
+    pages: Arc<Mutex<BTreeMap<PageNo, Page>>>,
     lsn: LSN,
 }
 
@@ -780,7 +763,7 @@ impl Snapshot {
             for (addr, range) in PageSegments::new(addr, len) {
                 let (page_no, offset) = split_ptr(addr);
                 let offset = offset as usize;
-                if let Some(page) = find_page(&mut locked_pages, page_no) {
+                if let Some(page) = locked_pages.get_mut(&page_no) {
                     let len = range.len();
                     buf[range].copy_from_slice(&page.data[offset..offset + len]);
                 }

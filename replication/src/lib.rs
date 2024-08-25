@@ -88,7 +88,7 @@ pub async fn replica_connect(
         return io_error("Invalid protocol version");
     }
 
-    let pool = PagePool::new(pages as usize);
+    let pool = PagePool::new(pages);
     let read_handle = pool.handle();
 
     let join_handle = tokio::spawn(client_worker(socket, pool));
