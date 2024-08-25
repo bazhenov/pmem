@@ -1,7 +1,4 @@
-use pmem::{
-    page::{PagePool, TxRead, TxWrite, PAGE_SIZE},
-    Addr,
-};
+use pmem::page::{Addr, PagePool, TxRead, TxWrite, PAGE_SIZE};
 use rand::{rngs::SmallRng, Rng, SeedableRng};
 use std::{hint::black_box, ops::Range};
 use tango_bench::{

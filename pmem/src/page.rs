@@ -353,12 +353,12 @@ pub enum Error {
     NoSnapshot(u64, u64),
 }
 
-struct Page {
+pub(crate) struct Page {
     data: Box<[u8; PAGE_SIZE]>,
 }
 
 impl Page {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             data: Box::new([0; PAGE_SIZE]),
         }

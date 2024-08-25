@@ -1,7 +1,7 @@
 use pmem::{
     memory::{self, SlicePtr, PTR_SIZE},
-    page::{TxRead, TxWrite},
-    Addr, Handle, Memory, Ptr, Record,
+    page::{Addr, TxRead, TxWrite},
+    Handle, Memory, Ptr, Record,
 };
 use pmem_derive::Record;
 use std::{
