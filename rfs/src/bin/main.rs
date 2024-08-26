@@ -1,5 +1,5 @@
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
-use pmem::page::PagePool;
+use pmem::{driver::FileDriver, page::PagePool};
 use rfs::{nfs::RFS, Filesystem};
 use std::io::{self, Write};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -16,7 +16,8 @@ async fn main() {
         .with(filter_layer)
         .init();
 
-    let mut pool = PagePool::with_capacity(100 * 1024 * 1024);
+    let driver = FileDriver::new("./test.db").unwrap();
+    let mut pool = PagePool::with_capacity_and_driver(100 * 1024 * 1024, driver);
     let tx = Filesystem::allocate(pool.start()).finish();
     pool.commit(tx).unwrap();
 

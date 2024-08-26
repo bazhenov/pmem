@@ -53,11 +53,15 @@ impl FileDriver {
     }
 
     fn ensure_loaded(&mut self, page_no: PageNo) -> io::Result<()> {
-        if !self.pages.contains_key(&page_no) {
+        if self.pages.contains_key(&page_no) {
             return Ok(());
         }
-        let offset = (page_no as u64) * (PAGE_SIZE as u64);
-        self.file.seek(SeekFrom::Start(offset))?;
+        let page_offset = page_no as u64 * PAGE_SIZE as u64;
+        let expected_size = (page_no as u64 + 1) * (PAGE_SIZE as u64);
+        if self.file.metadata()?.len() < expected_size {
+            self.file.set_len(expected_size)?;
+        }
+        self.file.seek(SeekFrom::Start(page_offset))?;
         let mut page = Box::new([0; PAGE_SIZE]);
         self.file.read_exact(page.as_mut())?;
         self.pages.insert(page_no, page);

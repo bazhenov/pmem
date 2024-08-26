@@ -434,6 +434,22 @@ impl PagePool {
     /// * `pages` - The number of pages the pool should initially contain. This determines
     ///   the range of valid addresses that can be written to in snapshots derived from this pool.
     pub fn new(page_cnt: PageNo) -> Self {
+        Self::new_with_driver(page_cnt, Box::new(MemoryDriver::default()))
+    }
+
+    pub fn with_capacity(bytes: usize) -> Self {
+        let pages = (bytes + PAGE_SIZE) / PAGE_SIZE;
+        let pages = u32::try_from(pages).expect("Too large capacity for the page pool");
+        Self::new(pages)
+    }
+
+    pub fn with_capacity_and_driver(bytes: usize, driver: impl PageDriver + 'static) -> Self {
+        let pages = (bytes + PAGE_SIZE) / PAGE_SIZE;
+        let pages = u32::try_from(pages).expect("Too large capacity for the page pool");
+        Self::new_with_driver(pages, Box::new(driver))
+    }
+
+    fn new_with_driver(page_cnt: u32, driver: Box<dyn PageDriver>) -> Self {
         assert!(page_cnt > 0, "The number of pages must be greater than 0");
         let commit = Commit {
             changes: vec![],
@@ -442,18 +458,12 @@ impl PagePool {
         };
         let commit = Mutex::new(Arc::new(Some(commit)));
         Self {
-            pages: Arc::new(Mutex::new(Box::new(MemoryDriver::default()))),
+            pages: Arc::new(Mutex::new(driver)),
             pages_count: page_cnt as PageNo,
             undo_log: Arc::new(Some(UndoEntry::default())),
             latest_commit: Arc::new((commit, Condvar::new())),
             lsn: AtomicU64::new(0),
         }
-    }
-
-    pub fn with_capacity(bytes: usize) -> Self {
-        let pages = (bytes + PAGE_SIZE) / PAGE_SIZE;
-        let pages = u32::try_from(pages).expect("Too large capacity for the page pool");
-        Self::new(pages)
     }
 
     /// Creates a new transaction over the current state of the page pool.
@@ -1372,7 +1382,7 @@ mod tests {
 
     #[test]
     fn data_can_be_read_from_a_different_thread() {
-        let mut pool = PagePool::new(1);
+        let mut pool = PagePool::default();
 
         let mut handle = pool.handle();
 
@@ -1392,7 +1402,7 @@ mod tests {
 
     #[test]
     fn can_get_notifications_about_commit() {
-        let mut pool = PagePool::new(1);
+        let mut pool = PagePool::default();
         let mut n1 = pool.commit_notify();
         let mut n2 = pool.commit_notify();
 
@@ -1413,7 +1423,7 @@ mod tests {
 
     #[test]
     fn each_commit_snapshot_can_be_addressed() {
-        let mut pool = PagePool::new(1);
+        let mut pool = PagePool::default();
         let mut notify = pool.commit_notify();
 
         for i in 1..=10 {
@@ -1430,7 +1440,7 @@ mod tests {
 
     #[test]
     fn can_wait_for_a_snapshot_in_a_thread() {
-        let mut pool = PagePool::new(1);
+        let mut pool = PagePool::default();
         let mut notify = pool.commit_notify();
 
         let lsn = thread::spawn(move || notify.next_commit().lsn());
@@ -1447,7 +1457,7 @@ mod tests {
     fn commit_stress_test() {
         const ITERATIONS: usize = 1000;
 
-        let mut pool = PagePool::new(1);
+        let mut pool = PagePool::default();
         let mut notify = pool.commit_notify();
 
         let handle = thread::spawn(move || {
