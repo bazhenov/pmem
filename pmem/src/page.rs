@@ -546,15 +546,19 @@ impl PagePool {
             next: ArcSwap::from_pointee(None),
             lsn,
         }));
-        (*self.commit_log)
-            .as_ref()
-            .expect("Commit log is missing")
-            .next
-            .store(Arc::clone(&new_commit));
-        self.commit_log = new_commit;
+        {
+            // TODO put commit_log undo commit_lock
+            let _guard = self.commit_notify.0.lock().unwrap();
+            (*self.commit_log)
+                .as_ref()
+                .expect("Commit log is missing")
+                .next
+                .store(Arc::clone(&new_commit));
+            self.commit_log = new_commit;
 
-        self.lsn = lsn;
-        self.commit_notify.1.notify_all();
+            self.lsn = lsn;
+            self.commit_notify.1.notify_all();
+        }
         Ok(lsn)
     }
 
