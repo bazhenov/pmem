@@ -63,7 +63,10 @@ use std::{
     fmt::{self, Display, Formatter},
     io,
     ops::Range,
-    sync::{Arc, Condvar, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Condvar, Mutex,
+    },
 };
 
 use crate::driver::{MemoryDriver, PageDriver};
@@ -409,14 +412,14 @@ pub struct PagePool {
     /// that [`UndoEntry::next`] which is [`ArcSwap`] must contains `Option` to be able
     /// to stop reference chain at some point and we can not have both `Arc<T>` and `Arc<Option<T>>` as the same time.
     undo_log: Arc<Option<UndoEntry>>,
-    commit_log: Arc<Option<Commit>>,
 
     /// A log sequence number (LSN) that uniquely identifies this snapshot. The LSN
     /// is used internally to ensure that snapshots are applied in a linear and consistent order.
-    lsn: LSN,
+    lsn: AtomicU64,
 
-    /// Condition variable used to notify waiting threads that a new commit has been completed.
-    commit_notify: Arc<(Mutex<()>, Condvar)>,
+    /// Reference to the latest commit and condition variable used to notify waiting threads
+    /// that a new commit has been completed
+    latest_commit: Arc<(Mutex<Arc<Option<Commit>>>, Condvar)>,
 }
 
 impl PagePool {
@@ -437,13 +440,13 @@ impl PagePool {
             next: ArcSwap::from_pointee(None),
             lsn: 0,
         };
+        let commit = Mutex::new(Arc::new(Some(commit)));
         Self {
             pages: Arc::new(Mutex::new(Box::new(MemoryDriver::default()))),
             pages_count: page_cnt as PageNo,
             undo_log: Arc::new(Some(UndoEntry::default())),
-            commit_log: Arc::new(Some(commit)),
-            commit_notify: Arc::new((Mutex::new(()), Condvar::new())),
-            lsn: 0,
+            latest_commit: Arc::new((commit, Condvar::new())),
+            lsn: AtomicU64::new(0),
         }
     }
 
@@ -486,15 +489,19 @@ impl PagePool {
     /// since the moment when transaction was created, attempt to commit such a transaction will return an
     /// [`Result::Err`], because such changes might not be consistent anymore.
     pub fn commit(&mut self, tx: impl Into<Transaction>) -> io::Result<u64> {
+        let (lock, notify) = self.latest_commit.as_ref();
+        let mut commit = lock.lock().unwrap();
         let tx: Transaction = tx.into();
-        if tx.base.lsn != self.lsn {
+
+        let current_lsn = self.lsn.load(Ordering::Relaxed);
+        if tx.base.lsn != current_lsn {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
                 "The pool was changed since the transaction was created",
             ));
         }
 
-        let lsn = self.lsn + 1;
+        let lsn = self.lsn.fetch_add(1, Ordering::Relaxed) + 1;
 
         // Updating pages and undo log
         {
@@ -546,27 +553,24 @@ impl PagePool {
             next: ArcSwap::from_pointee(None),
             lsn,
         }));
-        {
-            // TODO put commit_log undo commit_lock
-            let _guard = self.commit_notify.0.lock().unwrap();
-            (*self.commit_log)
-                .as_ref()
-                .expect("Commit log is missing")
-                .next
-                .store(Arc::clone(&new_commit));
-            self.commit_log = new_commit;
+        commit
+            .as_ref()
+            .as_ref()
+            .expect("Commit log is missing")
+            .next
+            .store(Arc::clone(&new_commit));
+        *commit = new_commit;
+        notify.notify_all();
 
-            self.lsn = lsn;
-            self.commit_notify.1.notify_all();
-        }
         Ok(lsn)
     }
 
     pub fn commit_notify(&self) -> CommitNotify {
+        let commit = self.latest_commit.0.lock().unwrap();
         CommitNotify {
-            last_seen_lsn: self.lsn,
-            commit_notify: Arc::clone(&self.commit_notify),
-            commit: Arc::clone(&self.commit_log),
+            last_seen_lsn: self.lsn.load(Ordering::Relaxed),
+            latest_commit: Arc::clone(&self.latest_commit),
+            commit: Arc::clone(&commit),
             pages_count: self.pages_count,
         }
     }
@@ -585,7 +589,7 @@ impl PagePool {
         debug_assert!(self.undo_log.is_some());
 
         Snapshot {
-            lsn: self.lsn,
+            lsn: self.lsn.load(Ordering::Relaxed),
             pages_count: self.pages_count,
             pages: Arc::clone(&self.pages),
             undo_log: Arc::clone(&self.undo_log),
@@ -649,9 +653,12 @@ impl PagePoolHandle {
 
 #[derive(Clone)]
 pub struct CommitNotify {
+    // Last processed commit.
     commit: Arc<Option<Commit>>,
     last_seen_lsn: u64,
-    commit_notify: Arc<(Mutex<()>, Condvar)>,
+
+    /// Latest commit that is available for reading in the pool. May be way ahead of `commit`.
+    latest_commit: Arc<(Mutex<Arc<Option<Commit>>>, Condvar)>,
     pages_count: PageNo,
 }
 
@@ -661,17 +668,27 @@ impl CommitNotify {
     /// If several commits happened since the last call to this method, this function will return
     /// all of them in order.
     pub fn next_commit(&mut self) -> &Commit {
-        let last_commit = (*self.commit).as_ref().unwrap();
-        if last_commit.next().is_none() {
-            let mut locked_commit = self.commit_notify.0.lock().unwrap();
-            // Need to check again after acquiring the lock, otherwise it is a race condition
-            // because we speculatively checked the condition before acquiring the lock to prevent
-            // contention when possible
-            while last_commit.next().is_none() {
-                locked_commit = self.commit_notify.1.wait(locked_commit).unwrap();
+        // Pay attention to the order of operations and the fact that algorithm uses 2 commits:
+        // 1. `commit` - the last processed commit by this method.
+        // 2. `latest_commit` - the latest commit that is available for reading in the pool.
+        //    `latest_commit` may be way ahead of `commit` if client of this funcion can't keep up with
+        //    ongoing commits.
+        //
+        // Access to `commit` is synchronized by `Arc` and most of the times we don't need to acquire
+        // the lock to check if there is a new commit available. We need to acquire global lock
+        // if we are contending for the latest commit in the pool.
+        let commit = (*self.commit).as_ref().unwrap();
+        if commit.next().is_none() {
+            let mut latest_commit = self.latest_commit.0.lock().unwrap();
+            // 1. Need to check again after acquiring the lock, otherwise it is a race condition
+            //    because we speculatively checked the condition before acquiring the lock to prevent
+            //    contention when possible
+            // 2. spourious wakeups are possible, so we need to check the condition in a loop
+            while commit.next().is_none() {
+                latest_commit = self.latest_commit.1.wait(latest_commit).unwrap();
             }
         }
-        let next_commit = last_commit.next();
+        let next_commit = commit.next();
         debug_assert!((*next_commit).as_ref().unwrap().lsn() > self.last_seen_lsn());
         self.commit = Arc::clone(&next_commit);
         (*self.commit).as_ref().unwrap()
@@ -1157,7 +1174,7 @@ impl DoubleEndedIterator for PageSegments {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{panic, thread};
+    use std::thread;
 
     #[test]
     fn first_commit_should_have_lsn_1() {
@@ -1424,6 +1441,29 @@ mod tests {
 
         let lsn = lsn.join().unwrap();
         assert_eq!(lsn, expected_lsn);
+    }
+
+    #[test]
+    fn commit_stress_test() {
+        const ITERATIONS: usize = 1000;
+
+        let mut pool = PagePool::new(1);
+        let mut notify = pool.commit_notify();
+
+        let handle = thread::spawn(move || {
+            for _ in 0..ITERATIONS {
+                let mut tx = pool.start();
+                tx.write(0, [0]);
+                pool.commit(tx).unwrap();
+            }
+        });
+
+        for i in 1..=ITERATIONS {
+            let lsn = notify.next_commit().lsn();
+            assert_eq!(lsn, i as u64);
+        }
+
+        handle.join().unwrap();
     }
 
     #[test]
