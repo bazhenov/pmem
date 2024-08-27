@@ -681,7 +681,7 @@ impl CommitNotify {
         // Pay attention to the order of operations and the fact that algorithm uses 2 commits:
         // 1. `commit` - the last processed commit by this method.
         // 2. `latest_commit` - the latest commit that is available for reading in the pool.
-        //    `latest_commit` may be way ahead of `commit` if client of this funcion can't keep up with
+        //    `latest_commit` may be way ahead of `commit` if client of this function can't keep up with
         //    ongoing commits.
         //
         // Access to `commit` is synchronized by `Arc` and most of the times we don't need to acquire
