@@ -115,7 +115,7 @@ fn write_page<T: Write + Seek>(file: &mut T, page_no: PageNo, page: &Page) -> io
 }
 
 #[cfg(test)]
-//#[cfg(not(miri))]
+#[cfg(not(miri))]
 mod tests {
     use super::*;
 

@@ -1,7 +1,10 @@
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use pmem::{driver::FileDriver, page::PagePool};
 use rfs::{nfs::RFS, Filesystem};
-use std::io::{self, Write};
+use std::{
+    fs,
+    io::{self, Write},
+};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 const HOSTPORT: u32 = 11111;
@@ -16,10 +19,13 @@ async fn main() {
         .with(filter_layer)
         .init();
 
-    let driver = FileDriver::from_file("./test.db").unwrap();
+    let file_path = "./target/test.db";
+    let driver = FileDriver::from_file(file_path).unwrap();
     let mut pool = PagePool::with_capacity_and_driver(100 * 1024 * 1024, driver);
-    let tx = Filesystem::allocate(pool.start()).finish();
-    pool.commit(tx).unwrap();
+    if fs::metadata(file_path).is_err() {
+        let tx = Filesystem::allocate(pool.start()).finish();
+        pool.commit(tx).unwrap();
+    }
 
     let commit_notify = pool.commit_notify();
 

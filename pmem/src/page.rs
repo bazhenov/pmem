@@ -606,6 +606,15 @@ impl PagePool {
     }
 
     #[cfg(test)]
+    fn into_driver(self) -> Option<Box<dyn PageDriver>> {
+        let lock = Arc::into_inner(self.pages)?;
+        let Ok(driver) = lock.into_inner() else {
+            return None;
+        };
+        Some(driver)
+    }
+
+    #[cfg(test)]
     fn read(&self, addr: Addr, len: usize) -> Cow<[u8]> {
         let mut buffer = vec![0; len];
 
@@ -1500,6 +1509,20 @@ mod tests {
                 (2 * PAGE_SIZE as Addr, (2 * PAGE_SIZE - 1)..(2 * PAGE_SIZE)),
             ]
         );
+    }
+
+    #[test]
+    fn page_pool_can_be_resotred_after_reopen() {
+        let mut pool = PagePool::new_with_driver(1, Box::new(FileDriver::in_memory()));
+
+        let mut tx = pool.start();
+        tx.write(0, [42]);
+        pool.commit(tx).unwrap();
+
+        let driver = pool.into_driver().unwrap();
+        let pool = PagePool::new_with_driver(1, driver);
+
+        assert_eq!(&*pool.read(0, 1), [42]);
     }
 
     mod patch {
