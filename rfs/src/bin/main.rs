@@ -16,7 +16,7 @@ async fn main() {
         .with(filter_layer)
         .init();
 
-    let driver = FileDriver::new("./test.db").unwrap();
+    let driver = FileDriver::from_file("./test.db").unwrap();
     let mut pool = PagePool::with_capacity_and_driver(100 * 1024 * 1024, driver);
     let tx = Filesystem::allocate(pool.start()).finish();
     pool.commit(tx).unwrap();

@@ -57,6 +57,7 @@
 //! overhead, making it perfectly valid and cost-effective to create a snapshot even when the intention is only to
 //! read data without any modifications.
 
+use crate::driver::{FileDriver, PageDriver};
 use arc_swap::ArcSwap;
 use std::{
     borrow::Cow,
@@ -68,8 +69,6 @@ use std::{
         Arc, Condvar, Mutex,
     },
 };
-
-use crate::driver::{MemoryDriver, PageDriver};
 
 pub const PAGE_SIZE_BITS: usize = 16;
 pub const PAGE_SIZE: usize = 1 << PAGE_SIZE_BITS; // 64Kib
@@ -434,7 +433,7 @@ impl PagePool {
     /// * `pages` - The number of pages the pool should initially contain. This determines
     ///   the range of valid addresses that can be written to in snapshots derived from this pool.
     pub fn new(page_cnt: PageNo) -> Self {
-        Self::new_with_driver(page_cnt, Box::new(MemoryDriver::default()))
+        Self::new_with_driver(page_cnt, Box::new(FileDriver::in_memory()))
     }
 
     pub fn with_capacity(bytes: usize) -> Self {
