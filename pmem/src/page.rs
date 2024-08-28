@@ -36,7 +36,7 @@
 //! ```rust
 //! use pmem::page::{PagePool, TxRead, TxWrite};
 //!
-//! let mut pool = PagePool::new(5);    // Initialize a pool with 5 pages
+//! let mut pool = PagePool::new_in_memory(5);    // Initialize a pool with 5 pages
 //!
 //! // Create a handle for concurrent read-only access
 //! let mut handle = pool.handle();
@@ -373,7 +373,7 @@ pub enum Error {
 /// ```
 /// use pmem::page::{PagePool, TxWrite};
 ///
-/// let mut pool = PagePool::new(5);  // Initialize a pool with 5 pages
+/// let mut pool = PagePool::new_in_memory(5);  // Initialize a pool with 5 pages
 /// let mut tx = pool.start();        // Create a new transaction
 /// tx.write(0, &[0, 1, 2, 3]);       // Modify the snapshot
 /// pool.commit(tx);                  // Commit the changes back to the pool
@@ -383,7 +383,7 @@ pub enum Error {
 /// ```
 /// use pmem::page::{PagePool, TxWrite, TxRead};
 ///
-/// let mut pool = PagePool::new(5);
+/// let mut pool = PagePool::new_in_memory(5);
 /// let snapshot = pool.snapshot();   // Create a new snapshot
 ///
 /// let mut tx = pool.start();
@@ -478,7 +478,7 @@ impl PagePool {
     ///
     /// ```
     /// # use pmem::page::PagePool;
-    /// let mut pool = PagePool::new(1);
+    /// let mut pool = PagePool::new_in_memory(1);
     /// let tx = pool.start();
     /// // tx modifications won't affect the original pool until committed.
     /// ```
