@@ -27,7 +27,7 @@ async fn check_replication_work_if_connected_later() -> io::Result<()> {
 
 #[tokio::test]
 async fn check_replication_can_resize_pool() -> io::Result<()> {
-    let mut net = MasterAndReplica::with_pool(PagePool::new(2)).await?;
+    let mut net = MasterAndReplica::with_pool(PagePool::new_in_memory(2)).await?;
 
     let bytes = [1, 2, 3, 4];
     let snapshot = net.master_write(|s| s.write(0, bytes)).await;
@@ -52,7 +52,7 @@ struct MasterAndReplica {
 
 impl MasterAndReplica {
     async fn new() -> io::Result<Self> {
-        Self::with_pool(PagePool::new(1)).await
+        Self::with_pool(PagePool::new_in_memory(1)).await
     }
 
     async fn with_pool(pool: PagePool) -> io::Result<Self> {

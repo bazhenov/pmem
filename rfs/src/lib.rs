@@ -1562,7 +1562,7 @@ mod tests {
     }
 
     fn create_fs() -> (Filesystem<Transaction>, PagePool) {
-        let page_pool = PagePool::new(1);
+        let page_pool = PagePool::new_in_memory(1);
         (Filesystem::allocate(page_pool.start()), page_pool)
     }
 

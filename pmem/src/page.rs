@@ -434,14 +434,14 @@ impl PagePool {
     ///
     /// * `pages` - The number of pages the pool should initially contain. This determines
     ///   the range of valid addresses that can be written to in snapshots derived from this pool.
-    pub fn new(page_cnt: PageNo) -> Self {
+    pub fn new_in_memory(page_cnt: PageNo) -> Self {
         Self::new_with_driver(page_cnt, Box::new(FileDriver::in_memory()))
     }
 
     pub fn with_capacity(bytes: usize) -> Self {
         let pages = (bytes + PAGE_SIZE) / PAGE_SIZE;
         let pages = u32::try_from(pages).expect("Too large capacity for the page pool");
-        Self::new(pages)
+        Self::new_in_memory(pages)
     }
 
     pub fn with_capacity_and_driver(bytes: usize, driver: impl PageDriver + 'static) -> Self {
@@ -630,7 +630,7 @@ impl PagePool {
 #[cfg(test)]
 impl Default for PagePool {
     fn default() -> Self {
-        Self::new(1)
+        Self::new_in_memory(1)
     }
 }
 
@@ -1369,7 +1369,7 @@ mod tests {
 
     #[test]
     fn data_across_multiple_pages_can_be_written() {
-        let mut mem = PagePool::new(2);
+        let mut mem = PagePool::new_in_memory(2);
 
         // Choosing address so that data is split across 2 pages
         let addr = PAGE_SIZE as Addr - 2;
@@ -1438,7 +1438,7 @@ mod tests {
             // setting stacksize explicitly so not to rely on the running environment
             .stack_size(100 * 1024)
             .spawn(|| {
-                let mut mem = PagePool::new(100);
+                let mut mem = PagePool::new_in_memory(100);
                 for _ in 0..1000 {
                     mem.commit(mem.start()).unwrap();
                 }
