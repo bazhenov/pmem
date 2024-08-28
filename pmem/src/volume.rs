@@ -57,7 +57,7 @@
 //! overhead, making it perfectly valid and cost-effective to create a snapshot even when the intention is only to
 //! read data without any modifications.
 
-use crate::driver::{FileDriver, PageDriver};
+use crate::driver::{MemoryDriver, PageDriver};
 use arc_swap::ArcSwap;
 use std::{
     borrow::Cow,
@@ -435,7 +435,7 @@ impl Volume {
     /// * `pages` - The number of pages the volume should initially contain. This determines
     ///   the range of valid addresses that can be written to in snapshots derived from this volume.
     pub fn new_in_memory(page_cnt: PageNo) -> Self {
-        Self::new_with_driver(page_cnt, Box::new(FileDriver::in_memory()))
+        Self::new_with_driver(page_cnt, Box::new(MemoryDriver))
     }
 
     pub fn with_capacity(bytes: usize) -> Self {
@@ -1577,7 +1577,7 @@ mod tests {
 
     #[test]
     fn page_volume_can_be_restored_after_reopen() {
-        let mut volume = Volume::new_with_driver(1, Box::new(FileDriver::in_memory()));
+        let mut volume = Volume::new_with_driver(1, Box::new(MemoryDriver));
 
         let mut tx = volume.start();
         tx.write(0, [42]);
