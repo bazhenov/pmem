@@ -1075,7 +1075,7 @@ impl<'a, S: TxRead> fmt::Debug for FsTree<'a, S> {
 mod tests {
     use super::*;
     use fmt::Debug;
-    use pmem::page::{PagePool, Transaction};
+    use pmem::page::{Transaction, Volume};
     use std::{collections::HashSet, fs};
 
     macro_rules! assert_not_exists {
@@ -1435,7 +1435,7 @@ mod tests {
     #[should_panic(expected = "NoSpaceLeft")]
     fn no_space_left() {
         // Maximum file size is 5184 bytes in test environment. So in order to trigger NoSpaceLeft
-        // we need to write 64Kib (1 page in PagePool) / 5184 = 13 files.
+        // we need to write 64Kib (1 page in Volume) / 5184 = 13 files.
         const MAX_FILE_SIZE: usize = BLOCK_SIZE * LAST_DOUBLE_INDIRECT_BLOCK;
 
         let (mut fs, _) = create_fs();
@@ -1561,9 +1561,9 @@ mod tests {
         }
     }
 
-    fn create_fs() -> (Filesystem<Transaction>, PagePool) {
-        let page_pool = PagePool::new_in_memory(1);
-        (Filesystem::allocate(page_pool.start()), page_pool)
+    fn create_fs() -> (Filesystem<Transaction>, Volume) {
+        let volume = Volume::new_in_memory(1);
+        (Filesystem::allocate(volume.start()), volume)
     }
 
     /// A filesystem action that can be applied to a filesystem
@@ -1653,7 +1653,7 @@ mod tests {
 
     mod proptests {
         use super::*;
-        use pmem::page::PagePool;
+        use pmem::page::Volume;
         use prop::collection::hash_set;
         use proptest::{collection::vec, prelude::*, prop_oneof, proptest, strategy::Strategy};
         use std::{fs, ops::Range};
@@ -1680,8 +1680,8 @@ mod tests {
 
             #[test]
             fn can_write_file(ops in vec(any_write_operation(), 0..10)) {
-                let pool = PagePool::with_capacity(1024 * 1024);
-                let mut fs = Filesystem::allocate(pool.start());
+                let volume = Volume::with_capacity(1024 * 1024);
+                let mut fs = Filesystem::allocate(volume.start());
 
                 let tmp_dir = TempDir::new()?;
                 let root = fs.get_root()?;

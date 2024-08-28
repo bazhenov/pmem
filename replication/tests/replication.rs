@@ -1,4 +1,4 @@
-use pmem::page::{Addr, PagePool, PagePoolHandle, Transaction, TxRead, TxWrite, PAGE_SIZE};
+use pmem::page::{Addr, Transaction, TxRead, TxWrite, Volume, VolumeHandle, PAGE_SIZE};
 use replication::{replica_connect, start_replication_server};
 use std::{io, net::SocketAddr};
 use tokio::task::{spawn_blocking, JoinHandle};
@@ -26,8 +26,8 @@ async fn check_replication_work_if_connected_later() -> io::Result<()> {
 }
 
 #[tokio::test]
-async fn check_replication_can_resize_pool() -> io::Result<()> {
-    let mut net = MasterAndReplica::with_pool(PagePool::new_in_memory(2)).await?;
+async fn check_replication_can_resize_volume() -> io::Result<()> {
+    let mut net = MasterAndReplica::with_volume(Volume::new_in_memory(2)).await?;
 
     let bytes = [1, 2, 3, 4];
     let snapshot = net.master_write(|s| s.write(0, bytes)).await;
@@ -44,23 +44,23 @@ async fn check_replication_can_resize_pool() -> io::Result<()> {
 }
 
 struct MasterAndReplica {
-    master_pool: PagePool,
+    master_volume: Volume,
     master_addr: SocketAddr,
-    replica_handle: PagePoolHandle,
+    replica_handle: VolumeHandle,
     replica_ctrl: JoinHandle<io::Result<()>>,
 }
 
 impl MasterAndReplica {
     async fn new() -> io::Result<Self> {
-        Self::with_pool(PagePool::new_in_memory(1)).await
+        Self::with_volume(Volume::new_in_memory(1)).await
     }
 
-    async fn with_pool(pool: PagePool) -> io::Result<Self> {
-        let notify = pool.commit_notify();
+    async fn with_volume(volume: Volume) -> io::Result<Self> {
+        let notify = volume.commit_notify();
         let (master_addr, _) = start_replication_server("127.0.0.1:0", notify).await?;
         let (replica, replica_ctrl) = replica_connect(master_addr).await?;
         Ok(Self {
-            master_pool: pool,
+            master_volume: volume,
             master_addr,
             replica_handle: replica,
             replica_ctrl,
@@ -77,10 +77,10 @@ impl MasterAndReplica {
 
     /// Write to master, wait for replica to catch up and returns corresponding snapshot from replica
     async fn master_write(&mut self, f: impl Fn(&mut Transaction)) -> impl TxRead {
-        let mut notify = self.master_pool.commit_notify();
-        let mut tx = self.master_pool.start();
+        let mut notify = self.master_volume.commit_notify();
+        let mut tx = self.master_volume.start();
         f(&mut tx);
-        let lsn = self.master_pool.commit(tx).unwrap();
+        let lsn = self.master_volume.commit(tx).unwrap();
 
         // Waiting for replica to catch up
         // We need to spawn_blocking here because `next_commit()` is a blocking call
@@ -88,6 +88,6 @@ impl MasterAndReplica {
         spawn_blocking(move || while notify.next_commit().lsn() < lsn {})
             .await
             .unwrap();
-        self.master_pool.start()
+        self.master_volume.start()
     }
 }

@@ -1,5 +1,5 @@
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
-use pmem::{driver::FileDriver, page::PagePool};
+use pmem::{driver::FileDriver, page::Volume};
 use rfs::{nfs::RFS, Filesystem};
 use std::{
     fs,
@@ -23,18 +23,18 @@ async fn main() {
     let file_path = "./target/test.db";
     let db_exists = fs::metadata(file_path).is_err();
     let driver = FileDriver::from_file(file_path).unwrap();
-    let mut pool = PagePool::with_capacity_and_driver(100 * 1024 * 1024, driver);
+    let mut volume = Volume::with_capacity_and_driver(100 * 1024 * 1024, driver);
     if db_exists {
         warn!(path = file_path, "Allocating FS");
-        let tx = Filesystem::allocate(pool.start()).finish();
-        pool.commit(tx).unwrap();
+        let tx = Filesystem::allocate(volume.start()).finish();
+        volume.commit(tx).unwrap();
     } else {
         info!(path = file_path, "Opening FS");
     }
 
-    let commit_notify = pool.commit_notify();
+    let commit_notify = volume.commit_notify();
 
-    let rfs = RFS::new(pool.start());
+    let rfs = RFS::new(volume.start());
     let state = rfs.state_handle();
     let listener = NFSTcpListener::bind(&format!("127.0.0.1:{HOSTPORT}"), rfs)
         .await
@@ -54,7 +54,7 @@ async fn main() {
             break;
         } else if cmd.trim() == "commit" {
             let mut s = state.lock().await;
-            s.commit(&mut pool).await;
+            s.commit(&mut volume).await;
             println!("Committed")
         } else {
             println!("Unknown command: {}", cmd)

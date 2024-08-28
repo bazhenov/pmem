@@ -73,8 +73,8 @@ impl MemoryInfo {
 impl Memory<Transaction> {
     #[cfg(test)]
     fn new() -> Self {
-        let pool = crate::page::PagePool::default();
-        Self::init(pool.start())
+        let volume = crate::page::Volume::default();
+        Self::init(volume.start())
     }
 }
 
@@ -538,7 +538,7 @@ pub const fn max<const N: usize>(array: [usize; N]) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use crate::page::PagePool;
+    use crate::page::Volume;
 
     use super::*;
     use pmem_derive::Record;
@@ -586,16 +586,16 @@ mod tests {
 
     #[test]
     fn memory_can_persist_over_commits() -> Result<()> {
-        let mut pool = PagePool::default();
-        let mut mem = Memory::init(pool.start());
+        let mut volume = Volume::default();
+        let mut mem = Memory::init(volume.start());
 
         let mut ptrs = vec![];
 
         for i in 0..10 {
             let handle = mem.write(Value(i))?;
             ptrs.push(handle.ptr());
-            pool.commit(mem.finish()).unwrap();
-            mem = Memory::open(pool.start());
+            volume.commit(mem.finish()).unwrap();
+            mem = Memory::open(volume.start());
         }
 
         for (i, ptr) in ptrs.into_iter().enumerate() {

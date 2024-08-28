@@ -1,4 +1,4 @@
-use pmem::page::{CommitNotify, PagePool, PagePoolHandle, Patch, TxWrite, LSN};
+use pmem::page::{CommitNotify, Patch, TxWrite, Volume, VolumeHandle, LSN};
 use protocol::{Message, PROTOCOL_VERSION};
 use std::{borrow::Cow, fmt::Debug, io, net::SocketAddr, pin::pin, thread};
 use tokio::{
@@ -73,7 +73,7 @@ async fn server_worker(mut socket: TcpStream, mut notify: CommitNotify) -> io::R
 
 pub async fn replica_connect(
     addr: impl ToSocketAddrs + Debug,
-) -> io::Result<(PagePoolHandle, JoinHandle<io::Result<()>>)> {
+) -> io::Result<(VolumeHandle, JoinHandle<io::Result<()>>)> {
     let mut socket = TcpStream::connect(&addr).await?;
     trace!(addr = ?addr, "Connected to remote");
     Message::ClientHello(PROTOCOL_VERSION)
@@ -88,16 +88,16 @@ pub async fn replica_connect(
         return io_error("Invalid protocol version");
     }
 
-    let pool = PagePool::new_in_memory(pages);
-    let read_handle = pool.handle();
+    let volume = Volume::new_in_memory(pages);
+    let read_handle = volume.handle();
 
-    let join_handle = tokio::spawn(client_worker(socket, pool));
+    let join_handle = tokio::spawn(client_worker(socket, volume));
 
     Ok((read_handle, join_handle))
 }
 
-#[instrument(skip(client, pool), fields(addr = %client.peer_addr().unwrap()))]
-async fn client_worker(mut client: TcpStream, mut pool: PagePool) -> io::Result<()> {
+#[instrument(skip(client, volume), fields(addr = %client.peer_addr().unwrap()))]
+async fn client_worker(mut client: TcpStream, mut volume: Volume) -> io::Result<()> {
     loop {
         let (lsn, snapshot) = next_snapshot(&mut client).await?;
         trace!(
@@ -106,7 +106,7 @@ async fn client_worker(mut client: TcpStream, mut pool: PagePool) -> io::Result<
             "Received snapshot from master"
         );
 
-        let mut tx = pool.start();
+        let mut tx = volume.start();
         for patch in snapshot {
             match patch {
                 Patch::Write(addr, bytes) => tx.write(addr, bytes),
@@ -114,7 +114,7 @@ async fn client_worker(mut client: TcpStream, mut pool: PagePool) -> io::Result<
             }
         }
 
-        let my_lsn = pool.commit(tx).unwrap();
+        let my_lsn = volume.commit(tx).unwrap();
         trace!(lsn = lsn, my_lsn = my_lsn, "Committed snapshot");
     }
 }

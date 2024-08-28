@@ -14,7 +14,7 @@ use nfsserve::{
     },
     vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities},
 };
-use pmem::page::{PagePool, Transaction};
+use pmem::page::{Transaction, Volume};
 use std::{
     io::{self, Read, Seek, SeekFrom, Write},
     mem,
@@ -34,11 +34,11 @@ pub struct RfsState {
 }
 
 impl RfsState {
-    pub async fn commit(&mut self, pool: &mut PagePool) {
-        let mut sw_fs = Filesystem::open(pool.start());
+    pub async fn commit(&mut self, volume: &mut Volume) {
+        let mut sw_fs = Filesystem::open(volume.start());
         mem::swap(&mut self.fs, &mut sw_fs);
-        pool.commit(sw_fs.finish()).unwrap();
-        let new_tx = pool.start();
+        volume.commit(sw_fs.finish()).unwrap();
+        let new_tx = volume.start();
         self.fs = Filesystem::open(new_tx);
     }
 }
