@@ -61,7 +61,7 @@ use crate::driver::{FileDriver, PageDriver};
 use arc_swap::ArcSwap;
 use std::{
     borrow::Cow,
-    collections::BTreeMap,
+    collections::{btree_map::Entry, BTreeMap},
     fmt::{self, Display, Formatter},
     io,
     ops::Range,
@@ -648,8 +648,12 @@ impl Pages {
     }
 
     fn ensure_loaded(&mut self, page_no: PageNo) -> io::Result<&mut Page> {
-        let page = self.pages.entry(page_no).or_insert_with(Page::new);
-        self.driver.read_page(page_no, page.data.as_mut())?;
+        let entry = self.pages.entry(page_no);
+        let present = matches!(entry, Entry::Occupied(_));
+        let page = entry.or_insert_with(Page::new);
+        if !present {
+            self.driver.read_page(page_no, page.data.as_mut())?;
+        }
         Ok(page)
     }
 
