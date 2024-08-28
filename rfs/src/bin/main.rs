@@ -5,6 +5,7 @@ use std::{
     fs,
     io::{self, Write},
 };
+use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 const HOSTPORT: u32 = 11111;
@@ -20,11 +21,15 @@ async fn main() {
         .init();
 
     let file_path = "./target/test.db";
+    let db_exists = fs::metadata(file_path).is_err();
     let driver = FileDriver::from_file(file_path).unwrap();
     let mut pool = PagePool::with_capacity_and_driver(100 * 1024 * 1024, driver);
-    if fs::metadata(file_path).is_err() {
+    if db_exists {
+        warn!(path = file_path, "Allocating FS");
         let tx = Filesystem::allocate(pool.start()).finish();
         pool.commit(tx).unwrap();
+    } else {
+        info!(path = file_path, "Opening FS");
     }
 
     let commit_notify = pool.commit_notify();

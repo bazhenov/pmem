@@ -61,6 +61,7 @@ use crate::driver::{FileDriver, PageDriver};
 use arc_swap::ArcSwap;
 use std::{
     borrow::Cow,
+    collections::BTreeMap,
     fmt::{self, Display, Formatter},
     io,
     ops::Range,
@@ -397,7 +398,7 @@ pub enum Error {
 /// at different points in time, or for implementing undo/redo functionality where each snapshot
 /// can represent a state in the history of changes.
 pub struct PagePool {
-    pages: Arc<Mutex<Box<dyn PageDriver>>>,
+    pages: Arc<Mutex<Pages>>,
     pages_count: PageNo,
 
     /// Reference to the [`UndoEntry`] for the last committed transaction.
@@ -422,7 +423,8 @@ pub struct PagePool {
 }
 
 impl PagePool {
-    /// Constructs a new `PagePool` with a specified number of pages.
+    /// Constructs a new `PagePool` with a specified number of pages with memory page-driver.
+    /// The data in this pool is **not persisted** to disk.
     ///
     /// This function initializes a `PagePool` instance with an empty set of patches and
     /// a given number of pages. See [`Self::with_capacity`] for creating a pool with a specified
@@ -457,7 +459,7 @@ impl PagePool {
         };
         let commit = Mutex::new(Arc::new(Some(commit)));
         Self {
-            pages: Arc::new(Mutex::new(driver)),
+            pages: Arc::new(Mutex::new(Pages::new(driver))),
             pages_count: page_cnt as PageNo,
             undo_log: Arc::new(Some(UndoEntry::default())),
             latest_commit: Arc::new((commit, Condvar::new())),
@@ -526,7 +528,7 @@ impl PagePool {
                     let len = slice_range.len();
                     let page_range = offset..(offset + len);
 
-                    let page = locked_pages.read_page_mut(page_no)?;
+                    let page = locked_pages.get_page_mut(page_no)?;
 
                     // Forming undo patch
                     undo_patch[slice_range.clone()].copy_from_slice(&page[page_range.clone()]);
@@ -608,10 +610,10 @@ impl PagePool {
     #[cfg(test)]
     fn into_driver(self) -> Option<Box<dyn PageDriver>> {
         let lock = Arc::into_inner(self.pages)?;
-        let Ok(driver) = lock.into_inner() else {
+        let Ok(pages) = lock.into_inner() else {
             return None;
         };
-        Some(driver)
+        Some(pages.into_inner())
     }
 
     #[cfg(test)]
@@ -632,6 +634,64 @@ impl Default for PagePool {
     }
 }
 
+struct Pages {
+    pages: BTreeMap<PageNo, Page>,
+    driver: Box<dyn PageDriver>,
+}
+
+impl Pages {
+    pub fn new(driver: Box<dyn PageDriver>) -> Self {
+        Self {
+            pages: BTreeMap::new(),
+            driver,
+        }
+    }
+
+    fn ensure_loaded(&mut self, page_no: PageNo) -> io::Result<&mut Page> {
+        let page = self.pages.entry(page_no).or_insert_with(Page::new);
+        self.driver.read_page(page_no, page.data.as_mut())?;
+        Ok(page)
+    }
+
+    fn get_page(&mut self, page_no: PageNo) -> io::Result<Option<&[u8; PAGE_SIZE]>> {
+        Ok(Some(self.ensure_loaded(page_no)?.data.as_ref()))
+    }
+
+    fn get_page_mut(&mut self, page_no: PageNo) -> io::Result<&mut [u8; PAGE_SIZE]> {
+        let page = self.ensure_loaded(page_no)?;
+        page.dirty = true;
+        Ok(page.data.as_mut())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        for (page_no, page) in self.pages.iter() {
+            if page.dirty {
+                self.driver.write_page(*page_no, page.data.as_ref())?;
+            }
+        }
+        self.driver.flush()
+    }
+
+    #[cfg(test)]
+    fn into_inner(self) -> Box<dyn PageDriver> {
+        self.driver
+    }
+}
+
+struct Page {
+    data: Box<[u8; PAGE_SIZE]>,
+    dirty: bool,
+}
+
+impl Page {
+    fn new() -> Self {
+        Self {
+            data: Box::new([0; PAGE_SIZE]),
+            dirty: false,
+        }
+    }
+}
+
 /// Describes a changes that need to be applied to the page to restore it to the state
 /// before particular transaction was committed.
 ///
@@ -649,7 +709,7 @@ pub struct PagePoolHandle {
     notify: CommitNotify,
     pages_count: PageNo,
     undo_log: Arc<Option<UndoEntry>>,
-    pages: Arc<Mutex<Box<dyn PageDriver>>>,
+    pages: Arc<Mutex<Pages>>,
 }
 
 impl PagePoolHandle {
@@ -771,7 +831,7 @@ pub trait TxWrite: TxRead {
 pub struct Snapshot {
     pages_count: PageNo,
     undo_log: Arc<Option<UndoEntry>>,
-    pages: Arc<Mutex<Box<dyn PageDriver>>>,
+    pages: Arc<Mutex<Pages>>,
     lsn: LSN,
 }
 
@@ -796,7 +856,7 @@ impl Snapshot {
             for (addr, range) in PageSegments::new(addr, len) {
                 let (page_no, offset) = split_ptr(addr);
                 let offset = offset as usize;
-                if let Some(page) = locked_pages.read_page(page_no).unwrap() {
+                if let Some(page) = locked_pages.get_page(page_no).unwrap() {
                     let len = range.len();
                     buf[range].copy_from_slice(&page[offset..offset + len]);
                 }
