@@ -1,4 +1,4 @@
-use crate::page::{Addr, PageOffset, Transaction, TxRead, TxWrite};
+use crate::volume::{Addr, PageOffset, Transaction, TxRead, TxWrite};
 use pmem_derive::Record;
 use std::{
     any::type_name,
@@ -34,7 +34,7 @@ pub enum Error {
     UnexpectedVariantCode(u64),
 
     #[error("Page error: {0}")]
-    Page(#[from] crate::page::Error),
+    Page(#[from] crate::volume::Error),
 }
 
 impl From<Error> for io::Error {
@@ -73,7 +73,7 @@ impl MemoryInfo {
 impl Memory<Transaction> {
     #[cfg(test)]
     fn new() -> Self {
-        let volume = crate::page::Volume::default();
+        let volume = crate::volume::Volume::default();
         Self::init(volume.start())
     }
 }
@@ -538,7 +538,7 @@ pub const fn max<const N: usize>(array: [usize; N]) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use crate::page::Volume;
+    use crate::volume::Volume;
 
     use super::*;
     use pmem_derive::Record;

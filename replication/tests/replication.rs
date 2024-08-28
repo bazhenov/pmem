@@ -1,4 +1,4 @@
-use pmem::page::{Addr, Transaction, TxRead, TxWrite, Volume, VolumeHandle, PAGE_SIZE};
+use pmem::volume::{Addr, Transaction, TxRead, TxWrite, Volume, VolumeHandle, PAGE_SIZE};
 use replication::{replica_connect, start_replication_server};
 use std::{io, net::SocketAddr};
 use tokio::task::{spawn_blocking, JoinHandle};

@@ -14,7 +14,7 @@ use nfsserve::{
     },
     vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities},
 };
-use pmem::page::{Transaction, Volume};
+use pmem::volume::{Transaction, Volume};
 use std::{
     io::{self, Read, Seek, SeekFrom, Write},
     mem,

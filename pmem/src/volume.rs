@@ -34,7 +34,7 @@
 //! ## Example
 //!
 //! ```rust
-//! use pmem::page::{Volume, TxRead, TxWrite};
+//! use pmem::volume::{Volume, TxRead, TxWrite};
 //!
 //! let mut volume = Volume::new_in_memory(5);    // Initialize a volume with 5 pages
 //!
@@ -371,7 +371,7 @@ pub enum Error {
 /// Modify the contents of a volume using a transaction:
 ///
 /// ```
-/// use pmem::page::{Volume, TxWrite};
+/// use pmem::volume::{Volume, TxWrite};
 ///
 /// let mut volume = Volume::new_in_memory(5);  // Initialize a volume with 5 pages
 /// let mut tx = volume.start();        // Create a new transaction
@@ -381,7 +381,7 @@ pub enum Error {
 ///
 /// Creating a snapshot of the volume:
 /// ```
-/// use pmem::page::{Volume, TxWrite, TxRead};
+/// use pmem::volume::{Volume, TxWrite, TxRead};
 ///
 /// let mut volume = Volume::new_in_memory(5);
 /// let snapshot = volume.snapshot();   // Create a new snapshot
@@ -477,7 +477,7 @@ impl Volume {
     /// Basic usage:
     ///
     /// ```
-    /// # use pmem::page::Volume;
+    /// # use pmem::volume::Volume;
     /// let mut volume = Volume::new_in_memory(1);
     /// let tx = volume.start();
     /// // tx modifications won't affect the original volume until committed.

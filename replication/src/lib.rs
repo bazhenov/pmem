@@ -1,4 +1,4 @@
-use pmem::page::{CommitNotify, Patch, TxWrite, Volume, VolumeHandle, LSN};
+use pmem::volume::{CommitNotify, Patch, TxWrite, Volume, VolumeHandle, LSN};
 use protocol::{Message, PROTOCOL_VERSION};
 use std::{borrow::Cow, fmt::Debug, io, net::SocketAddr, pin::pin, thread};
 use tokio::{

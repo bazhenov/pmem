@@ -1,4 +1,4 @@
-use pmem::page::{TxWrite, Volume};
+use pmem::volume::{TxWrite, Volume};
 use rand::{rngs::SmallRng, seq::SliceRandom, Rng, SeedableRng};
 use rfs::{FileMeta, Filesystem};
 use std::io::{Read, Seek, SeekFrom, Write};

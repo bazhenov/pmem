@@ -1,5 +1,5 @@
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
-use pmem::{driver::FileDriver, page::Volume};
+use pmem::{driver::FileDriver, volume::Volume};
 use rfs::{nfs::RFS, Filesystem};
 use std::{
     fs,

@@ -1,6 +1,6 @@
 use pmem::{
     memory::{self, SlicePtr, PTR_SIZE},
-    page::{Addr, TxRead, TxWrite},
+    volume::{Addr, TxRead, TxWrite},
     Handle, Memory, Ptr, Record,
 };
 use pmem_derive::Record;
@@ -1075,7 +1075,7 @@ impl<'a, S: TxRead> fmt::Debug for FsTree<'a, S> {
 mod tests {
     use super::*;
     use fmt::Debug;
-    use pmem::page::{Transaction, Volume};
+    use pmem::volume::{Transaction, Volume};
     use std::{collections::HashSet, fs};
 
     macro_rules! assert_not_exists {
@@ -1653,7 +1653,7 @@ mod tests {
 
     mod proptests {
         use super::*;
-        use pmem::page::Volume;
+        use pmem::volume::Volume;
         use prop::collection::hash_set;
         use proptest::{collection::vec, prelude::*, prop_oneof, proptest, strategy::Strategy};
         use std::{fs, ops::Range};

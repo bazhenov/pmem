@@ -1,6 +1,6 @@
 pub mod driver;
 pub mod memory;
-pub mod page;
+pub mod volume;
 
 pub use memory::{Handle, Memory, Ptr, Record};
 

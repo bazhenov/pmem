@@ -1,4 +1,4 @@
-use crate::page::{PageNo, PAGE_SIZE};
+use crate::volume::{PageNo, PAGE_SIZE};
 use std::{
     fs::{self, File},
     io::{self, Cursor, Read, Seek, SeekFrom, Write},
