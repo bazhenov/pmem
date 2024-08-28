@@ -1572,7 +1572,7 @@ mod tests {
     }
 
     #[test]
-    fn page_pool_can_be_resotred_after_reopen() {
+    fn page_pool_can_be_restored_after_reopen() {
         let mut pool = PagePool::new_with_driver(1, Box::new(FileDriver::in_memory()));
 
         let mut tx = pool.start();
