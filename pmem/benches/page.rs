@@ -10,13 +10,13 @@ const DB_SIZE: usize = 1024 * 1024;
 
 fn page_benchmarks() -> impl IntoBenchmarks {
     [
-        benchmark_fn("arbitrary_read", bench_read),
-        benchmark_fn("arbitrary_write", bench_write),
-        benchmark_fn("write_commit", bench_write_commit),
+        benchmark_fn("arbitrary_read", arbitrary_read),
+        benchmark_fn("arbitrary_write", arbitrary_write),
+        benchmark_fn("write_commit", write_commit),
     ]
 }
 
-fn bench_read(b: Bencher) -> Box<dyn Sampler> {
+fn arbitrary_read(b: Bencher) -> Box<dyn Sampler> {
     let mut rng = SmallRng::seed_from_u64(b.seed);
     let mem = generate_mem(&mut rng);
     b.iter(move || {
@@ -26,7 +26,7 @@ fn bench_read(b: Bencher) -> Box<dyn Sampler> {
     })
 }
 
-fn bench_write(b: Bencher) -> Box<dyn Sampler> {
+fn arbitrary_write(b: Bencher) -> Box<dyn Sampler> {
     let mut rng = SmallRng::seed_from_u64(b.seed);
 
     let mut buffer = [0u8; DB_SIZE];
@@ -40,7 +40,7 @@ fn bench_write(b: Bencher) -> Box<dyn Sampler> {
     })
 }
 
-fn bench_write_commit(b: Bencher) -> Box<dyn Sampler> {
+fn write_commit(b: Bencher) -> Box<dyn Sampler> {
     let mut rng = SmallRng::seed_from_u64(b.seed);
 
     let mut buffer = [0u8; DB_SIZE];
