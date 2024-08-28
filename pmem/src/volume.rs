@@ -607,8 +607,7 @@ impl Volume {
         }
     }
 
-    #[cfg(test)]
-    fn into_driver(self) -> Option<Box<dyn PageDriver>> {
+    pub fn into_driver(self) -> Option<Box<dyn PageDriver>> {
         let lock = Arc::into_inner(self.pages)?;
         let Ok(pages) = lock.into_inner() else {
             return None;
@@ -676,7 +675,6 @@ impl Pages {
         self.driver.flush()
     }
 
-    #[cfg(test)]
     fn into_inner(self) -> Box<dyn PageDriver> {
         self.driver
     }
@@ -1255,6 +1253,10 @@ impl DoubleEndedIterator for PageSegments {
 
 #[cfg(test)]
 mod tests {
+    use tempfile::tempdir;
+
+    use crate::driver::FileDriver;
+
     use super::*;
     use std::thread;
 
@@ -1576,17 +1578,19 @@ mod tests {
     }
 
     #[test]
-    fn page_volume_can_be_restored_after_reopen() {
-        let mut volume = Volume::new_with_driver(1, Box::new(MemoryDriver));
+    fn page_volume_can_be_restored_after_reopen() -> io::Result<()> {
+        let tempdir = tempdir()?;
+        let db_file = tempdir.path().join("test.db");
+        let mut volume = Volume::new_with_driver(1, Box::new(FileDriver::from_file(&db_file)?));
 
         let mut tx = volume.start();
         tx.write(0, [42]);
         volume.commit(tx).unwrap();
+        drop(volume);
 
-        let driver = volume.into_driver().unwrap();
-        let volume = Volume::new_with_driver(1, driver);
-
+        let volume = Volume::new_with_driver(1, Box::new(FileDriver::from_file(&db_file)?));
         assert_eq!(&*volume.read(0, 1), [42]);
+        Ok(())
     }
 
     mod patch {
