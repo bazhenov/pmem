@@ -6,12 +6,13 @@ edition = "2021"
 [dependencies]
 thiserror = { workspace = true }
 pmem-derive = { workspace = true }
+arc-swap = { workspace = true }
 
 [dev-dependencies]
 proptest = "1.0.0"
 rand = { workspace = true, features = ["small_rng"] }
 tango-bench = { workspace = true }
-arc-swap = { workspace = true }
+tempfile.workspace = true
 
 [[bench]]
 name = "page"

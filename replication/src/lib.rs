@@ -1,6 +1,6 @@
-use pmem::page::{CommitNotify, CommittedSnapshot, PagePool, PagePoolHandle, Patch, TxWrite, LSN};
+use pmem::volume::{CommitNotify, Patch, TxWrite, Volume, VolumeHandle, LSN};
 use protocol::{Message, PROTOCOL_VERSION};
-use std::{borrow::Cow, fmt::Debug, io, net::SocketAddr, pin::pin, sync::Arc, thread};
+use std::{borrow::Cow, fmt::Debug, io, net::SocketAddr, pin::pin, thread};
 use tokio::{
     net::{TcpListener, TcpStream, ToSocketAddrs},
     sync,
@@ -51,50 +51,29 @@ async fn server_worker(mut socket: TcpStream, mut notify: CommitNotify) -> io::R
     trace!(lsn = last_seen_lsn, "Starting log relay");
     let (tx, mut rx) = sync::mpsc::channel(1);
 
-    thread::spawn(move || while tx.blocking_send(notify.next_snapshot()).is_ok() {});
+    thread::spawn(move || {
+        let commit = notify.next_commit();
+        while tx
+            .blocking_send((commit.lsn(), commit.patches().to_vec()))
+            .is_ok()
+        {}
+    });
 
-    while let Some(snapshot) = rx.recv().await {
-        for lsn in last_seen_lsn..=snapshot.lsn() {
-            let next_snapshot = snapshot.find_at_lsn(lsn).unwrap();
-            let patches = next_snapshot.patches();
-            trace!(lsn = lsn, patches = patches.len(), "Sending snapshot");
-            for patch in patches {
-                Message::Patch(Cow::Borrowed(patch))
-                    .write_to(pin!(&mut socket))
-                    .await?;
-            }
-            Message::Commit(lsn).write_to(pin!(&mut socket)).await?;
+    while let Some((lsn, patches)) = rx.recv().await {
+        trace!(lsn = lsn, patches = patches.len(), "Sending snapshot");
+        for patch in patches {
+            Message::Patch(Cow::Owned(patch))
+                .write_to(pin!(&mut socket))
+                .await?;
         }
+        Message::Commit(lsn).write_to(pin!(&mut socket)).await?;
     }
     Ok(())
 }
 
-pub struct PoolReplica {
-    pool: PagePool,
-    last_snapshot: Arc<CommittedSnapshot>,
-}
-
-impl PoolReplica {
-    pub fn new(pool: PagePool) -> Self {
-        let last_snapshot = Arc::new(CommittedSnapshot::default());
-        Self {
-            pool,
-            last_snapshot,
-        }
-    }
-
-    pub fn snapshot(&self) -> Arc<CommittedSnapshot> {
-        self.last_snapshot.clone()
-    }
-
-    pub fn commit_notify(&self) -> CommitNotify {
-        self.pool.commit_notify()
-    }
-}
-
 pub async fn replica_connect(
     addr: impl ToSocketAddrs + Debug,
-) -> io::Result<(PagePoolHandle, JoinHandle<io::Result<()>>)> {
+) -> io::Result<(VolumeHandle, JoinHandle<io::Result<()>>)> {
     let mut socket = TcpStream::connect(&addr).await?;
     trace!(addr = ?addr, "Connected to remote");
     Message::ClientHello(PROTOCOL_VERSION)
@@ -109,16 +88,16 @@ pub async fn replica_connect(
         return io_error("Invalid protocol version");
     }
 
-    let pool = PagePool::new(pages as usize);
-    let read_handle = pool.handle();
+    let volume = Volume::new_in_memory(pages);
+    let read_handle = volume.handle();
 
-    let join_handle = tokio::spawn(client_worker(socket, pool));
+    let join_handle = tokio::spawn(client_worker(socket, volume));
 
     Ok((read_handle, join_handle))
 }
 
-#[instrument(skip(client, pool), fields(addr = %client.peer_addr().unwrap()))]
-async fn client_worker(mut client: TcpStream, mut pool: PagePool) -> io::Result<()> {
+#[instrument(skip(client, volume), fields(addr = %client.peer_addr().unwrap()))]
+async fn client_worker(mut client: TcpStream, mut volume: Volume) -> io::Result<()> {
     loop {
         let (lsn, snapshot) = next_snapshot(&mut client).await?;
         trace!(
@@ -127,15 +106,15 @@ async fn client_worker(mut client: TcpStream, mut pool: PagePool) -> io::Result<
             "Received snapshot from master"
         );
 
-        let mut s = pool.snapshot();
+        let mut tx = volume.start();
         for patch in snapshot {
             match patch {
-                Patch::Write(addr, bytes) => s.write(addr, bytes),
-                Patch::Reclaim(addr, len) => s.reclaim(addr, len),
+                Patch::Write(addr, bytes) => tx.write(addr, bytes),
+                Patch::Reclaim(addr, len) => tx.reclaim(addr, len),
             }
         }
 
-        let my_lsn = pool.commit(s);
+        let my_lsn = volume.commit(tx).unwrap();
         trace!(lsn = lsn, my_lsn = my_lsn, "Committed snapshot");
     }
 }

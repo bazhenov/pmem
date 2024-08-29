@@ -1,72 +1,74 @@
-//! # Page Management
+//! # Page Management Module
 //!
 //! This module provides a system for managing and manipulating snapshots of a memory. It is designed
 //! to facilitate operations on persistent memory (pmem), allowing for efficient snapshots, modifications, and commits
-//! of data changes. The core functionality revolves around the `PagePool` structure, which manages a pool of pages,
-//! and the `Snapshot` structure, which represents a modifiable snapshot of the page pool's state at a given point
+//! of data changes. The core functionality revolves around the [`Volume`] structure, which manages a volume of pages,
+//! and the [`Transaction`] structure, which represents a modifiable session of the volume's state at a given point
 //! in time.
 //!
 //! ## Concepts
 //!
-//! - [`PagePool`]: A collection of pages that can be snapshot, modified, and committed. It acts as the primary
+//! - [`Volume`]: A collection of pages that can be snapshoted, modified, and committed. It acts as the primary
 //!   interface for interacting with the page memory.
-//! - [`Snapshot`]: A snapshot represents the state of the page pool at a specific moment.
-//!   It can be modified independently of the pool, and later committed back to the pool to update its state.
-//! - [`CommittedSnapshot`]: A snapshot that has been committed to the page pool. It is immutable and can be
-//!   used to read data from the pool.
-//! - [`Patch`]: A modification recorded in a snapshot. It consists of the address where the modification starts and
+//! - [`Transaction`]: A read/write session allowing modifications of the volume.
+//!   It can be modified independently of the volume, and later committed back to the volume to update its state.
+//! - [`Snapshot`]: A frozen state of the volume at some point in time. It is immutable and only can be
+//!   used to read data.
+//! - [`Patch`]: A modification recorded in a transaction. It consists of the address where the modification starts and
 //!   the bytes that were written.
-//! - [`PagePoolHandle`]: A read-only view of the page pool that can be used to read data from the pool and
-//!   wait for new snapshots to be committed. It's useful for concurrent access to the pool.
+//! - [`Volume`]: A read-only view of the volume that can be used to read data from the volume and
+//!   wait for new snapshots to be committed. It's useful for concurrent access to the volume.
 //!
 //! ## Usage
 //!
 //! The module is designed to be used as follows:
 //!
-//! 1. **Initialization**: Create a new `PagePool`.
-//! 2. **Snapshotting**: Create a snapshot of the current state of the `PagePool`.
-//! 3. **Modification**: Use the snapshot to perform modifications. Each modification is recorded as a patch.
-//! 4. **Commit**: Commit the snapshot back to the `PagePool`, applying all the patches and updating the pool's state.
-//! 5. **Concurrent Access**: Optionally, create a `PagePoolHandle` for read-only access to the pool from other threads.
+//! 1. **Initialization**: Create a new [`Volume`].
+//! 2. **Transactioning**: Create a [`Transaction`] of the current state.
+//! 3. **Modification**: Use the [`Transaction`] to perform modifications. Each modification is recorded as a patch.
+//! 4. **Commit**: Commit the snapshot back to the [`Volume`], applying all the patches and updating
+//!    the volume's state.
+//! 5. **Concurrent Access**: Optionally, create a [`Volume`] for read-only access to the volume
+//!    from other threads.
 //!
 //! ## Example
 //!
 //! ```rust
-//! use pmem::page::{PagePool, TxRead, TxWrite};
+//! use pmem::volume::{Volume, TxRead, TxWrite};
 //!
-//! let mut pool = PagePool::new(5);    // Initialize a pool with 5 pages
-//! let mut snapshot = pool.snapshot(); // Create a snapshot of the current state
-//! snapshot.write(0, &[1, 2, 3, 4]);   // Write 4 bytes at offset 0 (uses TxWrite trait)
-//! pool.commit(snapshot);              // Commit the changes back to the pool
+//! let mut volume = Volume::new_in_memory(5);    // Initialize a volume with 5 pages
 //!
 //! // Create a handle for concurrent read-only access
-//! let handle = pool.handle();
-//! let committed_snapshot = handle.snapshot();
-//! assert_eq!(committed_snapshot.read(0, 4), vec![1, 2, 3, 4]); // Read using TxRead trait
+//! let mut handle = volume.handle();
+//!
+//! let mut tx = volume.start();  // Create a new transaction
+//! tx.write(0, &[1, 2, 3, 4]);   // Write 4 bytes at offset 0
+//! volume.commit(tx);            // Commit the changes back to the volume
+//!
+//! let snapshot = handle.wait();
+//! assert_eq!(snapshot.read(0, 4), vec![1, 2, 3, 4]); // Read using TxRead trait
 //! ```
 //!
 //! The [`TxRead`] and [`TxWrite`] traits provide methods for reading from and writing to snapshots, respectively.
 //!
-//! ## Safety and Correctness
-//!
-//! The module ensures safety and correctness through the following mechanisms:
-//!
-//! - **Immutability of Committed Snapshots**: Once a snapshot is committed, it becomes immutable, ensuring that
-//!   any reference to its data remains valid and unchanged until corresponding `Arc` reference is held.
-//! - **Linear Snapshot History**: The module enforces a linear history of snapshots, preventing branches in the
-//!   snapshot history and ensuring consistency of changes proposed in snapshots.
-//!
 //! ## Performance Considerations
 //!
-//! Since snapshots do not require duplicating the entire state of the page pool, they can be created with minimal
+//! Since snapshots do not require duplicating the entire state of the volume, they can be created with minimal
 //! overhead, making it perfectly valid and cost-effective to create a snapshot even when the intention is only to
 //! read data without any modifications.
 
+use crate::driver::{MemoryDriver, PageDriver};
+use arc_swap::ArcSwap;
 use std::{
     borrow::Cow,
+    collections::{btree_map::Entry, BTreeMap},
     fmt::{self, Display, Formatter},
+    io,
     ops::Range,
-    sync::{Arc, Condvar, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Condvar, Mutex,
+    },
 };
 
 pub const PAGE_SIZE_BITS: usize = 16;
@@ -206,14 +208,14 @@ impl Patch {
 
         match self.reorder(other) {
             (Write(addr_a, mut a), Write(addr_b, b)) => {
-                if a.len() + b.len() < 1024 {
+                if a.len() + b.len() < PAGE_SIZE {
                     a.extend(b);
                     Merged(Write(addr_a, a))
                 } else {
                     Reordered(Write(addr_a, a), Write(addr_b, b))
                 }
             }
-            (Reclaim(addr, a), Reclaim(_, b)) => Merged(Reclaim(addr, a + b)),
+            (Reclaim(addr_a, a), Reclaim(_, b)) => Merged(Reclaim(addr_a, a + b)),
             (a, b) => Reordered(a, b),
         }
     }
@@ -276,6 +278,10 @@ impl Patch {
             Patch::Reclaim(addr, _) => *addr = value,
         }
     }
+}
+
+fn are_on_the_same_page(a1: Addr, a2: Addr) -> bool {
+    a1 / PAGE_SIZE as Addr == a2 / PAGE_SIZE as Addr
 }
 
 impl Display for Patch {
@@ -352,233 +358,440 @@ pub enum Error {
     NoSnapshot(u64, u64),
 }
 
-/// A pool of pages that can capture and commit snapshots of data changes.
+/// A logically contiguous set of pages that can be transacted on.
 ///
-/// The `PagePool` struct allows for the creation of snapshots representing the state
-/// of a set of pages at a particular point in time. These snapshots can then be modified
-/// and eventually committed back to the pool, updating the pool's state to reflect the changes
-/// made in the snapshot.
+/// The `Volume` struct allows for the creation of:
+///
+/// - [`Snapshot`] – readonly views of the volume's state at a particular point in time.
+/// - [`Transaction`] - mutable views of the volume's state that can be modified and
+///   eventually committed back to the volume.
 ///
 /// # Examples
 ///
-/// Basic usage:
+/// Modify the contents of a volume using a transaction:
 ///
 /// ```
-/// # use pmem::page::{PagePool, TxWrite};
-/// let mut pool = PagePool::new(5);    // Initialize a pool with 5 pages
-/// let mut snapshot = pool.snapshot(); // Create a snapshot of the current state
-/// snapshot.write(0, &[0, 1, 2, 3]);   // Modify the snapshot
-/// pool.commit(snapshot);              // Commit the changes back to the pool
+/// use pmem::volume::{Volume, TxWrite};
+///
+/// let mut volume = Volume::new_in_memory(5);  // Initialize a volume with 5 pages
+/// let mut tx = volume.start();        // Create a new transaction
+/// tx.write(0, &[0, 1, 2, 3]);       // Modify the snapshot
+/// volume.commit(tx);                  // Commit the changes back to the volume
+/// ```
+///
+/// Creating a snapshot of the volume:
+/// ```
+/// use pmem::volume::{Volume, TxWrite, TxRead};
+///
+/// let mut volume = Volume::new_in_memory(5);
+/// let snapshot = volume.snapshot();   // Create a new snapshot
+///
+/// let mut tx = volume.start();
+/// tx.write(0, &[0, 1, 2, 3]);
+/// volume.commit(tx);
+///
+/// // The snapshot remains unchanged even after committing changes to the volume
+/// assert_eq!(&*snapshot.read(0, 4), &[0, 0, 0, 0]);
 /// ```
 ///
 /// This structure is particularly useful for systems that require consistent views of data
 /// at different points in time, or for implementing undo/redo functionality where each snapshot
 /// can represent a state in the history of changes.
-#[derive(Default)]
-pub struct PagePool {
-    latest: Arc<Mutex<Arc<CommittedSnapshot>>>,
-    notify: Arc<Condvar>,
+pub struct Volume {
+    pages: Arc<Mutex<Pages>>,
+    pages_count: PageNo,
+
+    /// Reference to the [`UndoEntry`] for the last committed transaction.
+    ///
+    /// When committing a transaction, this is used to create a snapshot and subsequent commits
+    /// will append undo log with the changes required to maintain REPEATABLE READ isolation level for the
+    /// snapshot.
+    ///
+    /// Ideally it should not contain `Option`, because it is required to be present
+    /// for the snapshot to be created. Unfortunately, this is not possible due to the fact
+    /// that [`UndoEntry::next`] which is [`ArcSwap`] must contains `Option` to be able
+    /// to stop reference chain at some point and we can not have both `Arc<T>` and `Arc<Option<T>>` as the same time.
+    undo_log: Arc<Option<UndoEntry>>,
+
+    /// A log sequence number (LSN) that uniquely identifies this snapshot. The LSN
+    /// is used internally to ensure that snapshots are applied in a linear and consistent order.
+    lsn: AtomicU64,
+
+    /// Reference to the latest commit and condition variable used to notify waiting threads
+    /// that a new commit has been completed
+    latest_commit: Arc<(Mutex<Arc<Option<Commit>>>, Condvar)>,
 }
 
-impl PagePool {
-    /// Constructs a new `PagePool` with a specified number of pages.
+impl Volume {
+    /// Constructs a new `Volume` with a specified number of pages with memory page-driver.
+    /// The data in this volume is **not persisted** to disk.
     ///
-    /// This function initializes a `PagePool` instance with an empty set of patches and
-    /// a given number of pages. See [`Self::with_capacity`] for creating a pool with a specified
+    /// This function initializes a `Volume` instance with an empty set of patches and
+    /// a given number of pages. See [`Self::with_capacity`] for creating a volume with a specified
     /// capacity in bytes.
     ///
     /// # Arguments
     ///
-    /// * `pages` - The number of pages the pool should initially contain. This determines
-    ///   the range of valid addresses that can be written to in snapshots derived from this pool.
-    pub fn new(pages: usize) -> Self {
-        let snapshot = CommittedSnapshot {
-            patches: vec![],
-            base: None,
-            pages: u32::try_from(pages).unwrap(),
-            lsn: 0,
-        };
-        Self::from_snapshot(snapshot)
-    }
-
-    fn from_snapshot(snapshot: CommittedSnapshot) -> Self {
-        Self {
-            latest: Arc::new(Mutex::new(Arc::new(snapshot))),
-            notify: Arc::new(Condvar::new()),
-        }
+    /// * `pages` - The number of pages the volume should initially contain. This determines
+    ///   the range of valid addresses that can be written to in snapshots derived from this volume.
+    pub fn new_in_memory(page_cnt: PageNo) -> Self {
+        Self::new_with_driver(page_cnt, Box::new(MemoryDriver))
     }
 
     pub fn with_capacity(bytes: usize) -> Self {
         let pages = (bytes + PAGE_SIZE) / PAGE_SIZE;
-        Self::new(pages)
+        let pages = u32::try_from(pages).expect("Too large capacity for the volume");
+        Self::new_in_memory(pages)
     }
 
-    /// Takes a snapshot of the current state of the `PagePool`.
+    pub fn with_capacity_and_driver(bytes: usize, driver: impl PageDriver + 'static) -> Self {
+        let pages = (bytes + PAGE_SIZE) / PAGE_SIZE;
+        let pages = u32::try_from(pages).expect("Too large capacity for the volume");
+        Self::new_with_driver(pages, Box::new(driver))
+    }
+
+    fn new_with_driver(page_cnt: u32, driver: Box<dyn PageDriver>) -> Self {
+        assert!(page_cnt > 0, "The number of pages must be greater than 0");
+        let commit = Commit {
+            changes: vec![],
+            next: ArcSwap::from_pointee(None),
+            lsn: 0,
+        };
+        let commit = Mutex::new(Arc::new(Some(commit)));
+        Self {
+            pages: Arc::new(Mutex::new(Pages::new(driver))),
+            pages_count: page_cnt as PageNo,
+            undo_log: Arc::new(Some(UndoEntry::default())),
+            latest_commit: Arc::new((commit, Condvar::new())),
+            lsn: AtomicU64::new(0),
+        }
+    }
+
+    /// Creates a new transaction over the current state of the volume.
     ///
-    /// This method creates a `Snapshot` instance representing the current state of the page pool.
-    /// The snapshot can be used to perform modifications independently of the pool. These modifications
-    /// are not reflected in the pool until the snapshot is committed using the [`commit`] method.
+    /// The transaction can be used to perform modifications independently of the volume. These modifications
+    /// are not reflected in the volume until the snapshot is committed using the [`commit`] method.
     ///
     /// # Examples
     ///
     /// Basic usage:
     ///
     /// ```
-    /// # use pmem::page::PagePool;
-    /// # let mut pool = PagePool::new(5);
-    /// let snapshot = pool.snapshot();
-    /// // The snapshot can now be modified, and those modifications
-    /// // won't affect the original pool until committed.
+    /// # use pmem::volume::Volume;
+    /// let mut volume = Volume::new_in_memory(1);
+    /// let tx = volume.start();
+    /// // tx modifications won't affect the original volume until committed.
     /// ```
     ///
-    /// # Returns
-    ///
-    /// A `Snapshot` instance representing the current state of the page pool. It can be used both for reading and
-    /// changing state of the page pool.
-    ///
     /// [`commit`]: Self::commit
-    pub fn snapshot(&self) -> Snapshot {
-        let base = self.latest.lock().unwrap();
-        let pages = base.pages;
-        Snapshot {
-            patches: vec![],
-            base: Arc::clone(&base),
-            pages,
+    pub fn start(&self) -> Transaction {
+        Transaction {
+            uncommitted: vec![],
+            base: self.snapshot(),
         }
     }
 
-    /// Returns a snapshot of the page pool at a specific LSN **or newer**.
-    pub fn snapshot_at(&self, lsn: u64) -> Result<Arc<CommittedSnapshot>, Error> {
-        let latest = self.latest.lock().unwrap();
-        latest
-            .find_at_lsn(lsn)
-            .ok_or(Error::NoSnapshot(lsn, latest.lsn))
-    }
+    /// Commits the changes made in a transaction back to the volume.
+    ///
+    /// This method updates the state of the volume to reflect the modifications
+    /// recorded in the provided transaction. Once committed, its changes are visible in subsequent operations.
+    ///
+    /// Each transaction is linked to the volume state it was created from. If the page poll was changed
+    /// since the moment when transaction was created, attempt to commit such a transaction will return an
+    /// [`Result::Err`], because such changes might not be consistent anymore.
+    pub fn commit(&mut self, tx: impl Into<Transaction>) -> io::Result<u64> {
+        let (lock, notify) = self.latest_commit.as_ref();
+        let mut commit = lock.lock().unwrap();
+        let tx: Transaction = tx.into();
 
-    /// Commits the changes made in a snapshot back to the page pool.
-    ///
-    /// This method updates the state of the page pool to reflect the modifications
-    /// recorded in the provided snapshot. Once committed, the snapshot becomes part
-    /// of the page pool's history, and its changes are visible in subsequent snapshots.
-    ///
-    /// Each snapshot is linked to the pool state it was created from. If the page poll was changed
-    /// since the moment when snapshot was created, attempt to commit such a snapshot will return an error,
-    /// because such changes might not be consistent anymore.
-    ///
-    /// # Arguments
-    ///
-    /// * `snapshot` - A snapshot containing modifications to commit to the page pool.
-    pub fn commit(&mut self, snapshot: impl Into<Snapshot>) -> u64 {
-        let snapshot = snapshot.into();
-        let mut latest = self.latest.lock().unwrap();
-        assert!(
-            Arc::ptr_eq(&latest, &snapshot.base),
-            "Proposed snapshot is not linear"
-        );
-        let lsn = latest.lsn + 1;
+        let current_lsn = self.lsn.load(Ordering::Relaxed);
+        if tx.base.lsn != current_lsn {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "The volume was changed since the transaction was created",
+            ));
+        }
 
-        let new_snapshot = Arc::new(CommittedSnapshot {
-            patches: snapshot.patches,
-            base: Some(Arc::clone(&latest)),
-            pages: snapshot.pages,
+        let lsn = self.lsn.fetch_add(1, Ordering::Relaxed) + 1;
+
+        // Updating pages and undo log
+        {
+            let mut locked_pages = self.pages.lock().unwrap();
+
+            let mut patches = Vec::with_capacity(tx.uncommitted.len());
+            for patch in &tx.uncommitted {
+                let segments = PageSegments::new(patch.addr(), patch.len());
+                let mut undo_patch = vec![0; patch.len()];
+                for (addr, slice_range) in segments {
+                    let (page_no, offset) = split_ptr(addr);
+                    let offset = offset as usize;
+                    let len = slice_range.len();
+                    let page_range = offset..(offset + len);
+
+                    let page = locked_pages.get_page_mut(page_no)?;
+
+                    // Forming undo patch
+                    undo_patch[slice_range.clone()].copy_from_slice(&page[page_range.clone()]);
+
+                    // Applying change to the page
+                    match patch {
+                        Patch::Write(_, data) => {
+                            page[page_range].copy_from_slice(&data[slice_range])
+                        }
+                        Patch::Reclaim(..) => page[page_range].fill(0),
+                    }
+                }
+                patches.push(Patch::Write(patch.addr(), undo_patch));
+
+                locked_pages.flush()?;
+            }
+            let undo = Arc::new(Some(UndoEntry {
+                next: ArcSwap::from_pointee(None),
+                patches,
+                lsn,
+            }));
+            (*self.undo_log)
+                .as_ref()
+                .expect("Undo log is missing")
+                .next
+                .store(Arc::clone(&undo));
+            self.undo_log = undo;
+        }
+
+        // Updating redo log
+        let new_commit = Arc::new(Some(Commit {
+            changes: tx.uncommitted,
+            next: ArcSwap::from_pointee(None),
             lsn,
-        });
-        *latest = new_snapshot;
-        drop(latest);
-        self.notify.notify_all();
-        lsn
+        }));
+        commit
+            .as_ref()
+            .as_ref()
+            .expect("Commit log is missing")
+            .next
+            .store(Arc::clone(&new_commit));
+        *commit = new_commit;
+        notify.notify_all();
+
+        Ok(lsn)
     }
 
     pub fn commit_notify(&self) -> CommitNotify {
-        let snapshot = self.latest.lock().unwrap();
+        let commit = self.latest_commit.0.lock().unwrap();
         CommitNotify {
-            last_seen_lsn: snapshot.lsn,
-            notify: Arc::clone(&self.notify),
-            snapshot: Arc::clone(&self.latest),
+            last_seen_lsn: self.lsn.load(Ordering::Relaxed),
+            latest_commit: Arc::clone(&self.latest_commit),
+            commit: Arc::clone(&commit),
+            pages_count: self.pages_count,
         }
     }
 
-    pub fn handle(&self) -> PagePoolHandle {
-        PagePoolHandle {
-            latest: Arc::clone(&self.latest),
+    /// Creates read-only handle to the volume that may be used to read data from it from different threads.
+    pub fn handle(&self) -> VolumeHandle {
+        VolumeHandle {
             notify: self.commit_notify(),
+            pages: Arc::clone(&self.pages),
+            pages_count: self.pages_count,
+            undo_log: Arc::clone(&self.undo_log),
         }
+    }
+
+    pub fn snapshot(&self) -> Snapshot {
+        debug_assert!(self.undo_log.is_some());
+
+        Snapshot {
+            lsn: self.lsn.load(Ordering::Relaxed),
+            pages_count: self.pages_count,
+            pages: Arc::clone(&self.pages),
+            undo_log: Arc::clone(&self.undo_log),
+        }
+    }
+
+    pub fn into_driver(self) -> Option<Box<dyn PageDriver>> {
+        let lock = Arc::into_inner(self.pages)?;
+        let Ok(pages) = lock.into_inner() else {
+            return None;
+        };
+        Some(pages.into_inner())
     }
 
     #[cfg(test)]
     fn read(&self, addr: Addr, len: usize) -> Cow<[u8]> {
-        #[allow(clippy::single_range_in_vec_init)]
         let mut buffer = vec![0; len];
-        #[allow(clippy::single_range_in_vec_init)]
-        let mut buf_ranges = vec![0..len];
-        let latest = {
-            // Explicit scope to drop lock early
-            Arc::clone(&self.latest.lock().unwrap())
-        };
-        latest.read_to_buf(addr, &mut buffer, &mut buf_ranges);
+
+        let snapshot = self.snapshot();
+        let buf = snapshot.read(addr, len);
+        buffer.copy_from_slice(&buf);
         Cow::Owned(buffer)
     }
 }
 
-#[derive(Clone)]
-pub struct PagePoolHandle {
-    latest: Arc<Mutex<Arc<CommittedSnapshot>>>,
-    notify: CommitNotify,
+#[cfg(test)]
+impl Default for Volume {
+    fn default() -> Self {
+        Self::new_in_memory(1)
+    }
 }
 
-impl PagePoolHandle {
-    pub fn snapshot(&self) -> Arc<CommittedSnapshot> {
-        Arc::clone(&self.latest.lock().unwrap())
-    }
+struct Pages {
+    pages: BTreeMap<PageNo, Page>,
+    driver: Box<dyn PageDriver>,
+}
 
-    pub fn snapshot_at(&self, lsn: u64) -> Result<Arc<CommittedSnapshot>, Error> {
-        let latest = {
-            // Explicit scope to drop lock early
-            Arc::clone(&self.latest.lock().unwrap())
-        };
-        latest
-            .find_at_lsn(lsn)
-            .ok_or(Error::NoSnapshot(lsn, latest.lsn))
-    }
-
-    pub fn wait_for_commit(&mut self) -> Arc<CommittedSnapshot> {
-        self.notify.next_snapshot()
-    }
-
-    /// Waits for and returns an earliest snapshot with LSM equal or greater than a given LSN
-    pub fn wait_for_lsn(&mut self, expected_lsn: LSN) -> Arc<CommittedSnapshot> {
-        let mut snapshot = Arc::clone(&self.latest.lock().unwrap());
-        while snapshot.lsn() < expected_lsn {
-            snapshot = self.notify.next_snapshot();
+impl Pages {
+    pub fn new(driver: Box<dyn PageDriver>) -> Self {
+        Self {
+            pages: BTreeMap::new(),
+            driver,
         }
-        snapshot.find_at_lsn(expected_lsn).unwrap()
+    }
+
+    fn ensure_loaded(&mut self, page_no: PageNo) -> io::Result<&mut Page> {
+        let entry = self.pages.entry(page_no);
+        let present = matches!(entry, Entry::Occupied(_));
+        let page = entry.or_insert_with(Page::new);
+        if !present {
+            self.driver.read_page(page_no, page.data.as_mut())?;
+        }
+        Ok(page)
+    }
+
+    fn get_page(&mut self, page_no: PageNo) -> io::Result<Option<&[u8; PAGE_SIZE]>> {
+        Ok(Some(self.ensure_loaded(page_no)?.data.as_ref()))
+    }
+
+    fn get_page_mut(&mut self, page_no: PageNo) -> io::Result<&mut [u8; PAGE_SIZE]> {
+        let page = self.ensure_loaded(page_no)?;
+        page.dirty = true;
+        Ok(page.data.as_mut())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        for (page_no, page) in self.pages.iter() {
+            if page.dirty {
+                self.driver.write_page(*page_no, page.data.as_ref())?;
+            }
+        }
+        self.driver.flush()
+    }
+
+    fn into_inner(self) -> Box<dyn PageDriver> {
+        self.driver
+    }
+}
+
+struct Page {
+    data: Box<[u8; PAGE_SIZE]>,
+    dirty: bool,
+}
+
+impl Page {
+    fn new() -> Self {
+        Self {
+            data: Box::new([0; PAGE_SIZE]),
+            dirty: false,
+        }
+    }
+}
+
+/// Describes a changes that need to be applied to the page to restore it to the state
+/// before particular transaction was committed.
+///
+/// `UndoEntry` is referenced from old to new and only last position is stored in [`Volume`].
+/// It enables automatic cleanup of old entries that are not referenced anymore by any snapshot or transaction.
+#[derive(Default)]
+struct UndoEntry {
+    next: ArcSwap<Option<UndoEntry>>,
+    patches: Vec<Patch>,
+    lsn: LSN,
+}
+
+/// Because this type forms a linked list, standard `Drop` implementation will cause stack overflow.
+/// This implements iterative drop instead.
+impl Drop for UndoEntry {
+    fn drop(&mut self) {
+        // SAFETY:
+        //  1. ArcSwap is owned and not impl Clone, so we're the only owner of it.
+        //  2. We're in Drop, so there are no other references to self.
+        // Therefore, we can safely move an `Arc` out of self.next.
+        let mut next = self.next.swap(Arc::new(None));
+
+        while let Some(Some(entry)) = Arc::into_inner(next) {
+            // What we're doing here is making one more ref to the next entry. This effectively prevents
+            // recursive drop(). 1 call to drop() will still be made, but it will return without recursion,
+            // because current stack frame holding a ref to the `self.next.next`. This way we can remove
+            // the whole list iteratively.
+            next = entry.next.load_full();
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct VolumeHandle {
+    notify: CommitNotify,
+    pages_count: PageNo,
+    undo_log: Arc<Option<UndoEntry>>,
+    pages: Arc<Mutex<Pages>>,
+}
+
+impl VolumeHandle {
+    /// Blocks until next snapshot is available and returns it
+    ///
+    /// The next snapshot is the one that is the most recent at the time this method is called.
+    /// It might be several snapshots ahead of the last seen snapshot.
+    pub fn wait(&mut self) -> Snapshot {
+        let commit = self.notify.next_commit();
+
+        Snapshot {
+            lsn: commit.lsn,
+            pages_count: self.pages_count,
+            pages: Arc::clone(&self.pages),
+            undo_log: Arc::clone(&self.undo_log),
+        }
     }
 }
 
 #[derive(Clone)]
 pub struct CommitNotify {
-    snapshot: Arc<Mutex<Arc<CommittedSnapshot>>>,
+    // Last processed commit.
+    commit: Arc<Option<Commit>>,
     last_seen_lsn: u64,
-    notify: Arc<Condvar>,
+
+    /// Latest commit that is available for reading in the volume. May be way ahead of `commit`.
+    latest_commit: Arc<(Mutex<Arc<Option<Commit>>>, Condvar)>,
+    pages_count: PageNo,
 }
 
 impl CommitNotify {
-    /// Blocks until next snapshot is available and returns it
+    /// Blocks until next commit is available and returns it
     ///
-    /// The next snapshot is the one that is the most recent at the time this method is called.
-    /// It might be several snapshots ahead of the last seen snapshot. All intermediate snapshots
-    /// can be seen by using [`CommittedSnapshot::find_at_lsn()`]
-    pub fn next_snapshot(&mut self) -> Arc<CommittedSnapshot> {
-        let snapshot = {
-            let mut locked_snapshot = self.snapshot.lock().unwrap();
-            if locked_snapshot.lsn() <= self.last_seen_lsn() {
-                locked_snapshot = self.notify.wait(locked_snapshot).unwrap();
+    /// If several commits happened since the last call to this method, this function will return
+    /// all of them in order.
+    pub fn next_commit(&mut self) -> &Commit {
+        // Pay attention to the order of operations and the fact that algorithm uses 2 commits:
+        // 1. `commit` - the last processed commit by this method.
+        // 2. `latest_commit` - the latest commit that is available for reading in the volume.
+        //    `latest_commit` may be way ahead of `commit` if client of this function can't keep up with
+        //    ongoing commits.
+        //
+        // Access to `commit` is synchronized by `Arc` and most of the times we don't need to acquire
+        // the lock to check if there is a new commit available. We need to acquire global lock
+        // if we are contending for the latest commit in the volume.
+        let commit = (*self.commit).as_ref().unwrap();
+        if commit.next().is_none() {
+            let mut latest_commit = self.latest_commit.0.lock().unwrap();
+            // 1. Need to check again after acquiring the lock, otherwise it is a race condition
+            //    because we speculatively checked the condition before acquiring the lock to prevent
+            //    contention when possible
+            // 2. spourious wakeups are possible, so we need to check the condition in a loop
+            while commit.next().is_none() {
+                latest_commit = self.latest_commit.1.wait(latest_commit).unwrap();
             }
-            Arc::clone(&locked_snapshot)
-        };
-        debug_assert!(snapshot.lsn() > self.last_seen_lsn());
-        self.last_seen_lsn = snapshot.lsn();
-        snapshot
+        }
+        let next_commit = commit.next();
+        debug_assert!((*next_commit).as_ref().unwrap().lsn() > self.last_seen_lsn());
+        self.commit = Arc::clone(&next_commit);
+        (*self.commit).as_ref().unwrap()
     }
 
     pub fn last_seen_lsn(&self) -> u64 {
@@ -587,13 +800,13 @@ impl CommitNotify {
 
     pub fn pages(&self) -> PageNo {
         // TODO is this correct? Can the number of pages change?
-        self.snapshot.lock().unwrap().pages()
+        self.pages_count
     }
 }
 
-/// Trait describing a read-only snapshot of a page pool.
+/// Trait describing a read-only snapshot of a volume.
 ///
-/// Represents a consistent snapshot of a page pool at a specific point in time.
+/// Represents a consistent snapshot of a volume at a specific point in time.
 pub trait TxRead {
     /// Reads the specified number of bytes from the given address.
     ///
@@ -603,11 +816,11 @@ pub trait TxRead {
 
     /// Checks if the specified range of addresses is valid.
     ///
-    /// The address is not valid if it addresses the pages that are outside of the pool bounds.
+    /// The address is not valid if it addresses the pages that are outside of the volume bounds.
     fn valid_range(&self, addr: Addr, len: usize) -> bool;
 }
 
-/// Trait describing a transaction that can modify data in a page pool.
+/// Trait describing a transaction that can modify data in a volume.
 ///
 /// Compared to [`TxRead`], this trait allows for writing and reclaiming data.
 pub trait TxWrite: TxRead {
@@ -627,188 +840,163 @@ pub trait TxWrite: TxRead {
     fn reclaim(&mut self, addr: Addr, len: usize);
 }
 
-/// Represents a committed snapshot of a page pool.
+/// Represents a committed snapshot of a volume. Created by [`Volume::snapshot`] method.
 ///
-/// A `CommittedSnapshot` captures the state of a page pool at a specific point in time,
+/// A `Snapshot` captures the state of a volume at a specific point in time,
 /// including any patches (modifications) that have been applied up to that point. It serves
-/// as a read-only view into the historical state of the pool, allowing for consistent reads
+/// as a read-only view into the historical state of the volume, allowing for consistent reads
 /// of pages as they existed at the time of the snapshot.
 ///
-/// Each `CommittedSnapshot` can optionally reference a base snapshot, forming a chain
-/// that represents the full history of modifications leading up to the current state.
-/// This chain is traversed backwards when reading from a snapshot to reconstruct the state
-/// of a page by applying patches in reverse chronological order.
+/// Snapshots are following repeatable read isolation level, meaning that they are not affected
+/// by any changes made to the volume after the snapshot was taken.
 #[derive(Clone)]
-pub struct CommittedSnapshot {
-    /// A patches that have been applied in this snapshot.
-    patches: Vec<Patch>,
-
-    /// A reference to the base snapshot from which this snapshot was derived.
-    /// If present, the base snapshot represents the state of the page pool
-    /// immediately before the current snapshot's patches were applied.
-    base: Option<Arc<CommittedSnapshot>>,
-
-    /// The total number of pages represented by this snapshot. This is used to
-    /// validate read requests and ensure they do not exceed the bounds of the snapshot.
-    pages: PageNo,
-
-    /// A log sequence number (LSN) that uniquely identifies this snapshot. The LSN
-    /// is used internally to ensure that snapshots are applied in a linear and consistent order.
+pub struct Snapshot {
+    pages_count: PageNo,
+    undo_log: Arc<Option<UndoEntry>>,
+    pages: Arc<Mutex<Pages>>,
     lsn: LSN,
 }
 
-impl Default for CommittedSnapshot {
-    fn default() -> Self {
-        Self {
-            patches: vec![],
-            base: None,
-            pages: 1,
-            lsn: 0,
+impl Snapshot {
+    // Main method that implements MVCC read logic of the system.
+    //
+    // Because [`apply_patches()`] is implementing first patch wins logic, the correct order of reading
+    // data at a given LSN is following:
+    //
+    // 1. Read whatever data is in the pages.
+    // 2. Apply changes from own patches. Any transaction should see its own not yet committed cnanges.
+    // 3. Apply changes from undo log, to restore the state of the page that is possibly changed
+    //    by concurrently committed transaction. This is needed to maintain REPETABLE READ
+    //    isolation guarantee.
+    fn read_uncommitted(&self, addr: Addr, len: usize, uncommitted: &[Patch]) -> Cow<[u8]> {
+        split_ptr_checked(addr, len, self.pages_count);
+        let mut buf = vec![0; len];
+
+        // Reading the pages
+        {
+            let mut locked_pages = self.pages.lock().unwrap();
+            for (addr, range) in PageSegments::new(addr, len) {
+                let (page_no, offset) = split_ptr(addr);
+                let offset = offset as usize;
+                if let Some(page) = locked_pages.get_page(page_no).unwrap() {
+                    let len = range.len();
+                    buf[range].copy_from_slice(&page[offset..offset + len]);
+                }
+            }
         }
+
+        #[allow(clippy::single_range_in_vec_init)]
+        let mut buf_mask = vec![0..len];
+
+        // Apply own uncommitted changes
+        apply_patches(uncommitted, addr as usize, &mut buf, &mut buf_mask);
+
+        // Applying with undo log
+        // We need to skip first entry in undo log, because it is describing how to undo the changes
+        // of previously applied transaction.
+        let mut log = (*self.undo_log).as_ref().unwrap().next.load_full();
+        while let Some(undo) = log.as_ref() {
+            if undo.lsn > self.lsn {
+                apply_patches(&undo.patches, addr as usize, &mut buf, &mut buf_mask);
+            }
+            log = undo.next.load_full();
+        }
+
+        Cow::Owned(buf)
+    }
+
+    pub fn lsn(&self) -> LSN {
+        self.lsn
     }
 }
 
-impl CommittedSnapshot {
+impl TxRead for Snapshot {
+    fn valid_range(&self, addr: Addr, len: usize) -> bool {
+        is_valid_ptr(addr, len, self.pages_count)
+    }
+
+    fn read(&self, addr: Addr, len: usize) -> Cow<[u8]> {
+        self.read_uncommitted(addr, len, &[])
+    }
+}
+
+pub struct Commit {
+    /// A changes that have been applied in this snapshot.
+    ///
+    /// This array is sorted by the address of the change and all patches are non-overlapping.
+    changes: Vec<Patch>,
+
+    /// A reference to the next commit in the chain.
+    ///
+    /// This is updated atomically by the thread that executing commit operation.
+    next: ArcSwap<Option<Commit>>,
+
+    /// A log sequence number (LSN) that uniquely identifies this commit.
+    /// LSN numbers are monotonically increasing.
+    lsn: LSN,
+}
+
+impl Commit {
     pub fn patches(&self) -> &[Patch] {
-        self.patches.as_slice()
-    }
-
-    fn read_to_buf(self: &Arc<Self>, addr: Addr, buf: &mut [u8], buf_mask: &mut Vec<Range<usize>>) {
-        split_ptr_checked(addr, buf.len(), self.pages);
-
-        let mut snapshot = Some(Arc::clone(self));
-        while !buf_mask.is_empty() && snapshot.is_some() {
-            let s = snapshot.take().unwrap();
-
-            apply_patches(&s.patches, addr as usize, buf, buf_mask);
-            snapshot.clone_from(&s.base);
-        }
-    }
-
-    /// Returns first snapshot in the chain that has LSN greater or equal to the provided LSN or newer.
-    pub fn find_at_lsn(self: &Arc<Self>, lsn: LSN) -> Option<Arc<Self>> {
-        let mut snapshot = self;
-        while let Some(s) = snapshot.base.as_ref() {
-            if s.lsn < lsn {
-                break;
-            } else {
-                snapshot = s;
-            }
-        }
-        (snapshot.lsn >= lsn).then(|| Arc::clone(snapshot))
+        self.changes.as_slice()
     }
 
     pub fn lsn(&self) -> LSN {
         self.lsn
     }
 
-    pub fn pages(&self) -> PageNo {
-        self.pages
+    pub fn next(&self) -> Arc<Option<Commit>> {
+        self.next.load_full()
     }
 }
 
-impl TxRead for Arc<CommittedSnapshot> {
-    fn read(&self, addr: Addr, len: usize) -> Cow<[u8]> {
-        split_ptr_checked(addr, len, self.pages);
-
-        let mut buf = vec![0; len];
-        #[allow(clippy::single_range_in_vec_init)]
-        let mut buf_ranges = vec![0..len];
-
-        self.read_to_buf(addr, &mut buf, &mut buf_ranges);
-        Cow::Owned(buf)
-    }
-
-    fn valid_range(&self, addr: Addr, len: usize) -> bool {
-        is_valid_ptr(addr, len, self.pages)
-    }
-}
-
-impl Drop for CommittedSnapshot {
-    /// Custom drop logic is necessary here to prevent a stack overflow that could
-    /// occur due to recursive drop calls on a long chain of `Arc` references to base snapshot.
-    /// Each `Arc` decrement could potentially trigger the drop of another `Arc` in the chain,
-    /// leading to deep recursion.
-    ///
-    /// By explicitly unwrapping and handling the inner `Arc` references, we ensure that the drop sequence
-    /// is performed without any recursion
+// It solves the same problem as for `UndoEntry`. See [`UndoEntry`] documentation.
+impl Drop for Commit {
     fn drop(&mut self) {
-        let mut next_base = self.base.take();
-        while let Some(base) = next_base {
-            next_base = Arc::try_unwrap(base)
-                .map(|mut base| base.base.take())
-                .unwrap_or(None);
+        let mut next = self.next.swap(Arc::new(None));
+        while let Some(Some(entry)) = Arc::into_inner(next) {
+            next = entry.next.load_full();
         }
     }
 }
 
 #[derive(Clone)]
-pub struct Snapshot {
-    patches: Vec<Patch>,
-    base: Arc<CommittedSnapshot>,
-    pages: PageNo,
+pub struct Transaction {
+    uncommitted: Vec<Patch>,
+    base: Snapshot,
 }
 
-impl Snapshot {
-    pub fn base(&self) -> Arc<CommittedSnapshot> {
-        Arc::clone(&self.base)
-    }
-
-    #[cfg(test)]
-    fn resize(&mut self, pages: usize) {
-        self.pages = pages as PageNo;
-    }
-
-    /// Returns the log sequence number (LSN) of the committed snapshot that this snapshot is based on.
-    #[cfg(test)]
-    fn committed_lsn(&self) -> u64 {
-        self.base.lsn
-    }
-}
-
-impl TxRead for Snapshot {
+impl TxRead for Transaction {
     fn valid_range(&self, addr: Addr, len: usize) -> bool {
-        is_valid_ptr(addr, len, self.pages)
+        self.base.valid_range(addr, len)
     }
 
     fn read(&self, addr: Addr, len: usize) -> Cow<[u8]> {
-        split_ptr_checked(addr, len, self.pages);
-
-        let mut buf = vec![0; len];
-        #[allow(clippy::single_range_in_vec_init)]
-        let mut buf_mask = vec![0..len];
-
-        // Apply uncommitted changes
-        apply_patches(&self.patches, addr as usize, &mut buf, &mut buf_mask);
-
-        // Apply committed changes
-        self.base.read_to_buf(addr, &mut buf, &mut buf_mask);
-
-        Cow::Owned(buf)
+        self.base.read_uncommitted(addr, len, &self.uncommitted)
     }
 }
 
-impl TxWrite for Snapshot {
+impl TxWrite for Transaction {
     fn write(&mut self, addr: Addr, bytes: impl Into<Vec<u8>>) {
         let bytes = bytes.into();
-        split_ptr_checked(addr, bytes.len(), self.pages);
+        split_ptr_checked(addr, bytes.len(), self.base.pages_count);
 
         if !bytes.is_empty() {
-            push_patch(&mut self.patches, Patch::Write(addr, bytes))
+            push_patch(&mut self.uncommitted, Patch::Write(addr, bytes));
         }
     }
 
     fn reclaim(&mut self, addr: Addr, len: usize) {
-        split_ptr_checked(addr, len, self.pages);
+        split_ptr_checked(addr, len, self.base.pages_count);
         if len > 0 {
-            push_patch(&mut self.patches, Patch::Reclaim(addr, len))
+            push_patch(&mut self.uncommitted, Patch::Reclaim(addr, len));
         }
     }
 }
 
-/// Pushes a patch to a snapshot ensuring the following invariants hold:
+/// Pushes a patch to a list ensuring the following invariants hold:
 ///
-/// 1. All patches are sorted by [Patch:addr()]
+/// 1. All patches are sorted by [`Patch::addr()`]
 /// 2. All patches are non-overlapping
 fn push_patch(patches: &mut Vec<Patch>, patch: Patch) {
     assert!(patch.len() > 0, "Patch should not be empty");
@@ -867,7 +1055,8 @@ fn push_patch(patches: &mut Vec<Patch>, patch: Patch) {
 /// This functions will find and apply corresponding patches to the buffer using `addr` as a base address
 /// for a buffer. It will also update `buf_mask` vector with ranges of buffer that still need to be patched.
 /// Therefore it is required to start with a full buffer range and then this function will update it with
-/// ranges that still need to be patched.
+/// ranges that still need to be patched. Therefore when calling several times this function will implement
+/// the "first patch wins" logic.
 fn apply_patches(
     patches: &[Patch],
     addr: usize,
@@ -1008,49 +1197,171 @@ fn intersects(patch: &Patch, range: &Range<usize>) -> bool {
     start < range.end && end > range.start
 }
 
+/// Iterator over page segments for a given address and size.
+///
+/// Because data is stored in pages when you want to read or write data you must must always align
+/// operations to page boundaries. This iterator provides a way to calculate page numbers, and corresponding
+/// offsets to copy to/from the page.
+///
+/// Page segments are represented by following tuple:
+/// - address – the page address for the next operation
+/// - range – the range within slice to operate on (relative to base address)
+///
+/// # Example
+///
+/// This example will read data without any cross-page operations.
+///
+/// ```nocompile
+/// use crate::PageSegments;
+/// use crate::PAGE_SIZE;
+///
+/// let base_addr = 0x1000;
+/// let size = 0x100;
+/// let buffer = vec![0; size];
+///
+/// let segments = PageSegments::new(base_addr, size);
+/// for (addr, range) in segments {
+///     let result = tx.read(addr, range.len());
+///     buffer[range].copy_from_slice(&result);
+/// }
+/// ```
+struct PageSegments {
+    base_addr: Addr,
+    start_addr: Addr,
+    end_addr: Addr,
+}
+
+impl PageSegments {
+    fn new(base_addr: Addr, size: usize) -> Self {
+        PageSegments {
+            base_addr,
+            start_addr: base_addr,
+            end_addr: base_addr + size as Addr,
+        }
+    }
+}
+
+impl Iterator for PageSegments {
+    type Item = (Addr, Range<usize>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.end_addr == self.start_addr {
+            return None;
+        }
+        let len = if are_on_the_same_page(self.start_addr, self.end_addr - 1) {
+            self.end_addr - self.start_addr
+        } else {
+            let (page, _) = split_ptr(self.start_addr);
+            let next_page_addr = (page + 1) as Addr * PAGE_SIZE as Addr;
+            next_page_addr - self.start_addr
+        };
+        let offset = (self.start_addr - self.base_addr) as usize;
+        let addr = self.start_addr;
+        self.start_addr += len as Addr;
+        Some((addr, offset..(offset + len as usize)))
+    }
+}
+
+impl DoubleEndedIterator for PageSegments {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.end_addr == self.start_addr {
+            return None;
+        }
+        let len = if are_on_the_same_page(self.start_addr, self.end_addr - 1) {
+            (self.end_addr - self.start_addr) as usize
+        } else {
+            let (page, _) = split_ptr(self.end_addr - 1);
+            let page_start_addr = page as Addr * PAGE_SIZE as Addr;
+            (self.end_addr - page_start_addr) as usize
+        };
+        let offset = (self.end_addr - self.base_addr - len as Addr) as usize;
+        let end_addr = self.end_addr;
+        self.end_addr -= len as Addr;
+        Some((end_addr - len as Addr, offset..(offset + len)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use tempfile::tempdir;
+
+    use crate::driver::FileDriver;
+
     use super::*;
-    use std::{panic, thread};
+    use std::thread;
 
     #[test]
     fn first_commit_should_have_lsn_1() {
         // In several places in codebase we assume that first commit has LSN 1
         // and LSN 0 is synthetic LSN used for base empty snapshot
-        let mut mem = PagePool::default();
-        let snapshot = mem.snapshot();
-        assert_eq!(mem.commit(snapshot), 1);
+        let mut mem = Volume::default();
+        let tx = mem.start();
+        assert_eq!(mem.commit(tx).unwrap(), 1);
+    }
+
+    #[test]
+    fn non_linear_commits_must_be_rejected() {
+        let mut mem = Volume::default();
+        let mut tx1 = mem.start();
+        let mut tx2 = mem.start();
+
+        tx1.write(0, b"Hello");
+        mem.commit(tx1).unwrap();
+
+        tx2.write(0, b"World");
+        assert!(mem.commit(tx2).is_err());
     }
 
     #[test]
     fn committed_changes_should_be_visible_on_a_page() {
-        let mut mem = PagePool::from("Jekyll");
+        let mut mem = Volume::from("Jekyll");
 
-        let mut snapshot = mem.snapshot();
-        snapshot.write(0, b"Hide");
-        mem.commit(snapshot);
+        let mut tx = mem.start();
+        tx.write(0, b"Hide");
+        mem.commit(tx).unwrap();
 
         assert_str_eq(mem.read(0, 4), b"Hide");
     }
 
     #[test]
     fn uncommitted_changes_should_be_visible_only_on_the_snapshot() {
-        let mem = PagePool::from("Jekyll");
+        let mem = Volume::from("Jekyll");
 
-        let mut snapshot = mem.snapshot();
-        snapshot.write(0, b"Hide");
+        let mut tx = mem.start();
+        tx.write(0, b"Hide");
 
-        assert_str_eq(snapshot.read(0, 4), "Hide");
+        assert_str_eq(tx.read(0, 4), "Hide");
         assert_str_eq(mem.read(0, 6), "Jekyll");
     }
 
     #[test]
-    fn patch_page() {
-        let mut mem = PagePool::from("Hello panic!");
+    fn snapshot_should_provide_repeatable_read_isolation() {
+        let mut mem = Volume::default();
 
-        let mut snapshot = mem.snapshot();
-        snapshot.write(6, b"world");
-        mem.commit(snapshot);
+        let zero = mem.snapshot();
+
+        let mut hide = mem.start();
+        hide.write(0, b"Hide");
+        mem.commit(hide).unwrap();
+        let hide = mem.start();
+
+        let mut jekyll = mem.start();
+        jekyll.write(0, b"Jekyll");
+        mem.commit(jekyll).unwrap();
+        let jekyll = mem.start();
+
+        assert_eq!(&*zero.read(0, 6), b"\0\0\0\0\0\0");
+        assert_eq!(&*hide.read(0, 6), b"Hide\0\0");
+        assert_eq!(&*jekyll.read(0, 6), b"Jekyll");
+    }
+
+    #[test]
+    fn patch_page() {
+        let mut mem = Volume::from("Hello panic!");
+
+        let mut tx = mem.start();
+        tx.write(6, b"world");
+        mem.commit(tx).unwrap();
 
         assert_str_eq(mem.read(0, 12), "Hello world!");
         assert_str_eq(mem.read(0, 8), "Hello wo");
@@ -1062,160 +1373,134 @@ mod tests {
 
     #[test]
     fn test_regression() {
-        let mut mem = PagePool::default();
+        let mut mem = Volume::default();
 
-        let mut snapshot = mem.snapshot();
-        snapshot.write(70, [0, 0, 1]);
-        mem.commit(snapshot);
-        let mut snapshot = mem.snapshot();
-        snapshot.reclaim(71, 2);
-        snapshot.write(73, [0]);
-        mem.commit(snapshot);
+        let mut tx = mem.start();
+        tx.write(70, [0, 0, 1]);
+        mem.commit(tx).unwrap();
+        let mut tx = mem.start();
+        tx.reclaim(71, 2);
+        tx.write(73, [0]);
+        mem.commit(tx).unwrap();
 
         assert_eq!(mem.read(70, 4).as_ref(), [0, 0, 0, 0]);
     }
 
     #[test]
     fn test_regression2() {
-        let mut mem = PagePool::default();
+        let mut mem = Volume::default();
 
-        let mut snapshot = mem.snapshot();
-        snapshot.write(70, [0, 0, 1]);
-        mem.commit(snapshot);
-        let mut snapshot = mem.snapshot();
-        snapshot.write(0, [0]);
-        mem.commit(snapshot);
-        let mut snapshot = mem.snapshot();
-        snapshot.reclaim(71, 2);
-        mem.commit(snapshot);
+        let mut tx = mem.start();
+        tx.write(70, [0, 0, 1]);
+        mem.commit(tx).unwrap();
+        let mut tx = mem.start();
+        tx.write(0, [0]);
+        mem.commit(tx).unwrap();
+        let mut tx = mem.start();
+        tx.reclaim(71, 2);
+        mem.commit(tx).unwrap();
 
         assert_eq!(mem.read(70, 4).as_ref(), [0, 0, 0, 0]);
     }
 
     #[test]
     fn data_across_multiple_pages_can_be_written() {
-        let mut mem = PagePool::new(3);
+        let mut mem = Volume::new_in_memory(2);
 
+        // Choosing address so that data is split across 2 pages
+        let addr = PAGE_SIZE as Addr - 2;
         let alice = b"Alice";
-        let bob = b"Bob";
-        let charlie = b"Charlie";
 
-        // Addresses on 3 consequent pages
-        let page_a = 0;
-        let page_b = PAGE_SIZE as Addr;
-        let page_c = 2 * PAGE_SIZE as Addr;
-
-        let mut snapshot = mem.snapshot();
-        snapshot.write(page_a, alice);
-        snapshot.write(page_b, bob);
-        snapshot.write(page_c, charlie);
+        let mut tx = mem.start();
+        tx.write(addr, alice);
 
         // Checking that data is visible in snapshot
-        assert_str_eq(snapshot.read(page_a, alice.len()), alice);
-        assert_str_eq(snapshot.read(page_b, bob.len()), bob);
-        assert_str_eq(snapshot.read(page_c, charlie.len()), charlie);
+        assert_str_eq(tx.read(addr, alice.len()), alice);
 
-        mem.commit(snapshot);
+        // Checking that data is visible after commit to volume
+        mem.commit(tx).unwrap();
+        assert_str_eq(mem.read(addr, alice.len()), alice);
+    }
 
-        // Checking that data is visible after commit to page pool
-        assert_str_eq(mem.read(page_a, alice.len()), alice);
-        assert_str_eq(mem.read(page_b, bob.len()), bob);
-        assert_str_eq(mem.read(page_c, charlie.len()), charlie);
+    #[test]
+    fn data_can_be_read_from_snapshot() {
+        let data = [1, 2, 3, 4, 5];
+        let mem = Volume::from(data.as_slice());
+
+        let tx = mem.start();
+        assert_eq!(tx.read(0, 5), data.as_slice());
     }
 
     #[test]
     fn data_can_be_removed_on_snapshot() {
         let data = [1, 2, 3, 4, 5];
-        let mem = PagePool::from(data.as_slice());
+        let mem = Volume::from(data.as_slice());
 
-        let mut snapshot = mem.snapshot();
-        snapshot.reclaim(1, 3);
+        let mut tx = mem.start();
+        tx.reclaim(1, 3);
 
-        assert_eq!(snapshot.read(0, 5), [1u8, 0, 0, 0, 5].as_slice());
+        assert_eq!(tx.read(0, 5), [1u8, 0, 0, 0, 5].as_slice());
     }
 
     #[test]
     #[should_panic(expected = "Address range is out of bounds")]
     fn must_panic_on_oob_read() {
         // reading in a such a way that start address is still valid, but end address is not
-        PagePool::default()
-            .snapshot()
-            .read(PAGE_SIZE as Addr - 10, 20);
+        Volume::default().start().read(PAGE_SIZE as Addr - 10, 20);
     }
 
     #[test]
     #[should_panic(expected = "Address range is out of bounds")]
     fn must_panic_on_oob_write() {
-        PagePool::default()
-            .snapshot()
+        Volume::default()
+            .start()
             .write(PAGE_SIZE as Addr - 10, [0; 20]);
     }
 
     #[test]
     #[should_panic(expected = "Address range is out of bounds")]
     fn must_panic_on_oob_reclaim() {
-        PagePool::default()
-            .snapshot()
+        Volume::default()
+            .start()
             .reclaim(PAGE_SIZE as Addr - 10, 20);
     }
 
+    /// When dropping transaction all related undo entries will be removed. It may lead
+    /// to stackoverflow if removed recursively.
     #[test]
-    fn change_number_of_pages_on_commit() {
-        let mut mem = PagePool::new(1); // Initially 1 page
-
-        let page_a = 0;
-        let page_b = PAGE_SIZE as Addr;
-
-        let alice = b"Alice";
-        let bob = b"Bob";
-
-        let mut snapshot = mem.snapshot();
-        snapshot.write(page_a, alice);
-        assert!(!snapshot.valid_range(page_b, bob.len()));
-        snapshot.resize(2); // adding second page
-        snapshot.write(page_b, bob);
-        mem.commit(snapshot);
-
-        let snapshot = mem.snapshot();
-        assert!(snapshot.valid_range(page_b, bob.len()));
-    }
-
-    #[test]
-    fn can_read_previous_snapshots() -> Result<(), Error> {
-        let mut mem = PagePool::new(1);
-
-        let mut a = mem.snapshot();
-        a.write(0, [1]);
-        let a_lsn = mem.commit(a);
-
-        let mut b = mem.snapshot();
-        b.write(0, [2]);
-        let b_lsn = mem.commit(b);
-
-        assert!(b_lsn >= a_lsn);
-
-        let a = mem.snapshot_at(a_lsn)?;
-        assert_eq!(&*a.read(0, 1), &[1]);
-
-        let b = mem.snapshot_at(b_lsn)?;
-        assert_eq!(&*b.read(0, 1), &[2]);
-
-        Ok(())
-    }
-
-    /// When dropping PagePool all related snapshots will be removed. It may lead
-    /// to stackoverflow if snapshots removed recursively.
-    #[test]
-    fn deep_snapshot_should_not_cause_stack_overflow() {
+    fn deep_transaction_should_not_cause_stack_overflow() {
         thread::Builder::new()
             .name("deep_snapshot_should_not_cause_stack_overflow".to_string())
             // setting stacksize explicitly so not to rely on the running environment
-            .stack_size(1024)
+            .stack_size(100 * 1024)
             .spawn(|| {
-                let mut mem = PagePool::new(1);
+                let mut mem = Volume::new_in_memory(100);
+                let tx = mem.start();
                 for _ in 0..1000 {
-                    mem.commit(mem.snapshot());
+                    mem.commit(mem.start()).unwrap();
                 }
+                drop(tx);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// When dropping transaction all related undo entries will be removed. It may lead
+    /// to stackoverflow if removed recursively.
+    #[test]
+    fn deep_commit_notify_should_not_cause_stack_overflow() {
+        thread::Builder::new()
+            .name("deep_snapshot_should_not_cause_stack_overflow".to_string())
+            // setting stacksize explicitly so not to rely on the running environment
+            .stack_size(100 * 1024)
+            .spawn(|| {
+                let mut mem = Volume::new_in_memory(100);
+                let notify = mem.commit_notify();
+                for _ in 0..1000 {
+                    mem.commit(mem.start()).unwrap();
+                }
+                drop(notify);
             })
             .unwrap()
             .join()
@@ -1224,17 +1509,17 @@ mod tests {
 
     #[test]
     fn data_can_be_read_from_a_different_thread() {
-        let mut pool = PagePool::new(1);
+        let mut volume = Volume::default();
 
-        let mut handle = pool.handle();
+        let mut handle = volume.handle();
 
         let lsn = thread::spawn(move || {
-            let mut snapshot = pool.snapshot();
-            snapshot.write(0, [1, 2, 3, 4]);
-            pool.commit(snapshot)
+            let mut tx = volume.start();
+            tx.write(0, [1, 2, 3, 4]);
+            volume.commit(tx).unwrap()
         });
 
-        let commit = handle.wait_for_commit();
+        let commit = handle.wait();
         let bytes = commit.read(0, 4);
 
         let lsn = lsn.join().unwrap();
@@ -1244,62 +1529,121 @@ mod tests {
 
     #[test]
     fn can_get_notifications_about_commit() {
-        let mut pool = PagePool::new(1);
-        let mut n1 = pool.commit_notify();
-        let mut n2 = pool.commit_notify();
-        let current_lsn = pool.snapshot().committed_lsn();
+        let mut volume = Volume::default();
+        let mut n1 = volume.commit_notify();
+        let mut n2 = volume.commit_notify();
 
-        thread::spawn(move || {
-            let mut snapshot = pool.snapshot();
-            snapshot.write(0, [1]);
-            pool.commit(snapshot);
+        let lsn = thread::spawn(move || {
+            let mut tx = volume.start();
+            tx.write(0, [1]);
+            volume.commit(tx).unwrap()
         });
 
-        let lsn2 = n2.next_snapshot().lsn;
-        let lsn1 = n1.next_snapshot().lsn;
+        let lsn2 = n2.next_commit().lsn();
+        let lsn1 = n1.next_commit().lsn();
 
-        assert_eq!(lsn1, current_lsn + 1);
-        assert_eq!(lsn2, current_lsn + 1);
+        let lsn = lsn.join().unwrap();
+
+        assert_eq!(lsn1, lsn);
+        assert_eq!(lsn2, lsn);
     }
 
     #[test]
     fn each_commit_snapshot_can_be_addressed() {
-        let mut pool = PagePool::new(1);
-        let mut notify = pool.commit_notify();
+        let mut volume = Volume::default();
+        let mut notify = volume.commit_notify();
 
         for i in 1..=10 {
-            let mut snapshot = pool.snapshot();
-            snapshot.write(i, [i as u8]);
-            pool.commit(snapshot);
+            let mut tx = volume.start();
+            tx.write(i, [i as u8]);
+            volume.commit(tx).unwrap();
         }
 
-        let snapshot = notify.next_snapshot();
-        assert_eq!(snapshot.lsn, 10);
-
         for lsn in 1..=10 {
-            let s = snapshot
-                .find_at_lsn(lsn)
-                .expect("Unable to find intermediate snapshot");
-            assert_eq!(&*s.read(lsn, 1), &[lsn as u8]);
+            let commit = notify.next_commit();
+            assert_eq!(lsn, commit.lsn());
         }
     }
 
     #[test]
-    fn can_wait_for_a_given_snapshot() {
-        let mut pool = PagePool::new(1);
-        let mut handle = pool.handle();
+    fn can_wait_for_a_snapshot_in_a_thread() {
+        let mut volume = Volume::default();
+        let mut notify = volume.commit_notify();
 
-        let latest_lsn = pool.snapshot().committed_lsn();
-        let snapshot = thread::spawn(move || handle.wait_for_lsn(latest_lsn + 5));
+        let lsn = thread::spawn(move || notify.next_commit().lsn());
 
-        for i in 0..10 {
-            let mut snapshot = pool.snapshot();
-            snapshot.write(0, [i]);
-            pool.commit(snapshot);
+        let mut tx = volume.start();
+        tx.write(0, [0]);
+        let expected_lsn = volume.commit(tx).unwrap();
+
+        let lsn = lsn.join().unwrap();
+        assert_eq!(lsn, expected_lsn);
+    }
+
+    #[test]
+    fn commit_stress_test() {
+        const ITERATIONS: usize = 1000;
+
+        let mut volume = Volume::default();
+        let mut notify = volume.commit_notify();
+
+        let handle = thread::spawn(move || {
+            for _ in 0..ITERATIONS {
+                let mut tx = volume.start();
+                tx.write(0, [0]);
+                volume.commit(tx).unwrap();
+            }
+        });
+
+        for i in 1..=ITERATIONS {
+            let lsn = notify.next_commit().lsn();
+            assert_eq!(lsn, i as u64);
         }
 
-        let snapshot = snapshot.join().unwrap();
-        assert_eq!(snapshot.lsn(), latest_lsn + 5);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn check_iterator_over_page_segments() {
+        assert_eq!(PageSegments::new(10, 0).collect::<Vec<_>>(), vec![]);
+
+        assert_eq!(
+            PageSegments::new(0, 10).collect::<Vec<_>>(),
+            vec![(0, 0..10)]
+        );
+
+        assert_eq!(
+            PageSegments::new(PAGE_SIZE as Addr / 2, PAGE_SIZE).collect::<Vec<_>>(),
+            vec![
+                (PAGE_SIZE as Addr / 2, 0..PAGE_SIZE / 2),
+                (PAGE_SIZE as Addr, PAGE_SIZE / 2..PAGE_SIZE),
+            ]
+        );
+
+        assert_eq!(
+            PageSegments::new(1, 2 * PAGE_SIZE).collect::<Vec<_>>(),
+            vec![
+                (1, 0..PAGE_SIZE - 1),
+                (PAGE_SIZE as Addr, (PAGE_SIZE - 1)..(2 * PAGE_SIZE - 1)),
+                (2 * PAGE_SIZE as Addr, (2 * PAGE_SIZE - 1)..(2 * PAGE_SIZE)),
+            ]
+        );
+    }
+
+    #[test]
+    fn page_volume_can_be_restored_after_reopen() -> io::Result<()> {
+        let tempdir = tempdir()?;
+        let db_file = tempdir.path().join("test.db");
+        let mut volume = Volume::new_with_driver(1, Box::new(FileDriver::from_file(&db_file)?));
+
+        let mut tx = volume.start();
+        tx.write(0, [42]);
+        volume.commit(tx).unwrap();
+        drop(volume);
+
+        let volume = Volume::new_with_driver(1, Box::new(FileDriver::from_file(&db_file)?));
+        assert_eq!(&*volume.read(0, 1), [42]);
+        Ok(())
     }
 
     mod patch {
@@ -1500,43 +1844,93 @@ mod tests {
         use NormalizedPatches::*;
 
         /// The size of database for testing
-        const DB_SIZE: usize = 1024;
+        const DB_SIZE: usize = PAGE_SIZE * 2;
 
         proptest! {
-            #![proptest_config(ProptestConfig {
-                cases: 1000,
-                ..ProptestConfig::default()
-            })]
+            #[test]
+            fn page_segments_len((addr, len) in any_addr_and_len()) {
+                let interval = PageSegments::new(addr, len);
+                let len_sum = interval.map(|(_, slice_range)| slice_range.len()).sum::<usize>();
+                prop_assert_eq!(len_sum, len);
+            }
+
+            #[test]
+            fn page_segments_are_connected((addr, len) in any_addr_and_len()) {
+                let segments = PageSegments::new(addr, len)
+                    .map(|(_, slice_range)| slice_range)
+                    .collect::<Vec<_>>();
+                for i in segments.windows(2) {
+                    prop_assert_eq!(i[0].end, i[1].start);
+                }
+            }
+
+            #[test]
+            fn page_segments_are_equivalent_to_reverted((addr, len) in any_addr_and_len()) {
+                let segments = PageSegments::new(addr, len).collect::<Vec<_>>();
+
+                let mut segments_rev = PageSegments::new(addr, len).rev().collect::<Vec<_>>();
+                segments_rev.sort_by_key(|(addr, _)| *addr);
+
+                prop_assert_eq!(segments, segments_rev);
+            }
 
             /// This test uses "shadow writes" to check if snapshot writing and reading
             /// algorithms are consistent. We do it by mirroring all patches to a shadow buffer sequentially.
             /// In the end, the final snapshot state should be equal to the shadow buffer.
             #[test]
-            fn shadow_write(snapshots in vec(any_snapshot(), 0..10)) {
+            fn shadow_write(snapshots in vec(any_snapshot(), 0..3)) {
                 let mut shadow_buffer = vec![0; DB_SIZE];
-                let mut mem = PagePool::default();
+                let mut mem = Volume::with_capacity(DB_SIZE);
 
                 for patches in snapshots {
-                    let mut snapshot = mem.snapshot();
+                    let mut tx = mem.start();
                     for patch in patches {
                         let offset = patch.addr() as usize;
                         let range = offset..offset + patch.len();
                         match patch {
                             Patch::Write(offset, bytes) => {
                                 shadow_buffer[range].copy_from_slice(bytes.as_slice());
-                                snapshot.write(offset, bytes);
+                                tx.write(offset, bytes);
                             },
                             Patch::Reclaim(offset, len) => {
                                 shadow_buffer[range].fill(0);
-                                snapshot.reclaim(offset, len);
+                                tx.reclaim(offset, len);
 
                             }
                         }
                     }
-                    mem.commit(snapshot);
+                    mem.commit(tx).unwrap();
                 }
 
                 assert_buffers_eq(&mem.read(0, DB_SIZE), shadow_buffer.as_slice())?;
+            }
+
+            /// This test ensure that no matter transactions are committed, snapshot should always
+            /// return the same initial state.
+            #[test]
+            fn repeatable_read(snapshots in vec(any_snapshot(), 1..5)) {
+                const VALUE: u8 = 42;
+                let initial = vec![VALUE; DB_SIZE];
+                let mut mem = Volume::from(initial.as_slice());
+                let s = mem.snapshot();
+
+                for patches in snapshots {
+                    let mut tx = mem.start();
+                    for patch in patches {
+                        match patch {
+                            Patch::Write(offset, bytes) => {
+                                tx.write(offset, bytes);
+                            },
+                            Patch::Reclaim(offset, len) => {
+                                tx.reclaim(offset, len);
+                            }
+                        }
+                    }
+
+                    prop_assert!(s.read(0, DB_SIZE).iter().all(|b| *b == VALUE));
+                    mem.commit(tx).unwrap();
+                    prop_assert!(s.read(0, DB_SIZE).iter().all(|b| *b == VALUE));
+                }
             }
 
             #[test]
@@ -1650,6 +2044,10 @@ mod tests {
             (0u32..10, 1u32..5).prop_map(|(offset, length)| offset..(offset + length))
         }
 
+        fn any_addr_and_len() -> impl Strategy<Value = (Addr, usize)> {
+            (0..100 * PAGE_SIZE as Addr, 0..20 * PAGE_SIZE)
+        }
+
         fn any_non_intersecting_ranges() -> impl Strategy<Value = Vec<Range<u32>>> {
             (0usize..10)
                 .prop_flat_map(|size| (vec(1u32..3, size), vec(0u32..3, size)))
@@ -1750,7 +2148,7 @@ mod tests {
             }
 
             pub(super) fn any_patch() -> impl Strategy<Value = Patch> {
-                prop_oneof![write_patch(1..5), reclaim_patch(1..5)]
+                prop_oneof![write_patch(1..16), reclaim_patch(1..16)]
             }
 
             pub(super) fn write_patch(len: Range<usize>) -> impl Strategy<Value = Patch> {
@@ -1814,28 +2212,20 @@ mod tests {
         assert_eq!(a, b);
     }
 
-    impl From<&[u8]> for CommittedSnapshot {
-        fn from(bytes: &[u8]) -> Self {
-            assert!(bytes.len() <= PAGE_SIZE, "String is too large");
-
-            CommittedSnapshot {
-                patches: vec![Patch::Write(0, bytes.to_vec())],
-                base: None,
-                pages: 1,
-                lsn: 1,
-            }
-        }
-    }
-
-    impl From<&str> for PagePool {
+    impl From<&str> for Volume {
         fn from(value: &str) -> Self {
             Self::from(value.as_bytes())
         }
     }
 
-    impl From<&[u8]> for PagePool {
+    impl From<&[u8]> for Volume {
         fn from(value: &[u8]) -> Self {
-            PagePool::from_snapshot(CommittedSnapshot::from(value))
+            let capactiy = PAGE_SIZE.max(value.len());
+            let mut volume = Volume::with_capacity(capactiy);
+            let mut tx = volume.start();
+            tx.write(0, value);
+            volume.commit(tx).unwrap();
+            volume
         }
     }
 

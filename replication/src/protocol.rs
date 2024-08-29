@@ -1,5 +1,5 @@
 use crate::io_error;
-use pmem::page::{Patch, LSN, PAGE_SIZE};
+use pmem::volume::{Patch, LSN, PAGE_SIZE};
 use std::{borrow::Cow, io, pin::Pin};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

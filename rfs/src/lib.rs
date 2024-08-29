@@ -1,7 +1,7 @@
 use pmem::{
     memory::{self, SlicePtr, PTR_SIZE},
-    page::{TxRead, TxWrite},
-    Addr, Handle, Memory, Ptr, Record,
+    volume::{Addr, TxRead, TxWrite},
+    Handle, Memory, Ptr, Record,
 };
 use pmem_derive::Record;
 use std::{
@@ -722,6 +722,8 @@ impl<'a, S: TxRead> Read for File<'a, S> {
             .min(bytes_left_in_block)
             .min(bytes_left_in_file as usize);
 
+        // TODO: profiling results show that get_current_block() is bottleneck of this function
+        //       in order to improve performance we need to read multiple blocks at once
         let block = self.get_current_block()?;
         buf[..len].copy_from_slice(&block[offset..offset + len]);
 
@@ -1073,7 +1075,7 @@ impl<'a, S: TxRead> fmt::Debug for FsTree<'a, S> {
 mod tests {
     use super::*;
     use fmt::Debug;
-    use pmem::page::{PagePool, Snapshot};
+    use pmem::volume::{Transaction, Volume};
     use std::{collections::HashSet, fs};
 
     macro_rules! assert_not_exists {
@@ -1327,17 +1329,17 @@ mod tests {
     fn detect_changes() -> Result<()> {
         let (mut fs_a, mut mem) = create_fs();
         mkdirs(&mut fs_a, &["/etc"]);
-        let lsn_a = mem.commit(fs_a.finish());
+        mem.commit(fs_a.finish()).unwrap();
+        let tx_a = mem.start();
 
-        let mut fs_b = Filesystem::open(mem.snapshot());
+        let mut fs_b = Filesystem::open(mem.start());
         fs_b.delete(&fs_b.get_root()?, "etc")?;
         mkdirs(&mut fs_b, &["/bin"]);
-        let lsn_b = mem.commit(fs_b.finish());
+        mem.commit(fs_b.finish()).unwrap();
+        let tx_b = mem.start();
 
-        let snapshot_a = mem.snapshot_at(lsn_a).unwrap();
-        let fs_a = Filesystem::open(snapshot_a);
-        let snapshot_b = mem.snapshot_at(lsn_b).unwrap();
-        let fs_b = Filesystem::open(snapshot_b);
+        let fs_a = Filesystem::open(tx_a);
+        let fs_b = Filesystem::open(tx_b);
 
         let (added, deleted) = fs_changes(&fs_a, &fs_b);
 
@@ -1433,7 +1435,7 @@ mod tests {
     #[should_panic(expected = "NoSpaceLeft")]
     fn no_space_left() {
         // Maximum file size is 5184 bytes in test environment. So in order to trigger NoSpaceLeft
-        // we need to write 64Kib (1 page in PagePool) / 5184 = 13 files.
+        // we need to write 64Kib (1 page in Volume) / 5184 = 13 files.
         const MAX_FILE_SIZE: usize = BLOCK_SIZE * LAST_DOUBLE_INDIRECT_BLOCK;
 
         let (mut fs, _) = create_fs();
@@ -1559,9 +1561,9 @@ mod tests {
         }
     }
 
-    fn create_fs() -> (Filesystem<Snapshot>, PagePool) {
-        let page_pool = PagePool::default();
-        (Filesystem::allocate(page_pool.snapshot()), page_pool)
+    fn create_fs() -> (Filesystem<Transaction>, Volume) {
+        let volume = Volume::new_in_memory(1);
+        (Filesystem::allocate(volume.start()), volume)
     }
 
     /// A filesystem action that can be applied to a filesystem
@@ -1651,7 +1653,7 @@ mod tests {
 
     mod proptests {
         use super::*;
-        use pmem::page::PagePool;
+        use pmem::volume::Volume;
         use prop::collection::hash_set;
         use proptest::{collection::vec, prelude::*, prop_oneof, proptest, strategy::Strategy};
         use std::{fs, ops::Range};
@@ -1678,8 +1680,8 @@ mod tests {
 
             #[test]
             fn can_write_file(ops in vec(any_write_operation(), 0..10)) {
-                let pool = PagePool::new(1024 * 1024);
-                let mut fs = Filesystem::allocate(pool.snapshot());
+                let volume = Volume::with_capacity(1024 * 1024);
+                let mut fs = Filesystem::allocate(volume.start());
 
                 let tmp_dir = TempDir::new()?;
                 let root = fs.get_root()?;

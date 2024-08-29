@@ -1,7 +1,4 @@
-use pmem::{
-    page::{PagePool, TxRead, TxWrite, PAGE_SIZE},
-    Addr,
-};
+use pmem::volume::{Addr, TxRead, TxWrite, Volume, PAGE_SIZE};
 use rand::{rngs::SmallRng, Rng, SeedableRng};
 use std::{hint::black_box, ops::Range};
 use tango_bench::{
@@ -13,49 +10,49 @@ const DB_SIZE: usize = 1024 * 1024;
 
 fn page_benchmarks() -> impl IntoBenchmarks {
     [
-        benchmark_fn("arbitrary_read", bench_read),
-        benchmark_fn("arbitrary_write", bench_write),
-        benchmark_fn("write_commit", bench_write_commit),
+        benchmark_fn("arbitrary_read", arbitrary_read),
+        benchmark_fn("arbitrary_write", arbitrary_write),
+        benchmark_fn("write_commit", write_commit),
     ]
 }
 
-fn bench_read(b: Bencher) -> Box<dyn Sampler> {
+fn arbitrary_read(b: Bencher) -> Box<dyn Sampler> {
     let mut rng = SmallRng::seed_from_u64(b.seed);
     let mem = generate_mem(&mut rng);
     b.iter(move || {
         let (addr, len) = random_segment(&mut rng, 0..DB_SIZE);
-        let snapshot = mem.snapshot();
-        let _ = black_box(snapshot.read(addr as Addr, len));
+        let tx = mem.start();
+        let _ = black_box(tx.read(addr as Addr, len));
     })
 }
 
-fn bench_write(b: Bencher) -> Box<dyn Sampler> {
+fn arbitrary_write(b: Bencher) -> Box<dyn Sampler> {
     let mut rng = SmallRng::seed_from_u64(b.seed);
 
     let mut buffer = [0u8; DB_SIZE];
     rng.fill(&mut buffer[..]);
 
-    let mem = PagePool::new(DB_SIZE / PAGE_SIZE + 1);
-    let mut snapshot = mem.snapshot();
+    let mem = Volume::new_in_memory((DB_SIZE / PAGE_SIZE + 1) as u32);
+    let mut tx = mem.start();
     b.iter(move || {
         let (addr, len) = random_segment(&mut rng, 0..DB_SIZE);
-        snapshot.write(addr as Addr, &buffer[..len]);
+        tx.write(addr as Addr, &buffer[..len]);
     })
 }
 
-fn bench_write_commit(b: Bencher) -> Box<dyn Sampler> {
+fn write_commit(b: Bencher) -> Box<dyn Sampler> {
     let mut rng = SmallRng::seed_from_u64(b.seed);
 
     let mut buffer = [0u8; DB_SIZE];
     rng.fill(&mut buffer[..]);
 
-    let mut mem = PagePool::new(DB_SIZE / PAGE_SIZE + 1);
+    let mut mem = Volume::new_in_memory((DB_SIZE / PAGE_SIZE + 1) as u32);
 
     b.iter(move || {
         let (addr, len) = random_segment(&mut rng, 0..DB_SIZE);
-        let mut snapshot = mem.snapshot();
-        snapshot.write(addr as Addr, &buffer[..len]);
-        mem.commit(snapshot);
+        let mut tx = mem.start();
+        tx.write(addr as Addr, &buffer[..len]);
+        mem.commit(tx).unwrap();
     })
 }
 
@@ -66,21 +63,21 @@ fn random_segment(rng: &mut SmallRng, mut range: Range<usize>) -> (usize, usize)
     (addr, len)
 }
 
-fn generate_mem(rng: &mut SmallRng) -> PagePool {
-    const SNAPSHOTS: usize = 100;
+fn generate_mem(rng: &mut SmallRng) -> Volume {
+    const TRANSACTIONS: usize = 100;
     const PATCHES: usize = 1000;
 
     let mut buffer = [0u8; DB_SIZE];
     rng.fill(&mut buffer[..]);
 
-    let mut mem = PagePool::new(DB_SIZE / PAGE_SIZE + 1);
-    for _ in 0..SNAPSHOTS {
-        let mut snapshot = mem.snapshot();
+    let mut mem = Volume::new_in_memory((DB_SIZE / PAGE_SIZE + 1) as u32);
+    for _ in 0..TRANSACTIONS {
+        let mut tx = mem.start();
         for _ in 0..PATCHES {
             let (addr, len) = random_segment(rng, 0..DB_SIZE);
-            snapshot.write(addr as Addr, &buffer[..len]);
+            tx.write(addr as Addr, &buffer[..len]);
         }
-        mem.commit(snapshot);
+        mem.commit(tx).unwrap();
     }
     mem
 }

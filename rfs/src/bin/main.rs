@@ -1,7 +1,11 @@
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
-use pmem::page::PagePool;
-use rfs::{nfs::RFS, ChangeKind, Filesystem};
-use std::io::{self, Write};
+use pmem::{driver::FileDriver, volume::Volume};
+use rfs::{nfs::RFS, Filesystem};
+use std::{
+    fs,
+    io::{self, Write},
+};
+use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 const HOSTPORT: u32 = 11111;
@@ -16,13 +20,21 @@ async fn main() {
         .with(filter_layer)
         .init();
 
-    let mut pool = PagePool::with_capacity(100 * 1024 * 1024);
-    let tx = Filesystem::allocate(pool.snapshot()).finish();
-    pool.commit(tx);
+    let file_path = "./target/test.db";
+    let db_exists = fs::metadata(file_path).is_err();
+    let driver = FileDriver::from_file(file_path).unwrap();
+    let mut volume = Volume::with_capacity_and_driver(100 * 1024 * 1024, driver);
+    if db_exists {
+        warn!(path = file_path, "Allocating FS");
+        let tx = Filesystem::allocate(volume.start()).finish();
+        volume.commit(tx).unwrap();
+    } else {
+        info!(path = file_path, "Opening FS");
+    }
 
-    let commit_notify = pool.commit_notify();
+    let commit_notify = volume.commit_notify();
 
-    let rfs = RFS::new(pool.snapshot());
+    let rfs = RFS::new(volume.start());
     let state = rfs.state_handle();
     let listener = NFSTcpListener::bind(&format!("127.0.0.1:{HOSTPORT}"), rfs)
         .await
@@ -41,18 +53,9 @@ async fn main() {
         if cmd.trim() == "exit" {
             break;
         } else if cmd.trim() == "commit" {
-            let changes = {
-                let mut s = state.lock().await;
-                s.commit_and_get_changes(&mut pool).await
-            };
-            for change in changes {
-                let marker = match change.kind() {
-                    ChangeKind::Add => "A",
-                    ChangeKind::Delete => "D",
-                    ChangeKind::Update => "M",
-                };
-                println!("{} {}", marker, change.into_path().display());
-            }
+            let mut s = state.lock().await;
+            s.commit(&mut volume).await;
+            println!("Committed")
         } else {
             println!("Unknown command: {}", cmd)
         }
