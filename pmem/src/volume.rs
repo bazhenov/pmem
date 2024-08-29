@@ -706,6 +706,26 @@ struct UndoEntry {
     lsn: LSN,
 }
 
+/// Because this type forms a linked list, standard `Drop` implementation will cause stack overflow.
+/// This implements iterative drop instead.
+impl Drop for UndoEntry {
+    fn drop(&mut self) {
+        // SAFETY:
+        //  1. ArcSwap is owned and not impl Clone, so we're the only owner of it.
+        //  2. We're in Drop, so there are no other references to self.
+        // Therefore, we can safely move an `Arc` out of self.next.
+        let mut next = self.next.swap(Arc::new(None));
+
+        while let Some(Some(entry)) = Arc::into_inner(next) {
+            // What we're doing here is making one more ref to the next entry. This effectively prevents
+            // recursive drop(). 1 call to drop() will still be made, but it will return without recursion,
+            // because current stack frame holding a ref to the `self.next.next`. This way we can remove
+            // the whole list iteratively.
+            next = entry.next.load_full();
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct VolumeHandle {
     notify: CommitNotify,
@@ -927,6 +947,16 @@ impl Commit {
 
     pub fn next(&self) -> Arc<Option<Commit>> {
         self.next.load_full()
+    }
+}
+
+// It solves the same problem as for `UndoEntry`. See [`UndoEntry`] documentation.
+impl Drop for Commit {
+    fn drop(&mut self) {
+        let mut next = self.next.swap(Arc::new(None));
+        while let Some(Some(entry)) = Arc::into_inner(next) {
+            next = entry.next.load_full();
+        }
     }
 }
 
@@ -1435,19 +1465,42 @@ mod tests {
             .reclaim(PAGE_SIZE as Addr - 10, 20);
     }
 
-    /// When dropping Volume all related snapshots will be removed. It may lead
-    /// to stackoverflow if snapshots removed recursively.
+    /// When dropping transaction all related undo entries will be removed. It may lead
+    /// to stackoverflow if removed recursively.
     #[test]
-    fn deep_snapshot_should_not_cause_stack_overflow() {
+    fn deep_transaction_should_not_cause_stack_overflow() {
         thread::Builder::new()
             .name("deep_snapshot_should_not_cause_stack_overflow".to_string())
             // setting stacksize explicitly so not to rely on the running environment
             .stack_size(100 * 1024)
             .spawn(|| {
                 let mut mem = Volume::new_in_memory(100);
+                let tx = mem.start();
                 for _ in 0..1000 {
                     mem.commit(mem.start()).unwrap();
                 }
+                drop(tx);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// When dropping transaction all related undo entries will be removed. It may lead
+    /// to stackoverflow if removed recursively.
+    #[test]
+    fn deep_commit_notify_should_not_cause_stack_overflow() {
+        thread::Builder::new()
+            .name("deep_snapshot_should_not_cause_stack_overflow".to_string())
+            // setting stacksize explicitly so not to rely on the running environment
+            .stack_size(100 * 1024)
+            .spawn(|| {
+                let mut mem = Volume::new_in_memory(100);
+                let notify = mem.commit_notify();
+                for _ in 0..1000 {
+                    mem.commit(mem.start()).unwrap();
+                }
+                drop(notify);
             })
             .unwrap()
             .join()
