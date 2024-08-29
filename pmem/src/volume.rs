@@ -742,6 +742,8 @@ impl VolumeHandle {
     pub fn wait(&mut self) -> Snapshot {
         let commit = self.notify.next_commit();
 
+        // TODO: we don't need to store origin undo_log here, it's actually a leak. We must move to the LSN
+        // of the commit.
         Snapshot {
             lsn: commit.lsn,
             pages_count: self.pages_count,
@@ -1283,6 +1285,7 @@ impl DoubleEndedIterator for PageSegments {
 
 #[cfg(test)]
 mod tests {
+    use rand::{rngs::SmallRng, Rng, SeedableRng};
     use tempfile::tempdir;
 
     use crate::driver::FileDriver;
@@ -1643,6 +1646,65 @@ mod tests {
 
         let volume = Volume::new_with_driver(1, Box::new(FileDriver::from_file(&db_file)?));
         assert_eq!(&*volume.read(0, 1), [42]);
+        Ok(())
+    }
+
+    /// This tests writes random data to the volume in a way that the total sum of all bytes is always 0.
+    /// It then checks that the sum is still 0 when observing volume snapshots from a different thread.
+    #[test]
+    fn consistency_check() -> io::Result<()> {
+        const PAGES: usize = 2;
+        const SIZE: usize = PAGE_SIZE * PAGES;
+        const PATCH_LEN: usize = 100;
+        const TRANSACTIONS: usize = 100;
+
+        fn wrapping_sum(tx: &impl TxRead) -> u8 {
+            tx.read(0, SIZE)
+                .iter()
+                .copied()
+                .reduce(|a, b| a.wrapping_add(b))
+                .unwrap()
+        }
+
+        fn check_transaction_consistency(mut handle: VolumeHandle) {
+            let mut lsn = 0u64;
+            while lsn < TRANSACTIONS as u64 {
+                let snapshot = handle.wait();
+                lsn = snapshot.lsn();
+                assert_eq!(wrapping_sum(&snapshot), 0);
+            }
+        }
+
+        let mut rng = SmallRng::from_entropy();
+        let mut patch = vec![0u8; PATCH_LEN];
+
+        let mut volume = Volume::new_in_memory(PAGES as PageNo);
+        let mut join_handles = vec![];
+
+        // Spawn 4 threads that will check the consistency of the volume snapshots.
+        for _ in 0..4 {
+            let handle = volume.handle();
+            let join = thread::spawn(move || check_transaction_consistency(handle));
+            join_handles.push(join);
+        }
+
+        // Write random patches to the volume and correct the first byte to keep the sum 0.
+        for _ in 0..TRANSACTIONS {
+            let offset = rng.gen_range(0..SIZE - PATCH_LEN);
+            rng.fill(patch.as_mut_slice());
+
+            let mut tx = volume.start();
+            tx.write(offset as Addr, patch.as_slice());
+            let sum = wrapping_sum(&tx);
+            let corrector = 255 - sum.wrapping_sub(tx.read(0, 1)[0]).wrapping_sub(1);
+            tx.write(0, [corrector]);
+            volume.commit(tx)?;
+        }
+
+        for join in join_handles {
+            join.join().unwrap();
+        }
+
         Ok(())
     }
 
