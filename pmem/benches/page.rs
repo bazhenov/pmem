@@ -1,4 +1,4 @@
-use pmem::volume::{Addr, TxRead, TxWrite, Volume, PAGE_SIZE};
+use pmem::volume::{Addr, TxRead, TxWrite, Volume};
 use rand::{rngs::SmallRng, Rng, SeedableRng};
 use std::{hint::black_box, ops::Range};
 use tango_bench::{
@@ -6,76 +6,107 @@ use tango_bench::{
     Sampler,
 };
 
-const DB_SIZE: usize = 1024 * 1024;
+const DB_SIZE: usize = 100 * 1024 * 1024;
 
 fn page_benchmarks() -> impl IntoBenchmarks {
     [
-        benchmark_fn("arbitrary_read", arbitrary_read),
-        benchmark_fn("arbitrary_write", arbitrary_write),
-        benchmark_fn("write_commit", write_commit),
+        benchmark_fn("arbitrary_read_1k", arbitrary_read_1k),
+        benchmark_fn("arbitrary_write_1k", arbitrary_write_1k),
+        benchmark_fn("write_commit_1k", write_commit_1k),
+        benchmark_fn("repeatable_read_tx_1k", repeatable_read_tx_1k),
     ]
 }
 
-fn arbitrary_read(b: Bencher) -> Box<dyn Sampler> {
+fn arbitrary_read_1k(b: Bencher) -> Box<dyn Sampler> {
+    const PATCH_SIZE: usize = 1024;
     let mut rng = SmallRng::seed_from_u64(b.seed);
+
     let mem = generate_mem(&mut rng);
     b.iter(move || {
-        let (addr, len) = random_segment(&mut rng, 0..DB_SIZE);
         let tx = mem.start();
-        let _ = black_box(tx.read(addr as Addr, len));
+
+        let addr = random_addr::<PATCH_SIZE>(&mut rng, 0..DB_SIZE);
+        let _ = black_box(tx.read(addr as Addr, PATCH_SIZE));
     })
 }
 
-fn arbitrary_write(b: Bencher) -> Box<dyn Sampler> {
+fn arbitrary_write_1k(b: Bencher) -> Box<dyn Sampler> {
+    const PATCH_SIZE: usize = 1024;
     let mut rng = SmallRng::seed_from_u64(b.seed);
 
-    let mut buffer = [0u8; DB_SIZE];
-    rng.fill(&mut buffer[..]);
+    let mut patch = vec![0u8; PATCH_SIZE];
+    rng.fill(&mut patch[..]);
 
-    let mem = Volume::new_in_memory((DB_SIZE / PAGE_SIZE + 1) as u32);
-    let mut tx = mem.start();
-    b.iter(move || {
-        let (addr, len) = random_segment(&mut rng, 0..DB_SIZE);
-        tx.write(addr as Addr, &buffer[..len]);
-    })
-}
-
-fn write_commit(b: Bencher) -> Box<dyn Sampler> {
-    let mut rng = SmallRng::seed_from_u64(b.seed);
-
-    let mut buffer = [0u8; DB_SIZE];
-    rng.fill(&mut buffer[..]);
-
-    let mut mem = Volume::new_in_memory((DB_SIZE / PAGE_SIZE + 1) as u32);
+    let mem = Volume::with_capacity(DB_SIZE);
 
     b.iter(move || {
-        let (addr, len) = random_segment(&mut rng, 0..DB_SIZE);
+        const PATCHES_COUNT: usize = 10;
         let mut tx = mem.start();
-        tx.write(addr as Addr, &buffer[..len]);
+
+        for _ in 0..PATCHES_COUNT {
+            // Here we use 0..PATCH_SIZE * PATCHES_COUNT to ensure that the patches are competing
+            // for the same memory regions.
+            let addr = random_addr::<PATCH_SIZE>(&mut rng, 0..PATCH_SIZE * PATCHES_COUNT);
+            tx.write(addr as Addr, patch.as_slice());
+        }
+    })
+}
+
+fn write_commit_1k(b: Bencher) -> Box<dyn Sampler> {
+    const PATCH_SIZE: usize = 1024;
+    let mut rng = SmallRng::seed_from_u64(b.seed);
+
+    let mut patch = vec![0u8; PATCH_SIZE];
+    rng.fill(&mut patch[..]);
+
+    let mut mem = Volume::with_capacity(DB_SIZE);
+
+    b.iter(move || {
+        let addr = random_addr::<PATCH_SIZE>(&mut rng, 0..DB_SIZE);
+        let mut tx = mem.start();
+        tx.write(addr as Addr, patch.as_slice());
         mem.commit(tx).unwrap();
     })
 }
 
-fn random_segment(rng: &mut SmallRng, mut range: Range<usize>) -> (usize, usize) {
-    let len = rng.gen_range(1..1024);
-    range.end -= len;
-    let addr = rng.gen_range(range);
-    (addr, len)
+/// This benchmark measures the time it takes for a repeated read operation to read through the undo log.
+fn repeatable_read_tx_1k(b: Bencher) -> Box<dyn Sampler> {
+    const PATCH_SIZE: usize = 1024;
+    const TRANSACTIONS: usize = 1000;
+
+    let mut mem = Volume::with_capacity(PATCH_SIZE);
+    // We must take snapshot before the transactions commit, otherwise the undo log of a snapshot will be empty.
+    let s = mem.snapshot();
+    for _ in 0..TRANSACTIONS {
+        let mut tx = mem.start();
+        tx.write(0, [1; PATCH_SIZE]);
+        mem.commit(tx).unwrap();
+    }
+
+    b.iter(move || {
+        let _ = black_box(s.read(0, PATCH_SIZE));
+    })
+}
+
+fn random_addr<const N: usize>(rng: &mut SmallRng, mut range: Range<usize>) -> usize {
+    range.end -= N;
+    rng.gen_range(range)
 }
 
 fn generate_mem(rng: &mut SmallRng) -> Volume {
     const TRANSACTIONS: usize = 100;
-    const PATCHES: usize = 1000;
+    const PATCHES: usize = 100;
+    const PATCH_SIZE: usize = 1024;
 
-    let mut buffer = [0u8; DB_SIZE];
-    rng.fill(&mut buffer[..]);
+    let mut patch = vec![0u8; PATCH_SIZE];
+    rng.fill(&mut patch[..]);
 
-    let mut mem = Volume::new_in_memory((DB_SIZE / PAGE_SIZE + 1) as u32);
+    let mut mem = Volume::with_capacity(DB_SIZE);
     for _ in 0..TRANSACTIONS {
         let mut tx = mem.start();
         for _ in 0..PATCHES {
-            let (addr, len) = random_segment(rng, 0..DB_SIZE);
-            tx.write(addr as Addr, &buffer[..len]);
+            let addr = random_addr::<PATCH_SIZE>(rng, 0..DB_SIZE);
+            tx.write(addr as Addr, patch.as_slice());
         }
         mem.commit(tx).unwrap();
     }
