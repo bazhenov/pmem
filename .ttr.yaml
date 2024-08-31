@@ -7,11 +7,11 @@ groups:
         tasks:
           - name: All
             key: a
-            cmd: cargo test -q --lib --examples
+            cmd: cargo test -q
             confirm: true
             clear: true
           - name: Lib
             key: l
-            cmd: cargo test -q --lib
+            cmd: cargo test -q --lib -p pmem
             confirm: true
             clear: true

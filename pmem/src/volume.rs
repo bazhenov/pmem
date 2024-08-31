@@ -401,7 +401,12 @@ pub struct Volume {
     pages: Arc<Mutex<Pages>>,
     pages_count: PageNo,
 
-    /// Reference to the [`UndoEntry`] for the last committed transaction.
+    /// A log sequence number (LSN) that uniquely identifies this snapshot. The LSN
+    /// is used internally to ensure that snapshots are applied in a linear and consistent order.
+    lsn: AtomicU64,
+
+    /// Reference to the latest commit and condition variable used to notify waiting threads
+    /// that a new commit has been completed
     ///
     /// When committing a transaction, this is used to create a snapshot and subsequent commits
     /// will append undo log with the changes required to maintain REPEATABLE READ isolation level for the
@@ -409,16 +414,8 @@ pub struct Volume {
     ///
     /// Ideally it should not contain `Option`, because it is required to be present
     /// for the snapshot to be created. Unfortunately, this is not possible due to the fact
-    /// that [`UndoEntry::next`] which is [`ArcSwap`] must contains `Option` to be able
+    /// that [`Commit::next`] which is [`ArcSwap`] must contains `Option` to be able
     /// to stop reference chain at some point and we can not have both `Arc<T>` and `Arc<Option<T>>` as the same time.
-    undo_log: Arc<Option<UndoEntry>>,
-
-    /// A log sequence number (LSN) that uniquely identifies this snapshot. The LSN
-    /// is used internally to ensure that snapshots are applied in a linear and consistent order.
-    lsn: AtomicU64,
-
-    /// Reference to the latest commit and condition variable used to notify waiting threads
-    /// that a new commit has been completed
     latest_commit: Arc<(Mutex<Arc<Option<Commit>>>, Condvar)>,
 }
 
@@ -454,6 +451,7 @@ impl Volume {
         assert!(page_cnt > 0, "The number of pages must be greater than 0");
         let commit = Commit {
             changes: vec![],
+            undo: vec![],
             next: ArcSwap::from_pointee(None),
             lsn: 0,
         };
@@ -461,7 +459,6 @@ impl Volume {
         Self {
             pages: Arc::new(Mutex::new(Pages::new(driver))),
             pages_count: page_cnt as PageNo,
-            undo_log: Arc::new(Some(UndoEntry::default())),
             latest_commit: Arc::new((commit, Condvar::new())),
             lsn: AtomicU64::new(0),
         }
@@ -514,11 +511,11 @@ impl Volume {
 
         let lsn = self.lsn.fetch_add(1, Ordering::Relaxed) + 1;
 
+        let mut undo_patches = Vec::with_capacity(tx.uncommitted.len());
         // Updating pages and undo log
         {
             let mut locked_pages = self.pages.lock().unwrap();
 
-            let mut patches = Vec::with_capacity(tx.uncommitted.len());
             for patch in &tx.uncommitted {
                 let segments = PageSegments::new(patch.addr(), patch.len());
                 let mut undo_patch = vec![0; patch.len()];
@@ -541,26 +538,16 @@ impl Volume {
                         Patch::Reclaim(..) => page[page_range].fill(0),
                     }
                 }
-                patches.push(Patch::Write(patch.addr(), undo_patch));
+                undo_patches.push(Patch::Write(patch.addr(), undo_patch));
 
                 locked_pages.flush()?;
             }
-            let undo = Arc::new(Some(UndoEntry {
-                next: ArcSwap::from_pointee(None),
-                patches,
-                lsn,
-            }));
-            (*self.undo_log)
-                .as_ref()
-                .expect("Undo log is missing")
-                .next
-                .store(Arc::clone(&undo));
-            self.undo_log = undo;
         }
 
         // Updating redo log
         let new_commit = Arc::new(Some(Commit {
             changes: tx.uncommitted,
+            undo: undo_patches,
             next: ArcSwap::from_pointee(None),
             lsn,
         }));
@@ -588,22 +575,24 @@ impl Volume {
 
     /// Creates read-only handle to the volume that may be used to read data from it from different threads.
     pub fn handle(&self) -> VolumeHandle {
+        let notify = self.commit_notify();
+        let commit_log = Arc::clone(&self.latest_commit.0.lock().unwrap());
         VolumeHandle {
-            notify: self.commit_notify(),
             pages: Arc::clone(&self.pages),
             pages_count: self.pages_count,
-            undo_log: Arc::clone(&self.undo_log),
+            notify,
+            commit_log,
         }
     }
 
     pub fn snapshot(&self) -> Snapshot {
-        debug_assert!(self.undo_log.is_some());
-
+        let commit = self.latest_commit.0.lock().unwrap();
+        debug_assert!(commit.is_some());
         Snapshot {
             lsn: self.lsn.load(Ordering::Relaxed),
             pages_count: self.pages_count,
             pages: Arc::clone(&self.pages),
-            undo_log: Arc::clone(&self.undo_log),
+            commit_log: Arc::clone(&commit),
         }
     }
 
@@ -694,43 +683,11 @@ impl Page {
     }
 }
 
-/// Describes a changes that need to be applied to the page to restore it to the state
-/// before particular transaction was committed.
-///
-/// `UndoEntry` is referenced from old to new and only last position is stored in [`Volume`].
-/// It enables automatic cleanup of old entries that are not referenced anymore by any snapshot or transaction.
-#[derive(Default)]
-struct UndoEntry {
-    next: ArcSwap<Option<UndoEntry>>,
-    patches: Vec<Patch>,
-    lsn: LSN,
-}
-
-/// Because this type forms a linked list, standard `Drop` implementation will cause stack overflow.
-/// This implements iterative drop instead.
-impl Drop for UndoEntry {
-    fn drop(&mut self) {
-        // SAFETY:
-        //  1. ArcSwap is owned and not impl Clone, so we're the only owner of it.
-        //  2. We're in Drop, so there are no other references to self.
-        // Therefore, we can safely move an `Arc` out of self.next.
-        let mut next = self.next.swap(Arc::new(None));
-
-        while let Some(Some(entry)) = Arc::into_inner(next) {
-            // What we're doing here is making one more ref to the next entry. This effectively prevents
-            // recursive drop(). 1 call to drop() will still be made, but it will return without recursion,
-            // because current stack frame holding a ref to the `self.next.next`. This way we can remove
-            // the whole list iteratively.
-            next = entry.next.load_full();
-        }
-    }
-}
-
 #[derive(Clone)]
 pub struct VolumeHandle {
     notify: CommitNotify,
     pages_count: PageNo,
-    undo_log: Arc<Option<UndoEntry>>,
+    commit_log: Arc<Option<Commit>>,
     pages: Arc<Mutex<Pages>>,
 }
 
@@ -747,8 +704,8 @@ impl VolumeHandle {
         Snapshot {
             lsn: commit.lsn,
             pages_count: self.pages_count,
+            commit_log: Arc::clone(&self.commit_log),
             pages: Arc::clone(&self.pages),
-            undo_log: Arc::clone(&self.undo_log),
         }
     }
 }
@@ -854,7 +811,7 @@ pub trait TxWrite: TxRead {
 #[derive(Clone)]
 pub struct Snapshot {
     pages_count: PageNo,
-    undo_log: Arc<Option<UndoEntry>>,
+    commit_log: Arc<Option<Commit>>,
     pages: Arc<Mutex<Pages>>,
     lsn: LSN,
 }
@@ -896,12 +853,12 @@ impl Snapshot {
         // Applying with undo log
         // We need to skip first entry in undo log, because it is describing how to undo the changes
         // of previously applied transaction.
-        let mut log = (*self.undo_log).as_ref().unwrap().next.load_full();
-        while let Some(undo) = log.as_ref() {
-            if undo.lsn > self.lsn {
-                apply_patches(&undo.patches, addr as usize, &mut buf, &mut buf_mask);
+        let mut commit_log = (*self.commit_log).as_ref().unwrap().next.load_full();
+        while let Some(commit) = commit_log.as_ref() {
+            if commit.lsn > self.lsn {
+                apply_patches(&commit.undo, addr as usize, &mut buf, &mut buf_mask);
             }
-            log = undo.next.load_full();
+            commit_log = commit.next.load_full();
         }
 
         Cow::Owned(buf)
@@ -922,11 +879,21 @@ impl TxRead for Snapshot {
     }
 }
 
+/// `Commit` is referenced from old to new and only last position is stored in [`Volume`].
+/// It enables automatic cleanup of old entries that are not referenced anymore by any snapshot or transaction.
 pub struct Commit {
-    /// A changes that have been applied in this snapshot.
+    /// A changes that have been applied in this commit.
     ///
     /// This array is sorted by the address of the change and all patches are non-overlapping.
     changes: Vec<Patch>,
+
+    /// Undo patches of a commit
+    ///
+    /// Changes that need to be applied to volume to restore it to the state before this transaction
+    /// was committed.
+    ///
+    /// As with `changes`, this array is sorted by the address of the change and all patches are non-overlapping.
+    undo: Vec<Patch>,
 
     /// A reference to the next commit in the chain.
     ///
@@ -952,11 +919,20 @@ impl Commit {
     }
 }
 
-// It solves the same problem as for `UndoEntry`. See [`UndoEntry`] documentation.
+/// Because this type forms a linked list, standard `Drop` implementation will cause stack overflow.
+/// This implements iterative drop instead.
 impl Drop for Commit {
     fn drop(&mut self) {
+        // SAFETY:
+        //  1. ArcSwap is owned and not impl Clone, so we're the only owner of it.
+        //  2. We're in Drop, so there are no other references to self.
+        // Therefore, we can safely move an `Arc` out of self.next.
         let mut next = self.next.swap(Arc::new(None));
         while let Some(Some(entry)) = Arc::into_inner(next) {
+            // What we're doing here is making one more ref to the next entry. This effectively prevents
+            // recursive drop(). 1 call to drop() will still be made, but it will return without recursion,
+            // because current stack frame holding a ref to the `self.next.next`. This way we can remove
+            // the whole list iteratively.
             next = entry.next.load_full();
         }
     }
