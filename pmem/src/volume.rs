@@ -1444,42 +1444,29 @@ mod tests {
             .reclaim(PAGE_SIZE as Addr - 10, 20);
     }
 
-    /// When dropping transaction all related undo entries will be removed. It may lead
-    /// to stackoverflow if removed recursively.
-    #[test]
-    fn deep_transaction_should_not_cause_stack_overflow() {
-        thread::Builder::new()
-            .name("deep_snapshot_should_not_cause_stack_overflow".to_string())
-            // setting stacksize explicitly so not to rely on the running environment
-            .stack_size(100 * 1024)
-            .spawn(|| {
-                let mut mem = Volume::new_in_memory(100);
-                let tx = mem.start();
-                for _ in 0..1000 {
-                    mem.commit(mem.start()).unwrap();
-                }
-                drop(tx);
-            })
-            .unwrap()
-            .join()
-            .unwrap();
-    }
-
-    /// When dropping transaction all related undo entries will be removed. It may lead
-    /// to stackoverflow if removed recursively.
+    /// When dropping transaction with a long commit log stackoverflow may happend if removed recursively.
     #[test]
     fn deep_commit_notify_should_not_cause_stack_overflow() {
         thread::Builder::new()
             .name("deep_snapshot_should_not_cause_stack_overflow".to_string())
-            // setting stacksize explicitly so not to rely on the running environment
+            // setting small stacksize explicitly so it will be easier to reproduce a problem
+            // and not to rely on the environment
             .stack_size(100 * 1024)
             .spawn(|| {
                 let mut mem = Volume::new_in_memory(100);
+
+                // Creating notify handle and a snapshot to check if in both cases
+                // stack overflow is not happening
                 let notify = mem.commit_notify();
+                let tx = mem.start();
+
                 for _ in 0..1000 {
                     mem.commit(mem.start()).unwrap();
                 }
+
+                // Explicitly dropping both, so they will not be eliminated before transactions are done
                 drop(notify);
+                drop(tx);
             })
             .unwrap()
             .join()
