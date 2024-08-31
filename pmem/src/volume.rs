@@ -293,7 +293,8 @@ impl Display for Patch {
     }
 }
 
-trait MemRange {
+#[allow(clippy::len_without_is_empty)]
+pub trait MemRange {
     fn addr(&self) -> Addr;
     fn len(&self) -> usize;
 
@@ -981,6 +982,10 @@ pub struct Commit {
 impl Commit {
     pub fn patches(&self) -> &[Patch] {
         self.changes.as_slice()
+    }
+
+    pub fn undo(&self) -> &[Patch] {
+        self.undo.as_slice()
     }
 
     pub fn lsn(&self) -> LSN {

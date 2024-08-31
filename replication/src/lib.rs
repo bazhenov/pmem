@@ -54,15 +54,19 @@ async fn server_worker(mut socket: TcpStream, mut notify: CommitNotify) -> io::R
     thread::spawn(move || {
         let commit = notify.next_commit();
         while tx
-            .blocking_send((commit.lsn(), commit.patches().to_vec()))
+            .blocking_send((
+                commit.lsn(),
+                commit.patches().to_vec(),
+                commit.undo().to_vec(),
+            ))
             .is_ok()
         {}
     });
 
-    while let Some((lsn, patches)) = rx.recv().await {
-        trace!(lsn = lsn, patches = patches.len(), "Sending snapshot");
-        for patch in patches {
-            Message::Patch(Cow::Owned(patch))
+    while let Some((lsn, redo, undo)) = rx.recv().await {
+        trace!(lsn = lsn, patches = redo.len(), "Sending snapshot");
+        for (r, u) in redo.iter().zip(undo.iter()) {
+            Message::Patch(Cow::Borrowed(r), Cow::Borrowed(u))
                 .write_to(pin!(&mut socket))
                 .await?;
         }
@@ -124,7 +128,7 @@ pub async fn next_snapshot(mut socket: &mut TcpStream) -> io::Result<(LSN, Vec<P
     loop {
         let msg = Message::read_from(pin!(&mut socket)).await?;
         match msg {
-            Message::Patch(p) => patches.push(p.into_owned()),
+            Message::Patch(p, _) => patches.push(p.into_owned()),
             Message::Commit(lsn) => return Ok((lsn, patches)),
             _ => return io_error("Invalid message type"),
         }

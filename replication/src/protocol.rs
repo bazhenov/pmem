@@ -1,5 +1,5 @@
 use crate::io_error;
-use pmem::volume::{Patch, LSN, PAGE_SIZE};
+use pmem::volume::{MemRange, Patch, LSN, PAGE_SIZE};
 use std::{borrow::Cow, io, pin::Pin};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -10,7 +10,8 @@ pub enum Message<'a> {
 
     // Hello message from server, contains protocol version and number of pages
     ServerHello(u8, u32),
-    Patch(Cow<'a, Patch>),
+    // Redo and undo patch
+    Patch(Cow<'a, Patch>, Cow<'a, Patch>),
     Commit(LSN),
 }
 
@@ -36,9 +37,14 @@ impl<'a> Message<'a> {
                 out.write_u8(*version).await?;
                 out.write_u32(*pages).await?;
             }
-            Message::Patch(p) => {
+            Message::Patch(r, u) => {
                 out.write_u8(PATCH).await?;
-                match p.as_ref() {
+                let Patch::Write(addr, undo) = u.as_ref() else {
+                    panic!("Incorrect undo patch");
+                };
+                assert_eq!(*addr, r.as_ref().addr(), "Mismatched patch addresses");
+                assert_eq!(undo.len(), r.as_ref().len(), "Mismatched patch length");
+                match r.as_ref() {
                     Patch::Write(addr, bytes) => {
                         out.write_u8(PATCH_WRITE).await?;
                         out.write_u64(*addr).await?;
@@ -51,6 +57,7 @@ impl<'a> Message<'a> {
                         out.write_u64(*length as u64).await?;
                     }
                 }
+                out.write_all(undo).await?;
             }
             Message::Commit(lsn) => {
                 out.write_u8(COMMIT).await?;
@@ -62,7 +69,6 @@ impl<'a> Message<'a> {
 
     pub async fn read_from(mut input: Pin<&mut impl AsyncReadExt>) -> io::Result<Self> {
         let discriminator = input.read_u8().await?;
-
         match discriminator {
             CLIENT_HELLO => {
                 let version = input.read_u8().await?;
@@ -78,9 +84,18 @@ impl<'a> Message<'a> {
                     let addr = input.read_u64().await?;
                     let len = usize::try_from(input.read_u64().await?).unwrap();
                     if len <= PAGE_SIZE {
-                        let mut bytes = vec![0; len];
-                        input.read_exact(&mut bytes).await?;
-                        Ok(Message::Patch(Cow::Owned(Patch::Write(addr, bytes))))
+                        let mut redo = vec![0; len];
+                        input.read_exact(&mut redo).await?;
+                        let redo_patch = Patch::Write(addr, redo);
+
+                        let mut undo = vec![0; len];
+                        input.read_exact(&mut undo).await?;
+                        let undo_patch = Patch::Write(addr, undo);
+
+                        Ok(Message::Patch(
+                            Cow::Owned(redo_patch),
+                            Cow::Owned(undo_patch),
+                        ))
                     } else {
                         io_error("Patch length exceeds page size")
                     }
@@ -88,7 +103,13 @@ impl<'a> Message<'a> {
                 PATCH_RECLAIM => {
                     let addr = input.read_u64().await?;
                     let len = usize::try_from(input.read_u64().await?).unwrap();
-                    Ok(Message::Patch(Cow::Owned(Patch::Reclaim(addr, len))))
+                    let redo = Patch::Reclaim(addr, len);
+
+                    let mut undo = vec![0; len];
+                    input.read_exact(&mut undo).await?;
+                    let undo_patch = Patch::Write(addr, undo);
+
+                    Ok(Message::Patch(Cow::Owned(redo), Cow::Owned(undo_patch)))
                 }
                 _ => io_error("Invalid patch type"),
             },
@@ -103,19 +124,20 @@ impl<'a> Message<'a> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use io::Cursor;
     use std::pin::pin;
 
-    use super::*;
     #[tokio::test]
     async fn check_serialization() -> io::Result<()> {
         assert_read_write_eq(Message::ClientHello(10)).await?;
         assert_read_write_eq(Message::ServerHello(10, 20)).await?;
 
         let write = Patch::Write(10, vec![0, 1, 2, 3]);
-        let reclaim = Patch::Reclaim(20, 10);
-        assert_read_write_eq(Message::Patch(Cow::Owned(write))).await?;
-        assert_read_write_eq(Message::Patch(Cow::Owned(reclaim))).await?;
+        let reclaim = Patch::Reclaim(10, 4);
+        let undo = Patch::Write(10, vec![0, 1, 2, 3]);
+        assert_read_write_eq(Message::Patch(Cow::Owned(write), Cow::Borrowed(&undo))).await?;
+        assert_read_write_eq(Message::Patch(Cow::Owned(reclaim), Cow::Borrowed(&undo))).await?;
 
         assert_read_write_eq(Message::Commit(100)).await?;
         Ok(())
