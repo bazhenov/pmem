@@ -497,19 +497,7 @@ impl Volume {
     /// since the moment when transaction was created, attempt to commit such a transaction will return an
     /// [`Result::Err`], because such changes might not be consistent anymore.
     pub fn commit(&mut self, tx: impl Into<Transaction>) -> io::Result<u64> {
-        let (lock, notify) = self.latest_commit.as_ref();
-        let mut commit = lock.lock().unwrap();
         let tx: Transaction = tx.into();
-
-        let current_lsn = self.lsn.load(Ordering::Relaxed);
-        if tx.base.lsn != current_lsn {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "The volume was changed since the transaction was created",
-            ));
-        }
-
-        let lsn = self.lsn.fetch_add(1, Ordering::Relaxed) + 1;
 
         let mut undo_patches = Vec::with_capacity(tx.uncommitted.len());
         // Updating pages and undo log
@@ -529,38 +517,90 @@ impl Volume {
 
                     // Forming undo patch
                     undo_patch[slice_range.clone()].copy_from_slice(&page[page_range.clone()]);
-
-                    // Applying change to the page
-                    match patch {
-                        Patch::Write(_, data) => {
-                            page[page_range].copy_from_slice(&data[slice_range])
-                        }
-                        Patch::Reclaim(..) => page[page_range].fill(0),
-                    }
                 }
                 undo_patches.push(Patch::Write(patch.addr(), undo_patch));
+            }
+        }
+
+        let lsn = tx.base.lsn + 1;
+        // Updating redo log
+        let new_commit = Commit {
+            changes: tx.uncommitted,
+            undo: undo_patches,
+            next: ArcSwap::from_pointee(None),
+            lsn,
+        };
+        self.apply_commit(new_commit)?;
+
+        Ok(lsn)
+    }
+
+    /// This is internal function and is not supposed to be used by the end user. Made public for replication
+    /// purposes.
+    fn apply_commit(&mut self, commit: Commit) -> io::Result<()> {
+        assert_patches_equals(&commit.changes, &commit.undo);
+
+        let (lock, notify) = self.latest_commit.as_ref();
+        let mut last_commit = lock.lock().unwrap();
+
+        let current_lsn = self.lsn.load(Ordering::Relaxed);
+        if commit.lsn != current_lsn + 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "The volume was changed since the transaction was created",
+            ));
+        }
+        self.lsn.store(commit.lsn, Ordering::Relaxed);
+
+        {
+            // Applying updates to the page pool
+            let mut locked_pages = self.pages.lock().unwrap();
+
+            for (patch, undo) in commit.changes.iter().zip(&commit.undo) {
+                let segments = PageSegments::new(patch.addr(), patch.len());
+                for (addr, slice_range) in segments {
+                    let (page_no, offset) = split_ptr(addr);
+                    let offset = offset as usize;
+                    let len = slice_range.len();
+                    let page_range = offset..(offset + len);
+
+                    // TODO: make undo vec<u8> and read addr from commit.changes?
+                    let Patch::Write(_, undo) = undo else {
+                        panic!("Undo can only be of type `Patch::Write`");
+                    };
+                    if let Some(page) = locked_pages.get_page_if_loaded_mut(page_no)? {
+                        debug_assert_eq!(
+                            &undo[slice_range.clone()],
+                            &page[page_range.clone()],
+                            "Undo patch is not consistent with the current page content"
+                        );
+                        // Applying change to the page
+                        match patch {
+                            Patch::Write(_, data) => {
+                                page[page_range].copy_from_slice(&data[slice_range])
+                            }
+                            Patch::Reclaim(..) => page[page_range].fill(0),
+                        }
+                    }
+                }
 
                 locked_pages.flush()?;
             }
         }
 
-        // Updating redo log
-        let new_commit = Arc::new(Some(Commit {
-            changes: tx.uncommitted,
-            undo: undo_patches,
-            next: ArcSwap::from_pointee(None),
-            lsn,
-        }));
-        commit
+        // Updating commit log
+        let commit = Arc::new(Some(commit));
+        last_commit
             .as_ref()
             .as_ref()
             .expect("Commit log is missing")
             .next
-            .store(Arc::clone(&new_commit));
-        *commit = new_commit;
+            .store(Arc::clone(&commit));
+        *last_commit = commit;
+
         notify.notify_all();
 
-        Ok(lsn)
+        Ok(())
     }
 
     pub fn commit_notify(&self) -> CommitNotify {
@@ -615,6 +655,26 @@ impl Volume {
     }
 }
 
+fn assert_patches_equals(changes: &[Patch], undo: &[Patch]) {
+    assert_eq!(
+        changes.len(),
+        undo.len(),
+        "Undo/redo patches are not the same"
+    );
+    for (change, undo) in changes.iter().zip(undo.iter()) {
+        assert_eq!(
+            change.addr(),
+            undo.addr(),
+            "Undo/redo patches are not the same"
+        );
+        assert_eq!(
+            change.len(),
+            undo.len(),
+            "Undo/redo patches are not the same"
+        );
+    }
+}
+
 #[cfg(test)]
 impl Default for Volume {
     fn default() -> Self {
@@ -653,6 +713,19 @@ impl Pages {
         let page = self.ensure_loaded(page_no)?;
         page.dirty = true;
         Ok(page.data.as_mut())
+    }
+
+    fn get_page_if_loaded_mut(
+        &mut self,
+        page_no: PageNo,
+    ) -> io::Result<Option<&mut [u8; PAGE_SIZE]>> {
+        let page = self.pages.get_mut(&page_no);
+        if let Some(p) = page {
+            p.dirty = true;
+            Ok(Some(p.data.as_mut()))
+        } else {
+            Ok(None)
+        }
     }
 
     fn flush(&mut self) -> io::Result<()> {
