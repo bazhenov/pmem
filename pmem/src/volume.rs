@@ -773,10 +773,25 @@ impl VolumeHandle {
     pub fn wait(&mut self) -> Snapshot {
         let commit = self.notify.next_commit();
 
-        // TODO: we don't need to store origin undo_log here, it's actually a leak. We must move to the LSN
-        // of the commit.
         Snapshot {
             lsn: commit.lsn,
+            pages_count: self.pages_count,
+            commit_log: Arc::clone(&self.commit_log),
+            pages: Arc::clone(&self.pages),
+        }
+    }
+
+    pub fn snapshot(&mut self) -> Snapshot {
+        let commit = Arc::clone(&self.commit_log);
+
+        while (*self.commit_log).as_ref().unwrap().next.load().is_some() {
+            self.commit_log = (*self.commit_log).as_ref().unwrap().next.load_full();
+        }
+
+        let lsn = (*commit).as_ref().unwrap().lsn();
+
+        Snapshot {
+            lsn,
             pages_count: self.pages_count,
             commit_log: Arc::clone(&self.commit_log),
             pages: Arc::clone(&self.pages),
@@ -824,7 +839,17 @@ impl CommitNotify {
         let next_commit = commit.next();
         debug_assert!((*next_commit).as_ref().unwrap().lsn() > self.last_seen_lsn());
         self.commit = Arc::clone(&next_commit);
+        self.last_seen_lsn = (*self.commit).as_ref().unwrap().lsn();
         (*self.commit).as_ref().unwrap()
+    }
+
+    /// Advances the `commit` to the latest commit available in the volume.
+    pub fn advance_to_latest(&mut self) -> u64 {
+        while (*self.commit).as_ref().unwrap().next.load().is_some() {
+            self.commit = (*self.commit).as_ref().unwrap().next.load_full();
+        }
+        self.last_seen_lsn = (*self.commit).as_ref().unwrap().lsn();
+        (*self.commit).as_ref().unwrap().lsn()
     }
 
     pub fn last_seen_lsn(&self) -> u64 {
@@ -1378,6 +1403,19 @@ mod tests {
         mem.commit(tx).unwrap();
 
         assert_str_eq(mem.read(0, 4), b"Hide");
+    }
+
+    #[test]
+    fn committed_changes_should_be_visible_via_handle() {
+        let mut mem = Volume::from("Jekyll");
+        let mut handle = mem.handle();
+
+        let mut tx = mem.start();
+        tx.write(0, b"Hide");
+        mem.commit(tx).unwrap();
+
+        let s = handle.snapshot();
+        assert_str_eq(s.read(0, 4), b"Hide");
     }
 
     #[test]

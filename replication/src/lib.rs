@@ -21,12 +21,16 @@ pub async fn start_replication_server(
     Ok((addr, handle))
 }
 
-pub async fn accept_loop(listener: TcpListener, notify: CommitNotify) -> io::Result<()> {
+pub async fn accept_loop(listener: TcpListener, mut notify: CommitNotify) -> io::Result<()> {
     loop {
         let (socket, _) = listener.accept().await?;
         if let Ok(addr) = socket.peer_addr() {
             info!(addr = ?addr, "Accepted connection");
         }
+
+        // TODO: Here is the leak. advance_to_latest() is called only on a new connection.
+        let lsn = notify.advance_to_latest();
+        trace!(lsn = lsn, "Advancing to latest");
         tokio::spawn(server_worker(socket, notify.clone()));
     }
 }
@@ -51,16 +55,17 @@ async fn server_worker(mut socket: TcpStream, mut notify: CommitNotify) -> io::R
     trace!(lsn = last_seen_lsn, "Starting log relay");
     let (tx, mut rx) = sync::mpsc::channel(1);
 
-    thread::spawn(move || {
-        let commit = notify.next_commit();
-        while tx
-            .blocking_send((
+    thread::spawn(move || loop {
+        let mut result = Ok(());
+        while result.is_ok() {
+            let commit = notify.next_commit();
+            trace!(lsn = commit.lsn(), "Got next commit");
+            result = tx.blocking_send((
                 commit.lsn(),
                 commit.patches().to_vec(),
                 commit.undo().to_vec(),
-            ))
-            .is_ok()
-        {}
+            ));
+        }
     });
 
     while let Some((lsn, redo, undo)) = rx.recv().await {

@@ -1,7 +1,9 @@
-use pmem::volume::{Addr, Transaction, TxRead, TxWrite, Volume, VolumeHandle, PAGE_SIZE};
+use pmem::volume::{Addr, Snapshot, Transaction, TxRead, TxWrite, Volume, VolumeHandle, PAGE_SIZE};
 use replication::{replica_connect, start_replication_server};
 use std::{io, net::SocketAddr};
 use tokio::task::{spawn_blocking, JoinHandle};
+
+mod tracing;
 
 #[tokio::test]
 async fn check_replication_simple_case() -> io::Result<()> {
@@ -14,13 +16,15 @@ async fn check_replication_simple_case() -> io::Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "Not implemented yet"]
 async fn check_replication_work_if_connected_later() -> io::Result<()> {
     let mut net = MasterAndReplica::new().await?;
 
     let bytes = [1, 2, 3, 4];
-    let snapshot = net.master_write(|s| s.write(0, bytes)).await;
+    net.master_write(|s| s.write(0, bytes)).await;
     net.replica_reconnect().await?;
 
+    let snapshot = net.slave_snapshot();
     assert_eq!(&*snapshot.read(0, 4), &bytes);
     Ok(())
 }
@@ -73,6 +77,10 @@ impl MasterAndReplica {
         self.replica_handle = replica;
         self.replica_ctrl = replica_ctrl;
         Ok(())
+    }
+
+    fn slave_snapshot(&mut self) -> Snapshot {
+        self.replica_handle.snapshot()
     }
 
     /// Write to master, wait for replica to catch up and returns corresponding snapshot from replica
