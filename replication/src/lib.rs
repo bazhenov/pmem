@@ -1,9 +1,12 @@
-use pmem::volume::{CommitNotify, Patch, TxWrite, Volume, VolumeHandle, LSN};
+use pmem::{
+    driver::PageDriver,
+    volume::{CommitNotify, PageNo, Patch, TxWrite, Volume, VolumeHandle, LSN, PAGE_SIZE},
+};
 use protocol::{Message, PROTOCOL_VERSION};
 use std::{borrow::Cow, fmt::Debug, io, net::SocketAddr, pin::pin, thread};
 use tokio::{
     net::{TcpListener, TcpStream, ToSocketAddrs},
-    sync,
+    sync::{self, mpsc, oneshot},
     task::JoinHandle,
 };
 use tracing::{info, instrument, trace};
@@ -97,7 +100,9 @@ pub async fn replica_connect(
         return io_error("Invalid protocol version");
     }
 
-    let volume = Volume::new_in_memory(pages);
+    let (tx, rx) = mpsc::channel(1);
+    let driver = NetworkDriver { tx };
+    let volume = Volume::new_with_driver(pages, Box::new(driver));
     let read_handle = volume.handle();
 
     let join_handle = tokio::spawn(client_worker(socket, volume));
@@ -137,6 +142,37 @@ pub async fn next_snapshot(mut socket: &mut TcpStream) -> io::Result<(LSN, Vec<P
             Message::Commit(lsn) => return Ok((lsn, patches)),
             _ => return io_error("Invalid message type"),
         }
+    }
+}
+
+struct NetworkDriver {
+    tx: mpsc::Sender<(PageNo, oneshot::Sender<io::Result<[u8; PAGE_SIZE]>>)>,
+}
+
+impl PageDriver for NetworkDriver {
+    fn read_page(
+        &mut self,
+        page_no: pmem::volume::PageNo,
+        page: &mut [u8; pmem::volume::PAGE_SIZE],
+    ) -> io::Result<()> {
+        trace!(page = page_no, "Requesting page from network");
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx.blocking_send((page_no, reply_tx)).unwrap();
+        let remote_page = reply_rx.blocking_recv().unwrap().unwrap();
+
+        Ok(())
+    }
+
+    fn write_page(
+        &mut self,
+        _page_no: pmem::volume::PageNo,
+        _page: &[u8; pmem::volume::PAGE_SIZE],
+    ) -> io::Result<()> {
+        unimplemented!()
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 

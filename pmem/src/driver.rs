@@ -12,9 +12,9 @@ pub trait PageDriver: Send {
     fn flush(&mut self) -> io::Result<()>;
 }
 
-pub struct MemoryDriver;
+pub struct NoDriver;
 
-impl PageDriver for MemoryDriver {
+impl PageDriver for NoDriver {
     fn read_page(&mut self, _page_no: PageNo, _page: &mut [u8; PAGE_SIZE]) -> io::Result<()> {
         Ok(())
     }

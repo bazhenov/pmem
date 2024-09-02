@@ -16,8 +16,9 @@ async fn check_replication_simple_case() -> io::Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "Not implemented yet"]
 async fn check_replication_work_if_connected_later() -> io::Result<()> {
+    tracing::init_tracing();
+
     let mut net = MasterAndReplica::new().await?;
 
     let bytes = [1, 2, 3, 4];

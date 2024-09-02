@@ -57,7 +57,7 @@
 //! overhead, making it perfectly valid and cost-effective to create a snapshot even when the intention is only to
 //! read data without any modifications.
 
-use crate::driver::{MemoryDriver, PageDriver};
+use crate::driver::{NoDriver, PageDriver};
 use arc_swap::ArcSwap;
 use std::{
     borrow::Cow,
@@ -433,7 +433,7 @@ impl Volume {
     /// * `pages` - The number of pages the volume should initially contain. This determines
     ///   the range of valid addresses that can be written to in snapshots derived from this volume.
     pub fn new_in_memory(page_cnt: PageNo) -> Self {
-        Self::new_with_driver(page_cnt, Box::new(MemoryDriver))
+        Self::new_with_driver(page_cnt, Box::new(NoDriver))
     }
 
     pub fn with_capacity(bytes: usize) -> Self {
@@ -448,7 +448,7 @@ impl Volume {
         Self::new_with_driver(pages, Box::new(driver))
     }
 
-    fn new_with_driver(page_cnt: u32, driver: Box<dyn PageDriver>) -> Self {
+    pub fn new_with_driver(page_cnt: u32, driver: Box<dyn PageDriver>) -> Self {
         assert!(page_cnt > 0, "The number of pages must be greater than 0");
         let commit = Commit {
             changes: vec![],
@@ -514,10 +514,10 @@ impl Volume {
                     let len = slice_range.len();
                     let page_range = offset..(offset + len);
 
-                    let page = locked_pages.get_page_mut(page_no)?;
-
-                    // Forming undo patch
-                    undo_patch[slice_range.clone()].copy_from_slice(&page[page_range.clone()]);
+                    if let Some(page) = locked_pages.get_page(page_no)? {
+                        // Forming undo patch
+                        undo_patch[slice_range].copy_from_slice(&page[page_range]);
+                    }
                 }
                 undo_patches.push(Patch::Write(patch.addr(), undo_patch));
             }
@@ -569,19 +569,18 @@ impl Volume {
                     let Patch::Write(_, undo) = undo else {
                         panic!("Undo can only be of type `Patch::Write`");
                     };
-                    if let Some(page) = locked_pages.get_page_if_loaded_mut(page_no)? {
-                        debug_assert_eq!(
-                            &undo[slice_range.clone()],
-                            &page[page_range.clone()],
-                            "Undo patch is not consistent with the current page content"
-                        );
-                        // Applying change to the page
-                        match patch {
-                            Patch::Write(_, data) => {
-                                page[page_range].copy_from_slice(&data[slice_range])
-                            }
-                            Patch::Reclaim(..) => page[page_range].fill(0),
+                    let page = locked_pages.get_page_mut(page_no)?;
+                    debug_assert_eq!(
+                        &undo[slice_range.clone()],
+                        &page[page_range.clone()],
+                        "Undo patch is not consistent with the current page content"
+                    );
+                    // Applying change to the page
+                    match patch {
+                        Patch::Write(_, data) => {
+                            page[page_range].copy_from_slice(&data[slice_range])
                         }
+                        Patch::Reclaim(..) => page[page_range].fill(0),
                     }
                 }
 
@@ -714,19 +713,6 @@ impl Pages {
         let page = self.ensure_loaded(page_no)?;
         page.dirty = true;
         Ok(page.data.as_mut())
-    }
-
-    fn get_page_if_loaded_mut(
-        &mut self,
-        page_no: PageNo,
-    ) -> io::Result<Option<&mut [u8; PAGE_SIZE]>> {
-        let page = self.pages.get_mut(&page_no);
-        if let Some(p) = page {
-            p.dirty = true;
-            Ok(Some(p.data.as_mut()))
-        } else {
-            Ok(None)
-        }
     }
 
     fn flush(&mut self) -> io::Result<()> {
