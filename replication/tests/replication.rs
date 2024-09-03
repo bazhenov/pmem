@@ -26,7 +26,10 @@ async fn check_replication_work_if_connected_later() -> io::Result<()> {
     net.replica_reconnect().await?;
 
     let snapshot = net.slave_snapshot();
-    assert_eq!(&*snapshot.read(0, 4), &bytes);
+    let data = spawn_blocking(move || snapshot.read(0, 4).to_vec())
+        .await
+        .unwrap();
+    assert_eq!(&*data, &bytes);
     Ok(())
 }
 
@@ -61,8 +64,7 @@ impl MasterAndReplica {
     }
 
     async fn with_volume(volume: Volume) -> io::Result<Self> {
-        let notify = volume.commit_notify();
-        let (master_addr, _) = start_replication_server("127.0.0.1:0", notify).await?;
+        let (master_addr, _) = start_replication_server("127.0.0.1:0", volume.handle()).await?;
         let (replica, replica_ctrl) = replica_connect(master_addr).await?;
         Ok(Self {
             master_volume: volume,

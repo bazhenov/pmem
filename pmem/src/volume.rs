@@ -584,7 +584,7 @@ impl Volume {
                     }
                 }
 
-                locked_pages.flush()?;
+                locked_pages.flush(commit.lsn)?;
             }
         }
 
@@ -715,10 +715,10 @@ impl Pages {
         Ok(page.data.as_mut())
     }
 
-    fn flush(&mut self) -> io::Result<()> {
+    fn flush(&mut self, lsn: LSN) -> io::Result<()> {
         for (page_no, page) in self.pages.iter() {
             if page.dirty {
-                self.driver.write_page(*page_no, page.data.as_ref())?;
+                self.driver.write_page(*page_no, page.data.as_ref(), lsn)?;
             }
         }
         self.driver.flush()
@@ -765,6 +765,18 @@ impl VolumeHandle {
             commit_log: Arc::clone(&self.commit_log),
             pages: Arc::clone(&self.pages),
         }
+    }
+
+    pub fn wait_commit(&mut self) -> &Commit {
+        self.notify.next_commit()
+    }
+
+    pub fn pages(&self) -> PageNo {
+        self.pages_count
+    }
+
+    pub fn last_seen_lsn(&self) -> u64 {
+        self.notify.last_seen_lsn()
     }
 
     pub fn snapshot(&mut self) -> Snapshot {

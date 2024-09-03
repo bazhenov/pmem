@@ -1,5 +1,5 @@
 use crate::io_error;
-use pmem::volume::{MemRange, Patch, LSN, PAGE_SIZE};
+use pmem::volume::{MemRange, PageNo, Patch, LSN, PAGE_SIZE};
 use std::{borrow::Cow, io, pin::Pin};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -13,6 +13,9 @@ pub enum Message<'a> {
     // Redo and undo patch
     Patch(Cow<'a, Patch>, Cow<'a, Patch>),
     Commit(LSN),
+
+    PageRequest(PageNo),
+    PageReply(PageNo, Cow<'a, Vec<u8>>, LSN),
 }
 
 pub const PROTOCOL_VERSION: u8 = 1;
@@ -21,6 +24,8 @@ const CLIENT_HELLO: u8 = 1;
 const SERVER_HELLO: u8 = 2;
 const PATCH: u8 = 3;
 const COMMIT: u8 = 4;
+const PAGE_REQUEST: u8 = 5;
+const PAGE_REPLY: u8 = 6;
 
 const PATCH_WRITE: u8 = 1;
 const PATCH_RECLAIM: u8 = 2;
@@ -62,6 +67,17 @@ impl<'a> Message<'a> {
             Message::Commit(lsn) => {
                 out.write_u8(COMMIT).await?;
                 out.write_u64(*lsn).await?;
+            }
+            Message::PageRequest(page_no) => {
+                out.write_u8(PAGE_REQUEST).await?;
+                out.write_u32(*page_no).await?;
+            }
+            Message::PageReply(page_no, data, lsn) => {
+                out.write_u8(PAGE_REPLY).await?;
+                out.write_u32(*page_no).await?;
+                out.write_u64(*lsn).await?;
+                out.write_u64(data.len() as u64).await?;
+                out.write_all(data.as_ref()).await?;
             }
         }
         Ok(())
@@ -117,6 +133,20 @@ impl<'a> Message<'a> {
                 let lsn = input.read_u64().await?;
                 Ok(Message::Commit(lsn))
             }
+
+            PAGE_REQUEST => {
+                let page_no = input.read_u32().await?;
+                Ok(Message::PageRequest(page_no))
+            }
+            PAGE_REPLY => {
+                let page_no = input.read_u32().await?;
+                let lsn = input.read_u64().await?;
+                let size = input.read_u64().await? as usize;
+                assert!(size <= PAGE_SIZE, "Page size exceeds maximum");
+                let mut data = vec![0; size];
+                input.read_exact(&mut data).await?;
+                Ok(Message::PageReply(page_no, Cow::Owned(data), lsn))
+            }
             _ => io_error("Invalid discriminator"),
         }
     }
@@ -138,6 +168,9 @@ mod tests {
         let undo = Patch::Write(10, vec![0, 1, 2, 3]);
         assert_read_write_eq(Message::Patch(Cow::Owned(write), Cow::Borrowed(&undo))).await?;
         assert_read_write_eq(Message::Patch(Cow::Owned(reclaim), Cow::Borrowed(&undo))).await?;
+
+        assert_read_write_eq(Message::PageRequest(42)).await?;
+        assert_read_write_eq(Message::PageReply(13, Cow::Owned(vec![1, 2, 3, 4]), 42)).await?;
 
         assert_read_write_eq(Message::Commit(100)).await?;
         Ok(())
