@@ -130,7 +130,7 @@ pub async fn replica_connect(
 
     let (tx, rx) = mpsc::channel(1);
     let driver = NetworkDriver { tx };
-    let volume = Volume::new_with_driver(pages, Box::new(driver));
+    let volume = Volume::new_with_driver(pages, driver);
     let read_handle = volume.handle();
 
     let join_handle = tokio::spawn(client_worker(socket, volume, rx));
@@ -175,6 +175,7 @@ async fn client_worker(
                                 }
                             }
 
+                            println!("Trying commit...");
                             let my_lsn = volume.commit(tx).unwrap();
                             trace!(lsn = lsn, my_lsn = my_lsn, "Committed snapshot");
                         }

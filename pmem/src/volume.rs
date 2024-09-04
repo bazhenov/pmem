@@ -433,7 +433,7 @@ impl Volume {
     /// * `pages` - The number of pages the volume should initially contain. This determines
     ///   the range of valid addresses that can be written to in snapshots derived from this volume.
     pub fn new_in_memory(page_cnt: PageNo) -> Self {
-        Self::new_with_driver(page_cnt, Box::new(NoDriver))
+        Self::new_with_driver(page_cnt, NoDriver)
     }
 
     pub fn with_capacity(bytes: usize) -> Self {
@@ -445,10 +445,10 @@ impl Volume {
     pub fn with_capacity_and_driver(bytes: usize, driver: impl PageDriver + 'static) -> Self {
         let pages = (bytes + PAGE_SIZE) / PAGE_SIZE;
         let pages = u32::try_from(pages).expect("Too large capacity for the volume");
-        Self::new_with_driver(pages, Box::new(driver))
+        Self::new_with_driver(pages, driver)
     }
 
-    pub fn new_with_driver(page_cnt: u32, driver: Box<dyn PageDriver>) -> Self {
+    pub fn new_with_driver(page_cnt: u32, driver: impl PageDriver + 'static) -> Self {
         assert!(page_cnt > 0, "The number of pages must be greater than 0");
         let commit = Commit {
             changes: vec![],
@@ -501,24 +501,15 @@ impl Volume {
         let tx: Transaction = tx.into();
 
         let mut undo_patches = Vec::with_capacity(tx.uncommitted.len());
-        // Updating pages and undo log
         {
+            // Form undo patches
             let mut locked_pages = self.pages.lock().unwrap();
 
             for patch in &tx.uncommitted {
-                let segments = PageSegments::new(patch.addr(), patch.len());
                 let mut undo_patch = vec![0; patch.len()];
-                for (addr, slice_range) in segments {
-                    let (page_no, offset) = split_ptr(addr);
-                    let offset = offset as usize;
-                    let len = slice_range.len();
-                    let page_range = offset..(offset + len);
-
-                    if let Some(page) = locked_pages.get_page(page_no)? {
-                        // Forming undo patch
-                        undo_patch[slice_range].copy_from_slice(&page[page_range]);
-                    }
-                }
+                locked_pages
+                    .read(patch.addr(), undo_patch.as_mut())
+                    .unwrap();
                 undo_patches.push(Patch::Write(patch.addr(), undo_patch));
             }
         }
@@ -555,37 +546,26 @@ impl Volume {
 
         {
             // Applying updates to the page pool
-            let mut locked_pages = self.pages.lock().unwrap();
+            let mut pages = self.pages.lock().unwrap();
 
-            for (patch, undo) in commit.changes.iter().zip(&commit.undo) {
-                let segments = PageSegments::new(patch.addr(), patch.len());
-                for (addr, slice_range) in segments {
-                    let (page_no, offset) = split_ptr(addr);
-                    let offset = offset as usize;
-                    let len = slice_range.len();
-                    let page_range = offset..(offset + len);
-
-                    // TODO: make undo vec<u8> and read addr from commit.changes?
-                    let Patch::Write(_, undo) = undo else {
-                        panic!("Undo can only be of type `Patch::Write`");
-                    };
-                    let page = locked_pages.get_page_mut(page_no)?;
-                    debug_assert_eq!(
-                        &undo[slice_range.clone()],
-                        &page[page_range.clone()],
-                        "Undo patch is not consistent with the current page content"
-                    );
-                    // Applying change to the page
-                    match patch {
-                        Patch::Write(_, data) => {
-                            page[page_range].copy_from_slice(&data[slice_range])
-                        }
-                        Patch::Reclaim(..) => page[page_range].fill(0),
-                    }
+            for patch in &commit.changes {
+                // TODO: make undo vec<u8> and read addr from commit.changes?
+                // TODO return this check
+                // let Patch::Write(_, undo) = undo else {
+                //     panic!("Undo can only be of type `Patch::Write`");
+                // };
+                // debug_assert_eq!(
+                //     &undo[slice_range.clone()],
+                //     &page[page_range.clone()],
+                //     "Undo patch is not consistent with the current page content"
+                // );
+                // Applying change to the page
+                match patch {
+                    Patch::Write(addr, data) => pages.write(*addr, data)?,
+                    Patch::Reclaim(addr, len) => pages.zero(*addr, *len)?,
                 }
-
-                locked_pages.flush(commit.lsn)?;
             }
+            pages.flush(commit.lsn)?;
         }
 
         // Updating commit log
@@ -688,10 +668,10 @@ struct Pages {
 }
 
 impl Pages {
-    pub fn new(driver: Box<dyn PageDriver>) -> Self {
+    pub fn new(driver: impl PageDriver + 'static) -> Self {
         Self {
             pages: BTreeMap::new(),
-            driver,
+            driver: Box::new(driver),
         }
     }
 
@@ -705,14 +685,52 @@ impl Pages {
         Ok(page)
     }
 
-    fn get_page(&mut self, page_no: PageNo) -> io::Result<Option<&[u8; PAGE_SIZE]>> {
-        Ok(Some(self.ensure_loaded(page_no)?.data.as_ref()))
+    fn read(&mut self, addr: Addr, buf: &mut [u8]) -> io::Result<()> {
+        let segments = PageSegments::new(addr, buf.len());
+        for (addr, slice_range) in segments {
+            let (page_no, offset) = split_ptr(addr);
+            let offset = offset as usize;
+            let len = slice_range.len();
+            let page_range = offset..offset + len;
+
+            // TODO need to check if page is missing and then zero out the buffer
+            let page = self.ensure_loaded(page_no)?.data.as_ref();
+            buf[slice_range].copy_from_slice(&page[page_range]);
+        }
+        Ok(())
     }
 
-    fn get_page_mut(&mut self, page_no: PageNo) -> io::Result<&mut [u8; PAGE_SIZE]> {
-        let page = self.ensure_loaded(page_no)?;
-        page.dirty = true;
-        Ok(page.data.as_mut())
+    // TODO proptests
+    fn write(&mut self, addr: Addr, buf: &[u8]) -> io::Result<()> {
+        let segments = PageSegments::new(addr, buf.len());
+        for (addr, slice_range) in segments {
+            let (page_no, offset) = split_ptr(addr);
+            let offset = offset as usize;
+            let len = slice_range.len();
+            let page_range = offset..offset + len;
+
+            let page = self.ensure_loaded(page_no)?;
+            let page_buf = page.data.as_mut_slice();
+            page_buf[page_range].copy_from_slice(&buf[slice_range]);
+            page.dirty = true;
+        }
+        Ok(())
+    }
+
+    fn zero(&mut self, addr: Addr, len: usize) -> io::Result<()> {
+        let segments = PageSegments::new(addr, len);
+        for (addr, slice_range) in segments {
+            let (page_no, offset) = split_ptr(addr);
+            let offset = offset as usize;
+            let len = slice_range.len();
+            let page_range = offset..offset + len;
+
+            let page = self.ensure_loaded(page_no)?;
+            let page_buf = page.data.as_mut_slice();
+            page_buf[page_range].fill(0);
+            page.dirty = true;
+        }
+        Ok(())
     }
 
     fn flush(&mut self, lsn: LSN) -> io::Result<()> {
@@ -928,18 +946,7 @@ impl Snapshot {
         split_ptr_checked(addr, len, self.pages_count);
         let mut buf = vec![0; len];
 
-        // Reading the pages
-        {
-            let mut locked_pages = self.pages.lock().unwrap();
-            for (addr, range) in PageSegments::new(addr, len) {
-                let (page_no, offset) = split_ptr(addr);
-                let offset = offset as usize;
-                if let Some(page) = locked_pages.get_page(page_no).unwrap() {
-                    let len = range.len();
-                    buf[range].copy_from_slice(&page[offset..offset + len]);
-                }
-            }
-        }
+        self.pages.lock().unwrap().read(addr, &mut buf).unwrap();
 
         #[allow(clippy::single_range_in_vec_init)]
         let mut buf_mask = vec![0..len];
@@ -1714,14 +1721,14 @@ mod tests {
     fn page_volume_can_be_restored_after_reopen() -> io::Result<()> {
         let tempdir = tempdir()?;
         let db_file = tempdir.path().join("test.db");
-        let mut volume = Volume::new_with_driver(1, Box::new(FileDriver::from_file(&db_file)?));
+        let mut volume = Volume::new_with_driver(1, FileDriver::from_file(&db_file)?);
 
         let mut tx = volume.start();
         tx.write(0, [42]);
         volume.commit(tx).unwrap();
         drop(volume);
 
-        let volume = Volume::new_with_driver(1, Box::new(FileDriver::from_file(&db_file)?));
+        let volume = Volume::new_with_driver(1, FileDriver::from_file(&db_file)?);
         assert_eq!(&*volume.read(0, 1), [42]);
         Ok(())
     }
@@ -1781,6 +1788,22 @@ mod tests {
         for join in join_handles {
             join.join().unwrap();
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn check_pages_read_write() -> io::Result<()> {
+        let mut pages = Pages::new(NoDriver);
+
+        let mut buf = vec![0; 5];
+        pages.read(0, &mut buf)?;
+        assert_eq!(buf, vec![0; 5]);
+
+        pages.write(0, &[1, 2, 3, 4, 5])?;
+
+        pages.read(0, &mut buf)?;
+        assert_eq!(buf, &[1, 2, 3, 4, 5]);
 
         Ok(())
     }
