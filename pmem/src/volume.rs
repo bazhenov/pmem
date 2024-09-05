@@ -61,7 +61,7 @@ use crate::driver::{NoDriver, PageDriver};
 use arc_swap::ArcSwap;
 use std::{
     borrow::Cow,
-    collections::{btree_map::Entry, BTreeMap},
+    collections::BTreeMap,
     fmt::{self, Display, Formatter},
     io,
     ops::Range,
@@ -663,26 +663,32 @@ impl Default for Volume {
 }
 
 struct Pages {
-    pages: BTreeMap<PageNo, Page>,
+    pages: Mutex<BTreeMap<PageNo, Page>>,
     driver: Box<dyn PageDriver>,
 }
 
 impl Pages {
     pub fn new(driver: impl PageDriver + 'static) -> Self {
         Self {
-            pages: BTreeMap::new(),
+            pages: Mutex::new(BTreeMap::new()),
             driver: Box::new(driver),
         }
     }
 
-    fn ensure_loaded(&mut self, page_no: PageNo) -> io::Result<&mut Page> {
-        let entry = self.pages.entry(page_no);
-        let present = matches!(entry, Entry::Occupied(_));
-        let page = entry.or_insert_with(Page::new);
-        if !present {
+    fn with_page(&mut self, page_no: PageNo, mut f: impl FnMut(&mut Page)) -> io::Result<()> {
+        let mut pages = self.pages.lock().unwrap();
+        if let Some(page) = pages.get_mut(&page_no) {
+            f(page);
+            Ok(())
+        } else {
+            drop(pages);
+            let mut page = Page::new();
             self.driver.read_page(page_no, page.data.as_mut())?;
+            let mut pages = self.pages.lock().unwrap();
+            f(&mut page);
+            pages.insert(page_no, page);
+            Ok(())
         }
-        Ok(page)
     }
 
     fn read(&mut self, addr: Addr, buf: &mut [u8]) -> io::Result<()> {
@@ -691,11 +697,13 @@ impl Pages {
             let (page_no, offset) = split_ptr(addr);
             let offset = offset as usize;
             let len = slice_range.len();
-            let page_range = offset..offset + len;
 
             // TODO need to check if page is missing and then zero out the buffer
-            let page = self.ensure_loaded(page_no)?.data.as_ref();
-            buf[slice_range].copy_from_slice(&page[page_range]);
+            let buf_slice = &mut buf[slice_range];
+            self.with_page(page_no, move |page| {
+                let page_range = offset..offset + len;
+                buf_slice.copy_from_slice(&page.data[page_range]);
+            })?;
         }
         Ok(())
     }
@@ -707,12 +715,14 @@ impl Pages {
             let (page_no, offset) = split_ptr(addr);
             let offset = offset as usize;
             let len = slice_range.len();
-            let page_range = offset..offset + len;
 
-            let page = self.ensure_loaded(page_no)?;
-            let page_buf = page.data.as_mut_slice();
-            page_buf[page_range].copy_from_slice(&buf[slice_range]);
-            page.dirty = true;
+            self.with_page(page_no, move |page| {
+                let slice_range = slice_range.clone();
+                let page_range = offset..offset + len;
+                let page_buf = page.data.as_mut_slice();
+                page_buf[page_range].copy_from_slice(&buf[slice_range]);
+                page.dirty = true;
+            })?;
         }
         Ok(())
     }
@@ -723,18 +733,20 @@ impl Pages {
             let (page_no, offset) = split_ptr(addr);
             let offset = offset as usize;
             let len = slice_range.len();
-            let page_range = offset..offset + len;
 
-            let page = self.ensure_loaded(page_no)?;
-            let page_buf = page.data.as_mut_slice();
-            page_buf[page_range].fill(0);
-            page.dirty = true;
+            self.with_page(page_no, |page| {
+                let page_range = offset..offset + len;
+                let page_buf = page.data.as_mut_slice();
+                page_buf[page_range].fill(0);
+                page.dirty = true;
+            })?;
         }
         Ok(())
     }
 
     fn flush(&mut self, lsn: LSN) -> io::Result<()> {
-        for (page_no, page) in self.pages.iter() {
+        let pages = self.pages.lock().unwrap();
+        for (page_no, page) in pages.iter() {
             if page.dirty {
                 self.driver.write_page(*page_no, page.data.as_ref(), lsn)?;
             }
