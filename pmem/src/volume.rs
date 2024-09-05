@@ -399,7 +399,7 @@ pub enum Error {
 /// at different points in time, or for implementing undo/redo functionality where each snapshot
 /// can represent a state in the history of changes.
 pub struct Volume {
-    pages: Arc<Mutex<Pages>>,
+    pages: Arc<Pages>,
     pages_count: PageNo,
 
     /// A log sequence number (LSN) that uniquely identifies this snapshot. The LSN
@@ -458,7 +458,7 @@ impl Volume {
         };
         let commit = Mutex::new(Arc::new(Some(commit)));
         Self {
-            pages: Arc::new(Mutex::new(Pages::new(driver))),
+            pages: Arc::new(Pages::new(driver)),
             pages_count: page_cnt as PageNo,
             latest_commit: Arc::new((commit, Condvar::new())),
             lsn: AtomicU64::new(0),
@@ -503,13 +503,10 @@ impl Volume {
         let mut undo_patches = Vec::with_capacity(tx.uncommitted.len());
         {
             // Form undo patches
-            let mut locked_pages = self.pages.lock().unwrap();
 
             for patch in &tx.uncommitted {
                 let mut undo_patch = vec![0; patch.len()];
-                locked_pages
-                    .read(patch.addr(), undo_patch.as_mut())
-                    .unwrap();
+                self.pages.read(patch.addr(), undo_patch.as_mut()).unwrap();
                 undo_patches.push(Patch::Write(patch.addr(), undo_patch));
             }
         }
@@ -544,29 +541,24 @@ impl Volume {
         }
         self.lsn.store(commit.lsn, Ordering::Relaxed);
 
-        {
-            // Applying updates to the page pool
-            let mut pages = self.pages.lock().unwrap();
-
-            for patch in &commit.changes {
-                // TODO: make undo vec<u8> and read addr from commit.changes?
-                // TODO return this check
-                // let Patch::Write(_, undo) = undo else {
-                //     panic!("Undo can only be of type `Patch::Write`");
-                // };
-                // debug_assert_eq!(
-                //     &undo[slice_range.clone()],
-                //     &page[page_range.clone()],
-                //     "Undo patch is not consistent with the current page content"
-                // );
-                // Applying change to the page
-                match patch {
-                    Patch::Write(addr, data) => pages.write(*addr, data)?,
-                    Patch::Reclaim(addr, len) => pages.zero(*addr, *len)?,
-                }
+        for patch in &commit.changes {
+            // TODO: make undo vec<u8> and read addr from commit.changes?
+            // TODO return this check
+            // let Patch::Write(_, undo) = undo else {
+            //     panic!("Undo can only be of type `Patch::Write`");
+            // };
+            // debug_assert_eq!(
+            //     &undo[slice_range.clone()],
+            //     &page[page_range.clone()],
+            //     "Undo patch is not consistent with the current page content"
+            // );
+            // Applying change to the page
+            match patch {
+                Patch::Write(addr, data) => self.pages.write(*addr, data)?,
+                Patch::Reclaim(addr, len) => self.pages.zero(*addr, *len)?,
             }
-            pages.flush(commit.lsn)?;
         }
+        self.pages.flush(commit.lsn)?;
 
         // Updating commit log
         let commit = Arc::new(Some(commit));
@@ -617,10 +609,7 @@ impl Volume {
     }
 
     pub fn into_driver(self) -> Option<Box<dyn PageDriver>> {
-        let lock = Arc::into_inner(self.pages)?;
-        let Ok(pages) = lock.into_inner() else {
-            return None;
-        };
+        let pages = Arc::into_inner(self.pages)?;
         Some(pages.into_inner())
     }
 
@@ -664,18 +653,18 @@ impl Default for Volume {
 
 struct Pages {
     pages: Mutex<BTreeMap<PageNo, Page>>,
-    driver: Box<dyn PageDriver>,
+    driver: Mutex<Box<dyn PageDriver>>,
 }
 
 impl Pages {
     pub fn new(driver: impl PageDriver + 'static) -> Self {
         Self {
             pages: Mutex::new(BTreeMap::new()),
-            driver: Box::new(driver),
+            driver: Mutex::new(Box::new(driver)),
         }
     }
 
-    fn with_page(&mut self, page_no: PageNo, mut f: impl FnMut(&mut Page)) -> io::Result<()> {
+    fn with_page(&self, page_no: PageNo, mut f: impl FnMut(&mut Page)) -> io::Result<()> {
         let mut pages = self.pages.lock().unwrap();
         if let Some(page) = pages.get_mut(&page_no) {
             f(page);
@@ -683,7 +672,10 @@ impl Pages {
         } else {
             drop(pages);
             let mut page = Page::new();
-            self.driver.read_page(page_no, page.data.as_mut())?;
+            self.driver
+                .lock()
+                .unwrap()
+                .read_page(page_no, page.data.as_mut())?;
             let mut pages = self.pages.lock().unwrap();
             f(&mut page);
             pages.insert(page_no, page);
@@ -691,7 +683,7 @@ impl Pages {
         }
     }
 
-    fn read(&mut self, addr: Addr, buf: &mut [u8]) -> io::Result<()> {
+    fn read(&self, addr: Addr, buf: &mut [u8]) -> io::Result<()> {
         let segments = PageSegments::new(addr, buf.len());
         for (addr, slice_range) in segments {
             let (page_no, offset) = split_ptr(addr);
@@ -709,7 +701,7 @@ impl Pages {
     }
 
     // TODO proptests
-    fn write(&mut self, addr: Addr, buf: &[u8]) -> io::Result<()> {
+    fn write(&self, addr: Addr, buf: &[u8]) -> io::Result<()> {
         let segments = PageSegments::new(addr, buf.len());
         for (addr, slice_range) in segments {
             let (page_no, offset) = split_ptr(addr);
@@ -727,7 +719,7 @@ impl Pages {
         Ok(())
     }
 
-    fn zero(&mut self, addr: Addr, len: usize) -> io::Result<()> {
+    fn zero(&self, addr: Addr, len: usize) -> io::Result<()> {
         let segments = PageSegments::new(addr, len);
         for (addr, slice_range) in segments {
             let (page_no, offset) = split_ptr(addr);
@@ -744,18 +736,19 @@ impl Pages {
         Ok(())
     }
 
-    fn flush(&mut self, lsn: LSN) -> io::Result<()> {
+    fn flush(&self, lsn: LSN) -> io::Result<()> {
+        let mut driver = self.driver.lock().unwrap();
         let pages = self.pages.lock().unwrap();
         for (page_no, page) in pages.iter() {
             if page.dirty {
-                self.driver.write_page(*page_no, page.data.as_ref(), lsn)?;
+                driver.write_page(*page_no, page.data.as_ref(), lsn)?;
             }
         }
-        self.driver.flush()
+        driver.flush()
     }
 
     fn into_inner(self) -> Box<dyn PageDriver> {
-        self.driver
+        self.driver.into_inner().unwrap()
     }
 }
 
@@ -778,7 +771,7 @@ pub struct VolumeHandle {
     notify: CommitNotify,
     pages_count: PageNo,
     commit_log: Arc<Option<Commit>>,
-    pages: Arc<Mutex<Pages>>,
+    pages: Arc<Pages>,
 }
 
 impl VolumeHandle {
@@ -939,7 +932,7 @@ pub trait TxWrite: TxRead {
 pub struct Snapshot {
     pages_count: PageNo,
     commit_log: Arc<Option<Commit>>,
-    pages: Arc<Mutex<Pages>>,
+    pages: Arc<Pages>,
     lsn: LSN,
 }
 
@@ -958,7 +951,7 @@ impl Snapshot {
         split_ptr_checked(addr, len, self.pages_count);
         let mut buf = vec![0; len];
 
-        self.pages.lock().unwrap().read(addr, &mut buf).unwrap();
+        self.pages.read(addr, &mut buf).unwrap();
 
         #[allow(clippy::single_range_in_vec_init)]
         let mut buf_mask = vec![0..len];
@@ -1806,7 +1799,7 @@ mod tests {
 
     #[test]
     fn check_pages_read_write() -> io::Result<()> {
-        let mut pages = Pages::new(NoDriver);
+        let pages = Pages::new(NoDriver);
 
         let mut buf = vec![0; 5];
         pages.read(0, &mut buf)?;
