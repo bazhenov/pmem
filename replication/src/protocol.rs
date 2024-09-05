@@ -14,8 +14,8 @@ pub enum Message<'a> {
     Patch(Cow<'a, Patch>, Cow<'a, Patch>),
     Commit(LSN),
 
-    PageRequest(PageNo),
-    PageReply(PageNo, Cow<'a, Vec<u8>>, LSN),
+    PageRequest(u64, PageNo),
+    PageReply(u64, Cow<'a, Vec<u8>>, LSN),
 }
 
 pub const PROTOCOL_VERSION: u8 = 1;
@@ -68,13 +68,14 @@ impl<'a> Message<'a> {
                 out.write_u8(COMMIT).await?;
                 out.write_u64(*lsn).await?;
             }
-            Message::PageRequest(page_no) => {
+            Message::PageRequest(correlation_id, page_no) => {
                 out.write_u8(PAGE_REQUEST).await?;
+                out.write_u64(*correlation_id).await?;
                 out.write_u32(*page_no).await?;
             }
-            Message::PageReply(page_no, data, lsn) => {
+            Message::PageReply(corelation_id, data, lsn) => {
                 out.write_u8(PAGE_REPLY).await?;
-                out.write_u32(*page_no).await?;
+                out.write_u64(*corelation_id).await?;
                 out.write_u64(*lsn).await?;
                 out.write_u64(data.len() as u64).await?;
                 out.write_all(data.as_ref()).await?;
@@ -135,17 +136,18 @@ impl<'a> Message<'a> {
             }
 
             PAGE_REQUEST => {
+                let corelation_id = input.read_u64().await?;
                 let page_no = input.read_u32().await?;
-                Ok(Message::PageRequest(page_no))
+                Ok(Message::PageRequest(corelation_id, page_no))
             }
             PAGE_REPLY => {
-                let page_no = input.read_u32().await?;
+                let corelation_id = input.read_u64().await?;
                 let lsn = input.read_u64().await?;
                 let size = input.read_u64().await? as usize;
                 assert!(size <= PAGE_SIZE, "Page size exceeds maximum");
                 let mut data = vec![0; size];
                 input.read_exact(&mut data).await?;
-                Ok(Message::PageReply(page_no, Cow::Owned(data), lsn))
+                Ok(Message::PageReply(corelation_id, Cow::Owned(data), lsn))
             }
             _ => io_error("Invalid discriminator"),
         }
@@ -169,8 +171,8 @@ mod tests {
         assert_read_write_eq(Message::Patch(Cow::Owned(write), Cow::Borrowed(&undo))).await?;
         assert_read_write_eq(Message::Patch(Cow::Owned(reclaim), Cow::Borrowed(&undo))).await?;
 
-        assert_read_write_eq(Message::PageRequest(42)).await?;
-        assert_read_write_eq(Message::PageReply(13, Cow::Owned(vec![1, 2, 3, 4]), 42)).await?;
+        assert_read_write_eq(Message::PageRequest(100, 42)).await?;
+        assert_read_write_eq(Message::PageReply(100, Cow::Owned(vec![1, 2, 3, 4]), 42)).await?;
 
         assert_read_write_eq(Message::Commit(100)).await?;
         Ok(())

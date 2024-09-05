@@ -4,38 +4,34 @@ use std::{
     io::{self, Read, Seek, SeekFrom, Write},
     mem,
     path::Path,
+    sync::Mutex,
 };
 
-pub trait PageDriver: Send {
-    fn read_page(&mut self, page_no: PageNo, page: &mut [u8; PAGE_SIZE]) -> io::Result<LSN>;
-    fn write_page(&mut self, page_no: PageNo, page: &[u8; PAGE_SIZE], lsn: LSN) -> io::Result<()>;
+pub trait PageDriver: Send + Sync {
+    fn read_page(&self, page_no: PageNo, page: &mut [u8; PAGE_SIZE]) -> io::Result<LSN>;
+    fn write_page(&self, page_no: PageNo, page: &[u8; PAGE_SIZE], lsn: LSN) -> io::Result<()>;
 
-    fn flush(&mut self) -> io::Result<()>;
+    fn flush(&self) -> io::Result<()>;
 }
 
 pub struct NoDriver;
 
 impl PageDriver for NoDriver {
-    fn read_page(&mut self, _page_no: PageNo, _page: &mut [u8; PAGE_SIZE]) -> io::Result<LSN> {
+    fn read_page(&self, _page_no: PageNo, _page: &mut [u8; PAGE_SIZE]) -> io::Result<LSN> {
         Ok(0)
     }
 
-    fn write_page(
-        &mut self,
-        _page_no: PageNo,
-        _page: &[u8; PAGE_SIZE],
-        _lsn: LSN,
-    ) -> io::Result<()> {
+    fn write_page(&self, _page_no: PageNo, _page: &[u8; PAGE_SIZE], _lsn: LSN) -> io::Result<()> {
         Ok(())
     }
 
-    fn flush(&mut self) -> io::Result<()> {
+    fn flush(&self) -> io::Result<()> {
         Ok(())
     }
 }
 
 pub struct FileDriver {
-    file: File,
+    file: Mutex<File>,
 }
 
 impl FileDriver {
@@ -50,42 +46,47 @@ impl FileDriver {
     }
 
     pub fn new(file: File) -> Self {
-        Self { file }
+        Self {
+            file: Mutex::new(file),
+        }
     }
 
     pub fn into_inner(self) -> File {
-        self.file
+        self.file.into_inner().unwrap()
     }
 }
 
 impl PageDriver for FileDriver {
-    fn read_page(&mut self, page_no: PageNo, page: &mut [u8; PAGE_SIZE]) -> io::Result<LSN> {
+    fn read_page(&self, page_no: PageNo, page: &mut [u8; PAGE_SIZE]) -> io::Result<LSN> {
         const BLOCK_SIZE: u64 = PAGE_SIZE as u64 + mem::size_of::<LSN>() as u64;
         let expected_size = (page_no as u64 + 1) * BLOCK_SIZE;
         let mut lsn_bytes = [0u8; mem::size_of::<LSN>()];
-        if stream_len(&mut self.file)? >= expected_size {
+        let mut file = self.file.lock().unwrap();
+        if stream_len(&mut *file)? >= expected_size {
             let page_offset = page_no as u64 * PAGE_SIZE as u64;
-            self.file.seek(SeekFrom::Start(page_offset))?;
-            self.file.read_exact(&mut lsn_bytes)?;
-            self.file.read_exact(page)?;
+            file.seek(SeekFrom::Start(page_offset))?;
+            file.read_exact(&mut lsn_bytes)?;
+            file.read_exact(page)?;
         }
         Ok(LSN::from_le_bytes(lsn_bytes))
     }
 
-    fn write_page(&mut self, page_no: PageNo, page: &[u8; PAGE_SIZE], lsn: LSN) -> io::Result<()> {
+    fn write_page(&self, page_no: PageNo, page: &[u8; PAGE_SIZE], lsn: LSN) -> io::Result<()> {
         let page_offset = page_no as u64 * PAGE_SIZE as u64;
-        self.file.seek(SeekFrom::Start(page_offset))?;
+        let mut file = self.file.lock().unwrap();
+
+        file.seek(SeekFrom::Start(page_offset))?;
 
         let lsn_bytes = lsn.to_le_bytes();
-        self.file.write_all(&lsn_bytes)?;
+        file.write_all(&lsn_bytes)?;
 
-        self.file.write_all(page)?;
+        file.write_all(page)?;
 
         Ok(())
     }
 
-    fn flush(&mut self) -> io::Result<()> {
-        self.file.flush()
+    fn flush(&self) -> io::Result<()> {
+        self.file.lock().unwrap().flush()
     }
 }
 
@@ -108,13 +109,13 @@ mod tests {
         let file = dir.path().join("test.db");
         let page = [42; PAGE_SIZE];
         let mut page_copy = [0; PAGE_SIZE];
-        let mut driver = FileDriver::from_file(file)?;
+        let driver = FileDriver::from_file(file)?;
         let page_no = 0;
         let expected_lsn = 15;
         driver.write_page(page_no, &page, expected_lsn)?;
         driver.flush()?;
 
-        let mut driver = FileDriver::new(driver.into_inner());
+        let driver = FileDriver::new(driver.into_inner());
         let page_no = 0;
         let lsn = driver.read_page(page_no, &mut page_copy)?;
         assert_eq!(lsn, expected_lsn);

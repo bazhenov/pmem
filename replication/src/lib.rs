@@ -1,6 +1,6 @@
 use pmem::{
     driver::PageDriver,
-    volume::{Addr, PageNo, Patch, TxRead, TxWrite, Volume, VolumeHandle, LSN, PAGE_SIZE},
+    volume::{Addr, Commit, PageNo, Patch, TxRead, TxWrite, Volume, VolumeHandle, LSN, PAGE_SIZE},
 };
 use protocol::{Message, PROTOCOL_VERSION};
 use std::{
@@ -11,7 +11,7 @@ use tokio::{
     sync::{self, mpsc, oneshot},
     task::JoinHandle,
 };
-use tracing::{info, instrument, trace};
+use tracing::{info, instrument, trace, warn};
 
 mod protocol;
 
@@ -58,7 +58,7 @@ async fn server_worker(mut socket: TcpStream, mut handle: VolumeHandle) -> io::R
     // FSM for tracking in-flight patches and commits with a given LSN on a client.
     let last_seen_lsn = handle.last_seen_lsn().max(1);
     trace!(lsn = last_seen_lsn, "Starting log relay");
-    let (tx, mut rx) = sync::mpsc::channel(1);
+    let (tx, mut rx) = sync::mpsc::channel(10);
 
     {
         let mut handle = handle.clone();
@@ -78,37 +78,37 @@ async fn server_worker(mut socket: TcpStream, mut handle: VolumeHandle) -> io::R
 
     let mut socket = pin!(socket);
 
-    tokio::select! {
-        snapshot = rx.recv() => {
-            if let Some((lsn, redo, undo)) = snapshot {
-                trace!(lsn = lsn, patches = redo.len(), "Sending snapshot");
-                for (r, u) in redo.iter().zip(undo.iter()) {
-                    Message::Patch(Cow::Borrowed(r), Cow::Borrowed(u))
-                        .write_to(pin!(&mut socket))
-                        .await?;
+    loop {
+        tokio::select! {
+            snapshot = rx.recv() => {
+                if let Some((lsn, redo, undo)) = snapshot {
+                    trace!(lsn = lsn, patches = redo.len(), "Sending snapshot");
+                    for (r, u) in redo.iter().zip(undo.iter()) {
+                        Message::Patch(Cow::Borrowed(r), Cow::Borrowed(u))
+                            .write_to(pin!(&mut socket))
+                            .await?;
+                    }
+                    Message::Commit(lsn).write_to(socket.as_mut()).await?;
+                }else{
+                    info!("No more snapshots");
+                    return Ok(());
                 }
-                Message::Commit(lsn).write_to(socket.as_mut()).await?;
-            }else{
-                info!("No more snapshots");
-                return Ok(());
             }
-        }
-        msg = Message::read_from(socket.as_mut()) => {
-            match msg? {
-                Message::PageRequest(page_no) => {
-                    trace!(page_no, "PageRequest received");
-                    let snapshot = handle.snapshot();
-                    let page = snapshot.read(page_no as Addr * PAGE_SIZE as Addr, PAGE_SIZE).into_owned();
-                    Message::PageReply(page_no, Cow::Owned(page), snapshot.lsn())
-                        .write_to(pin!(&mut socket))
-                        .await?;
+            msg = Message::read_from(socket.as_mut()) => {
+                match msg? {
+                    Message::PageRequest(corelation_id, page_no) => {
+                        trace!(page_no, cid = corelation_id, "PageRequest received");
+                        let snapshot = handle.snapshot();
+                        let page = snapshot.read(page_no as Addr * PAGE_SIZE as Addr, PAGE_SIZE).into_owned();
+                        Message::PageReply(corelation_id, Cow::Owned(page), snapshot.lsn())
+                            .write_to(pin!(&mut socket))
+                            .await?;
+                    }
+                    _ => return io_error("Invalid message"),
                 }
-                _ => return io_error("Invalid message"),
             }
         }
     }
-
-    Ok(())
 }
 
 pub async fn replica_connect(
@@ -128,7 +128,7 @@ pub async fn replica_connect(
         return io_error("Invalid protocol version");
     }
 
-    let (tx, rx) = mpsc::channel(1);
+    let (tx, rx) = mpsc::channel(100);
     let driver = NetworkDriver { tx };
     let volume = Volume::new_with_driver(pages, driver);
     let read_handle = volume.handle();
@@ -146,48 +146,59 @@ async fn client_worker(
 ) -> io::Result<()> {
     let mut assembler = PacketAssembler::default();
     let mut inflight_pages = HashMap::new();
+    let mut corelation_id = 0;
     let (read, write) = client.split();
     let mut read = pin!(read);
     let mut write = pin!(write);
+
+    let (commit_tx, mut commit_rx) = mpsc::channel(10);
+
+    // We're doing commits in a separate task so not to block Network IO-task from fetching pages
+    // from the network.
+    thread::spawn(move || {
+        while let Some((lsn, redo, undo)) = commit_rx.blocking_recv() {
+            let commit = Commit::new(redo, undo, lsn);
+
+            trace!(lsn, "Trying commit...");
+            volume.apply_commit(commit).expect("Unable to apply commit");
+            // let my_lsn = volume.commit(tx).unwrap();
+            trace!(lsn = lsn, "Committed snapshot");
+        }
+    });
+
     loop {
         tokio::select! {
             Some((page_no, rx)) = rx.recv() => {
-                trace!(page = page_no, "Requesting page from network");
-                inflight_pages.insert(page_no, rx);
-                Message::PageRequest(page_no).write_to(write.as_mut()).await?;
+                corelation_id += 1;
+                trace!(page = page_no, cid = corelation_id, "Requesting page from network");
+                inflight_pages.insert(corelation_id, (page_no, rx));
+                Message::PageRequest(corelation_id, page_no).write_to(write.as_mut()).await?;
             }
             msg = Message::read_from(read.as_mut()) => {
-                let msg = msg?;
+                let msg = msg.expect("Unable to read message");
                 if let Some(command) = assembler.feed_packet(msg)? {
                     match command {
-                        AssembledCommand::Commit(lsn, snapshot) => {
+                        AssembledCommand::Commit(lsn, redo, undo) => {
                             trace!(
                                 lsn = lsn,
-                                patches = snapshot.len(),
+                                patches = redo.len(),
                                 "Received snapshot from master"
                             );
+                            commit_tx.send((lsn, redo, undo)).await.expect("Unable to send page to client");
+                        }
+                        AssembledCommand::Page(corelation_id, lsn, data) => {
+                            if let Some((page_no, tx)) = inflight_pages.remove(&corelation_id) {
+                                trace!(page_no = page_no, lsn = lsn, "Received page");
 
-                            let mut tx = volume.start();
-                            for patch in snapshot {
-                                match patch {
-                                    Patch::Write(addr, bytes) => tx.write(addr, bytes),
-                                    Patch::Reclaim(addr, len) => tx.reclaim(addr, len),
-                                }
+                                // TODO: page type should be consistent
+                                tx.send(Ok((data.try_into().unwrap(), lsn))).expect("Unable to send page to client");
+                            }else{
+                                warn!(cid = corelation_id, "Page not requested")
                             }
 
-                            println!("Trying commit...");
-                            let my_lsn = volume.commit(tx).unwrap();
-                            trace!(lsn = lsn, my_lsn = my_lsn, "Committed snapshot");
-                        }
-                        AssembledCommand::Page(page_no, lsn, data) => {
-                            trace!(page_no = page_no, lsn = lsn, "Received page");
-                            let tx = inflight_pages.remove(&page_no).unwrap();
-                            // TODO: page type should be consistent
-                            tx.send(Ok((data.try_into().unwrap(), lsn))).unwrap();
                         }
                     }
                 }
-                println!("Done");
             }
         }
     }
@@ -195,27 +206,30 @@ async fn client_worker(
 
 #[derive(Default)]
 struct PacketAssembler {
-    commits: Vec<Patch>,
+    redo_patches: Vec<Patch>,
+    undo_patches: Vec<Patch>,
 }
 
 enum AssembledCommand {
-    Commit(LSN, Vec<Patch>),
-    Page(PageNo, LSN, Vec<u8>),
+    Commit(LSN, Vec<Patch>, Vec<Patch>),
+    Page(u64, LSN, Vec<u8>),
 }
 
 impl PacketAssembler {
     fn feed_packet(&mut self, msg: Message) -> io::Result<Option<AssembledCommand>> {
         match msg {
-            Message::Patch(p, _) => {
-                self.commits.push(p.into_owned());
+            Message::Patch(redo, undo) => {
+                self.redo_patches.push(redo.into_owned());
+                self.undo_patches.push(undo.into_owned());
                 Ok(None)
             }
             Message::Commit(lsn) => {
-                let commits = mem::take(&mut self.commits);
-                Ok(Some(AssembledCommand::Commit(lsn, commits)))
+                let redo = mem::take(&mut self.redo_patches);
+                let undo = mem::take(&mut self.undo_patches);
+                Ok(Some(AssembledCommand::Commit(lsn, redo, undo)))
             }
-            Message::PageReply(page_no, data, lsn) => Ok(Some(AssembledCommand::Page(
-                page_no,
+            Message::PageReply(corelation_id, data, lsn) => Ok(Some(AssembledCommand::Page(
+                corelation_id,
                 lsn,
                 data.into_owned(),
             ))),
@@ -242,30 +256,32 @@ struct NetworkDriver {
 
 impl PageDriver for NetworkDriver {
     fn read_page(
-        &mut self,
+        &self,
         page_no: pmem::volume::PageNo,
         page: &mut [u8; pmem::volume::PAGE_SIZE],
     ) -> io::Result<LSN> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        println!("Hi");
-        self.tx.blocking_send((page_no, reply_tx)).unwrap();
-        println!("Hi2");
-        let (remote_page, lsn) = reply_rx.blocking_recv().unwrap()?;
+        trace!(page = page_no, "Requesting page from network");
+        self.tx
+            .blocking_send((page_no, reply_tx))
+            .expect("Unable to send request");
+        trace!(page = page_no, "Waiting for a page from network");
+        let (remote_page, lsn) = reply_rx.blocking_recv().expect("Unable to recv response")?;
         page.copy_from_slice(&remote_page);
 
         Ok(lsn)
     }
 
     fn write_page(
-        &mut self,
+        &self,
         _page_no: pmem::volume::PageNo,
         _page: &[u8; pmem::volume::PAGE_SIZE],
         _lsn: LSN,
     ) -> io::Result<()> {
-        unimplemented!()
+        Ok(())
     }
 
-    fn flush(&mut self) -> io::Result<()> {
+    fn flush(&self) -> io::Result<()> {
         Ok(())
     }
 }

@@ -526,7 +526,7 @@ impl Volume {
 
     /// This is internal function and is not supposed to be used by the end user. Made public for replication
     /// purposes.
-    fn apply_commit(&mut self, commit: Commit) -> io::Result<()> {
+    pub fn apply_commit(&mut self, commit: Commit) -> io::Result<()> {
         assert_patches_equals(&commit.changes, &commit.undo);
 
         let (lock, notify) = self.latest_commit.as_ref();
@@ -653,14 +653,14 @@ impl Default for Volume {
 
 struct Pages {
     pages: Mutex<BTreeMap<PageNo, Page>>,
-    driver: Mutex<Box<dyn PageDriver>>,
+    driver: Box<dyn PageDriver>,
 }
 
 impl Pages {
     pub fn new(driver: impl PageDriver + 'static) -> Self {
         Self {
             pages: Mutex::new(BTreeMap::new()),
-            driver: Mutex::new(Box::new(driver)),
+            driver: Box::new(driver),
         }
     }
 
@@ -672,15 +672,20 @@ impl Pages {
         } else {
             drop(pages);
             let mut page = Page::new();
-            self.driver
-                .lock()
-                .unwrap()
-                .read_page(page_no, page.data.as_mut())?;
+            self.driver.read_page(page_no, page.data.as_mut())?;
             let mut pages = self.pages.lock().unwrap();
             f(&mut page);
             pages.insert(page_no, page);
             Ok(())
         }
+    }
+
+    fn with_page_opt(&self, page_no: PageNo, mut f: impl FnMut(&mut Page)) -> io::Result<()> {
+        let mut pages = self.pages.lock().unwrap();
+        if let Some(page) = pages.get_mut(&page_no) {
+            f(page);
+        }
+        Ok(())
     }
 
     fn read(&self, addr: Addr, buf: &mut [u8]) -> io::Result<()> {
@@ -708,7 +713,7 @@ impl Pages {
             let offset = offset as usize;
             let len = slice_range.len();
 
-            self.with_page(page_no, move |page| {
+            self.with_page_opt(page_no, move |page| {
                 let slice_range = slice_range.clone();
                 let page_range = offset..offset + len;
                 let page_buf = page.data.as_mut_slice();
@@ -726,7 +731,7 @@ impl Pages {
             let offset = offset as usize;
             let len = slice_range.len();
 
-            self.with_page(page_no, |page| {
+            self.with_page_opt(page_no, |page| {
                 let page_range = offset..offset + len;
                 let page_buf = page.data.as_mut_slice();
                 page_buf[page_range].fill(0);
@@ -737,18 +742,18 @@ impl Pages {
     }
 
     fn flush(&self, lsn: LSN) -> io::Result<()> {
-        let mut driver = self.driver.lock().unwrap();
         let pages = self.pages.lock().unwrap();
         for (page_no, page) in pages.iter() {
             if page.dirty {
-                driver.write_page(*page_no, page.data.as_ref(), lsn)?;
+                println!("Flushing page: {}", page_no);
+                self.driver.write_page(*page_no, page.data.as_ref(), lsn)?;
             }
         }
-        driver.flush()
+        self.driver.flush()
     }
 
     fn into_inner(self) -> Box<dyn PageDriver> {
-        self.driver.into_inner().unwrap()
+        self.driver
     }
 }
 
@@ -1015,6 +1020,15 @@ pub struct Commit {
 }
 
 impl Commit {
+    pub fn new(changes: Vec<Patch>, undo: Vec<Patch>, lsn: LSN) -> Self {
+        Self {
+            changes,
+            undo,
+            next: ArcSwap::from_pointee(None),
+            lsn,
+        }
+    }
+
     pub fn patches(&self) -> &[Patch] {
         self.changes.as_slice()
     }
