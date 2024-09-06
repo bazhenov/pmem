@@ -11,7 +11,7 @@ use tokio::{
     sync::{self, mpsc, oneshot},
     task::JoinHandle,
 };
-use tracing::{info, instrument, trace, warn};
+use tracing::{event, info, instrument, span, trace, warn, Level};
 
 mod protocol;
 
@@ -47,10 +47,10 @@ async fn server_worker(mut socket: TcpStream, mut handle: VolumeHandle) -> io::R
         .await?;
     let msg = Message::read_from(pin!(&mut socket)).await?;
     let Message::ClientHello(v) = msg else {
-        return io_error("Invalid handshake message");
+        return io_result("Invalid handshake message");
     };
     if v != PROTOCOL_VERSION {
-        return io_error("Invalid protocol version");
+        return io_result("Invalid protocol version");
     }
 
     // We do not want to send LSN=0 to the client, because it will cause a shift in LSNs
@@ -98,13 +98,15 @@ async fn server_worker(mut socket: TcpStream, mut handle: VolumeHandle) -> io::R
                 match msg? {
                     Message::PageRequest(corelation_id, page_no) => {
                         trace!(page_no, cid = corelation_id, "PageRequest received");
+
                         let snapshot = handle.snapshot();
                         let page = snapshot.read(page_no as Addr * PAGE_SIZE as Addr, PAGE_SIZE).into_owned();
+                        trace!(page_no, cid = corelation_id, lsn = handle.last_seen_lsn(), "Sending PageReply");
                         Message::PageReply(corelation_id, Cow::Owned(page), snapshot.lsn())
                             .write_to(pin!(&mut socket))
                             .await?;
                     }
-                    _ => return io_error("Invalid message"),
+                    _ => return io_result("Invalid message"),
                 }
             }
         }
@@ -122,10 +124,10 @@ pub async fn replica_connect(
 
     let msg = Message::read_from(pin!(&mut socket)).await?;
     let Message::ServerHello(version, pages) = msg else {
-        return io_error("Invalid handshake response");
+        return io_result("Invalid handshake response");
     };
     if version != PROTOCOL_VERSION {
-        return io_error("Invalid protocol version");
+        return io_result("Invalid protocol version");
     }
 
     let (tx, rx) = mpsc::channel(100);
@@ -233,7 +235,7 @@ impl PacketAssembler {
                 lsn,
                 data.into_owned(),
             ))),
-            _ => io_error("Invalid message type"),
+            _ => io_result("Invalid message type"),
         }
     }
 }
@@ -245,7 +247,7 @@ pub async fn next_snapshot(mut socket: &mut TcpStream) -> io::Result<(LSN, Vec<P
         match msg {
             Message::Patch(p, _) => patches.push(p.into_owned()),
             Message::Commit(lsn) => return Ok((lsn, patches)),
-            _ => return io_error("Invalid message type"),
+            _ => return io_result("Invalid message type"),
         }
     }
 }
@@ -255,29 +257,21 @@ struct NetworkDriver {
 }
 
 impl PageDriver for NetworkDriver {
-    fn read_page(
-        &self,
-        page_no: pmem::volume::PageNo,
-        page: &mut [u8; pmem::volume::PAGE_SIZE],
-    ) -> io::Result<LSN> {
+    #[instrument(skip(self, page), err, ret(level = "trace"))]
+    fn read_page(&self, page_no: PageNo, page: &mut [u8; PAGE_SIZE]) -> io::Result<LSN> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        trace!(page = page_no, "Requesting page from network");
         self.tx
             .blocking_send((page_no, reply_tx))
-            .expect("Unable to send request");
-        trace!(page = page_no, "Waiting for a page from network");
-        let (remote_page, lsn) = reply_rx.blocking_recv().expect("Unable to recv response")?;
+            .map_err(|_| io_error("Unable to send request"))?;
+        let (remote_page, lsn) = reply_rx
+            .blocking_recv()
+            .map_err(|_| io_error("Unable to recv response"))??;
         page.copy_from_slice(&remote_page);
 
         Ok(lsn)
     }
 
-    fn write_page(
-        &self,
-        _page_no: pmem::volume::PageNo,
-        _page: &[u8; pmem::volume::PAGE_SIZE],
-        _lsn: LSN,
-    ) -> io::Result<()> {
+    fn write_page(&self, _page_no: PageNo, _page: &[u8; PAGE_SIZE], _lsn: LSN) -> io::Result<()> {
         Ok(())
     }
 
@@ -286,6 +280,10 @@ impl PageDriver for NetworkDriver {
     }
 }
 
-pub(crate) fn io_error<T>(error: &str) -> Result<T, io::Error> {
-    Err(io::Error::new(io::ErrorKind::InvalidData, error))
+pub(crate) fn io_result<T>(error: &str) -> io::Result<T> {
+    Err(io_error(error))
+}
+
+pub(crate) fn io_error(error: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error)
 }

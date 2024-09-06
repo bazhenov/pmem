@@ -1,4 +1,4 @@
-use crate::io_error;
+use crate::io_result;
 use pmem::volume::{MemRange, PageNo, Patch, LSN, PAGE_SIZE};
 use std::{borrow::Cow, io, pin::Pin};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -114,7 +114,7 @@ impl<'a> Message<'a> {
                             Cow::Owned(undo_patch),
                         ))
                     } else {
-                        io_error("Patch length exceeds page size")
+                        io_result("Patch length exceeds page size")
                     }
                 }
                 PATCH_RECLAIM => {
@@ -128,7 +128,7 @@ impl<'a> Message<'a> {
 
                     Ok(Message::Patch(Cow::Owned(redo), Cow::Owned(undo_patch)))
                 }
-                _ => io_error("Invalid patch type"),
+                _ => io_result("Invalid patch type"),
             },
             COMMIT => {
                 let lsn = input.read_u64().await?;
@@ -149,7 +149,7 @@ impl<'a> Message<'a> {
                 input.read_exact(&mut data).await?;
                 Ok(Message::PageReply(corelation_id, Cow::Owned(data), lsn))
             }
-            _ => io_error("Invalid discriminator"),
+            _ => io_result("Invalid discriminator"),
         }
     }
 }

@@ -511,7 +511,7 @@ impl Volume {
             }
         }
 
-        let lsn = tx.base.lsn + 1;
+        let lsn = tx.base.lsn() + 1;
         // Updating redo log
         let new_commit = Commit {
             changes: tx.uncommitted,
@@ -601,7 +601,6 @@ impl Volume {
         let commit = self.latest_commit.0.lock().unwrap();
         debug_assert!(commit.is_some());
         Snapshot {
-            lsn: self.lsn.load(Ordering::Relaxed),
             pages_count: self.pages_count,
             pages: Arc::clone(&self.pages),
             commit_log: Arc::clone(&commit),
@@ -670,6 +669,7 @@ impl Pages {
             f(page);
             Ok(())
         } else {
+            // Driver may block due disk or network IO. Dropping lock before reading page.
             drop(pages);
             let mut page = Page::new();
             self.driver.read_page(page_no, page.data.as_mut())?;
@@ -775,7 +775,7 @@ impl Page {
 pub struct VolumeHandle {
     notify: CommitNotify,
     pages_count: PageNo,
-    commit_log: Arc<Option<Commit>>,
+    commit_log: Arc<Option<Commit>>, // TODO we can get rid of this
     pages: Arc<Pages>,
 }
 
@@ -785,12 +785,12 @@ impl VolumeHandle {
     /// The next snapshot is the one that is the most recent at the time this method is called.
     /// It might be several snapshots ahead of the last seen snapshot.
     pub fn wait(&mut self) -> Snapshot {
-        let commit = self.notify.next_commit();
+        // TODO: this is incorrect, we should return not the next, but latest snapshot
+        self.notify.next_commit();
 
         Snapshot {
-            lsn: commit.lsn,
             pages_count: self.pages_count,
-            commit_log: Arc::clone(&self.commit_log),
+            commit_log: Arc::clone(&self.notify.commit),
             pages: Arc::clone(&self.pages),
         }
     }
@@ -808,16 +808,11 @@ impl VolumeHandle {
     }
 
     pub fn snapshot(&mut self) -> Snapshot {
-        let commit = Arc::clone(&self.commit_log);
-
         while (*self.commit_log).as_ref().unwrap().next.load().is_some() {
             self.commit_log = (*self.commit_log).as_ref().unwrap().next.load_full();
         }
 
-        let lsn = (*commit).as_ref().unwrap().lsn();
-
         Snapshot {
-            lsn,
             pages_count: self.pages_count,
             commit_log: Arc::clone(&self.commit_log),
             pages: Arc::clone(&self.pages),
@@ -870,7 +865,7 @@ impl CommitNotify {
     }
 
     /// Advances the `commit` to the latest commit available in the volume.
-    pub fn advance_to_latest(&mut self) -> u64 {
+    fn advance_to_latest(&mut self) -> u64 {
         while (*self.commit).as_ref().unwrap().next.load().is_some() {
             self.commit = (*self.commit).as_ref().unwrap().next.load_full();
         }
@@ -938,7 +933,6 @@ pub struct Snapshot {
     pages_count: PageNo,
     commit_log: Arc<Option<Commit>>,
     pages: Arc<Pages>,
-    lsn: LSN,
 }
 
 impl Snapshot {
@@ -969,7 +963,7 @@ impl Snapshot {
         // of previously applied transaction.
         let mut commit_log = (*self.commit_log).as_ref().unwrap().next.load_full();
         while let Some(commit) = commit_log.as_ref() {
-            if commit.lsn > self.lsn {
+            if commit.lsn > self.lsn() {
                 apply_patches(&commit.undo, addr as usize, &mut buf, &mut buf_mask);
             }
             commit_log = commit.next.load_full();
@@ -979,7 +973,7 @@ impl Snapshot {
     }
 
     pub fn lsn(&self) -> LSN {
-        self.lsn
+        (*self.commit_log).as_ref().unwrap().lsn()
     }
 }
 
@@ -1436,10 +1430,13 @@ mod tests {
 
         let mut tx = mem.start();
         tx.write(0, b"Hide");
-        mem.commit(tx).unwrap();
+        let expected_lsn = mem.commit(tx).unwrap();
 
         let s = handle.snapshot();
         assert_str_eq(s.read(0, 4), b"Hide");
+        assert_eq!(s.lsn(), expected_lsn);
+        // TODO
+        // assert_eq!(handle.last_seen_lsn(), expected_lsn);
     }
 
     #[test]
@@ -1625,12 +1622,15 @@ mod tests {
             volume.commit(tx).unwrap()
         });
 
-        let commit = handle.wait();
-        let bytes = commit.read(0, 4);
-
+        let s1 = handle.wait();
         let lsn = lsn.join().unwrap();
-        assert_eq!(commit.lsn, lsn);
-        assert_eq!(&*bytes, [1, 2, 3, 4]);
+        let s2 = handle.snapshot();
+
+        assert_eq!(s1.lsn(), lsn);
+        assert_eq!(&*s1.read(0, 4), [1, 2, 3, 4]);
+
+        assert_eq!(s2.lsn(), lsn);
+        assert_eq!(&*s2.read(0, 4), [1, 2, 3, 4]);
     }
 
     #[test]
