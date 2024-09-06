@@ -500,15 +500,12 @@ impl Volume {
     pub fn commit(&mut self, tx: impl Into<Transaction>) -> io::Result<u64> {
         let tx: Transaction = tx.into();
 
+        // Form undo patches
         let mut undo_patches = Vec::with_capacity(tx.uncommitted.len());
-        {
-            // Form undo patches
-
-            for patch in &tx.uncommitted {
-                let mut undo_patch = vec![0; patch.len()];
-                self.pages.read(patch.addr(), undo_patch.as_mut()).unwrap();
-                undo_patches.push(Patch::Write(patch.addr(), undo_patch));
-            }
+        for patch in &tx.uncommitted {
+            let mut undo_patch = vec![0; patch.len()];
+            self.pages.read(patch.addr(), undo_patch.as_mut()).unwrap();
+            undo_patches.push(Patch::Write(patch.addr(), undo_patch));
         }
 
         let lsn = tx.base.lsn() + 1;

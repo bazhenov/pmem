@@ -56,14 +56,15 @@ impl FileDriver {
     }
 }
 
+const BLOCK_SIZE: u64 = PAGE_SIZE as u64 + mem::size_of::<LSN>() as u64;
+
 impl PageDriver for FileDriver {
     fn read_page(&self, page_no: PageNo, page: &mut [u8; PAGE_SIZE]) -> io::Result<LSN> {
-        const BLOCK_SIZE: u64 = PAGE_SIZE as u64 + mem::size_of::<LSN>() as u64;
         let expected_size = (page_no as u64 + 1) * BLOCK_SIZE;
         let mut lsn_bytes = [0u8; mem::size_of::<LSN>()];
         let mut file = self.file.lock().unwrap();
         if stream_len(&mut *file)? >= expected_size {
-            let page_offset = page_no as u64 * PAGE_SIZE as u64;
+            let page_offset = page_no as u64 * BLOCK_SIZE;
             file.seek(SeekFrom::Start(page_offset))?;
             file.read_exact(&mut lsn_bytes)?;
             file.read_exact(page)?;
@@ -72,14 +73,13 @@ impl PageDriver for FileDriver {
     }
 
     fn write_page(&self, page_no: PageNo, page: &[u8; PAGE_SIZE], lsn: LSN) -> io::Result<()> {
-        let page_offset = page_no as u64 * PAGE_SIZE as u64;
+        let page_offset = page_no as u64 * BLOCK_SIZE;
         let mut file = self.file.lock().unwrap();
 
         file.seek(SeekFrom::Start(page_offset))?;
 
         let lsn_bytes = lsn.to_le_bytes();
         file.write_all(&lsn_bytes)?;
-
         file.write_all(page)?;
 
         Ok(())
@@ -103,23 +103,35 @@ mod tests {
     use super::*;
     use tempfile;
 
+    // TODO proptest of the page driver
     #[test]
     fn can_read_and_write_page() -> io::Result<()> {
         let dir = tempfile::tempdir()?;
         let file = dir.path().join("test.db");
-        let page = [42; PAGE_SIZE];
-        let mut page_copy = [0; PAGE_SIZE];
+
+        let pages = [
+            (1 as LSN, [1; PAGE_SIZE]), // LSN + Page Content
+            (2, [2; PAGE_SIZE]),        // LSN + Page Content
+            (3, [3; PAGE_SIZE]),        // LSN + Page Content
+        ];
+
         let driver = FileDriver::from_file(file)?;
-        let page_no = 0;
-        let expected_lsn = 15;
-        driver.write_page(page_no, &page, expected_lsn)?;
+
+        for (page_no, (lsn, page)) in pages.iter().enumerate() {
+            driver.write_page(page_no as PageNo, page, *lsn)?;
+        }
+
         driver.flush()?;
 
         let driver = FileDriver::new(driver.into_inner());
-        let page_no = 0;
-        let lsn = driver.read_page(page_no, &mut page_copy)?;
-        assert_eq!(lsn, expected_lsn);
-        assert_eq!(page, page_copy);
+
+        let mut page_copy = [0; PAGE_SIZE];
+        for (page_no, (expected_lsn, page)) in pages.iter().enumerate() {
+            let lsn = driver.read_page(page_no as PageNo, &mut page_copy)?;
+            assert_eq!(lsn, *expected_lsn);
+            assert_eq!(page, &page_copy);
+        }
+
         Ok(())
     }
 }
