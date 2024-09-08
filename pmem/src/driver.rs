@@ -1,5 +1,6 @@
 use crate::volume::{PageNo, LSN, PAGE_SIZE};
 use std::{
+    collections::BTreeMap,
     fs::{self, File},
     io::{self, Read, Seek, SeekFrom, Write},
     mem,
@@ -8,20 +9,42 @@ use std::{
 };
 
 pub trait PageDriver: Send + Sync {
-    fn read_page(&self, page_no: PageNo, page: &mut [u8; PAGE_SIZE]) -> io::Result<LSN>;
+    fn read_page(&self, page_no: PageNo, page: &mut [u8; PAGE_SIZE]) -> io::Result<Option<LSN>>;
     fn write_page(&self, page_no: PageNo, page: &[u8; PAGE_SIZE], lsn: LSN) -> io::Result<()>;
 
     fn flush(&self) -> io::Result<()>;
 }
 
-pub struct NoDriver;
+pub struct NoDriver {
+    pages: Mutex<BTreeMap<PageNo, (LSN, Box<[u8; PAGE_SIZE]>)>>,
+}
+
+impl Default for NoDriver {
+    fn default() -> Self {
+        Self {
+            pages: Mutex::new(BTreeMap::new()),
+        }
+    }
+}
 
 impl PageDriver for NoDriver {
-    fn read_page(&self, _page_no: PageNo, _page: &mut [u8; PAGE_SIZE]) -> io::Result<LSN> {
-        Ok(0)
+    fn read_page(&self, page_no: PageNo, buf: &mut [u8; PAGE_SIZE]) -> io::Result<Option<LSN>> {
+        println!("Trying to read page {}", page_no);
+        let pages = self.pages.lock().unwrap();
+        if let Some((lsn, page)) = pages.get(&page_no) {
+            buf.copy_from_slice(page.as_slice());
+            Ok(Some(*lsn))
+        } else {
+            // TODO Option?
+            // Ok(0)
+            Ok(None)
+        }
     }
 
-    fn write_page(&self, _page_no: PageNo, _page: &[u8; PAGE_SIZE], _lsn: LSN) -> io::Result<()> {
+    fn write_page(&self, page_no: PageNo, page: &[u8; PAGE_SIZE], lsn: LSN) -> io::Result<()> {
+        println!("Writing page {}/{}", page_no, lsn);
+        let mut pages = self.pages.lock().unwrap();
+        pages.insert(page_no, (lsn, Box::new(*page)));
         Ok(())
     }
 
@@ -59,7 +82,7 @@ impl FileDriver {
 const BLOCK_SIZE: u64 = PAGE_SIZE as u64 + mem::size_of::<LSN>() as u64;
 
 impl PageDriver for FileDriver {
-    fn read_page(&self, page_no: PageNo, page: &mut [u8; PAGE_SIZE]) -> io::Result<LSN> {
+    fn read_page(&self, page_no: PageNo, page: &mut [u8; PAGE_SIZE]) -> io::Result<Option<LSN>> {
         let expected_size = (page_no as u64 + 1) * BLOCK_SIZE;
         let mut lsn_bytes = [0u8; mem::size_of::<LSN>()];
         let mut file = self.file.lock().unwrap();
@@ -68,8 +91,10 @@ impl PageDriver for FileDriver {
             file.seek(SeekFrom::Start(page_offset))?;
             file.read_exact(&mut lsn_bytes)?;
             file.read_exact(page)?;
+            Ok(Some(LSN::from_le_bytes(lsn_bytes)))
+        } else {
+            Ok(None)
         }
-        Ok(LSN::from_le_bytes(lsn_bytes))
     }
 
     fn write_page(&self, page_no: PageNo, page: &[u8; PAGE_SIZE], lsn: LSN) -> io::Result<()> {
@@ -104,10 +129,13 @@ pub struct TestPageDriver {
 
 #[cfg(test)]
 impl PageDriver for TestPageDriver {
-    fn read_page(&self, page_no: PageNo, page: &mut [u8; PAGE_SIZE]) -> io::Result<LSN> {
-        let (lsn, data) = self.pages[page_no as usize];
-        page.copy_from_slice(&data);
-        Ok(lsn)
+    fn read_page(&self, page_no: PageNo, page: &mut [u8; PAGE_SIZE]) -> io::Result<Option<LSN>> {
+        if let Some((lsn, data)) = self.pages.get(page_no as usize) {
+            page.copy_from_slice(data);
+            Ok(Some(*lsn))
+        } else {
+            Ok(None)
+        }
     }
 
     fn write_page(&self, _page_no: PageNo, _page: &[u8; PAGE_SIZE], _lsn: LSN) -> io::Result<()> {
@@ -148,7 +176,9 @@ mod tests {
 
         let mut page_copy = [0; PAGE_SIZE];
         for (page_no, (expected_lsn, page)) in pages.iter().enumerate() {
-            let lsn = driver.read_page(page_no as PageNo, &mut page_copy)?;
+            let lsn = driver
+                .read_page(page_no as PageNo, &mut page_copy)?
+                .unwrap();
             assert_eq!(lsn, *expected_lsn);
             assert_eq!(page, &page_copy);
         }

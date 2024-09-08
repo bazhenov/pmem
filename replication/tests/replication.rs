@@ -10,9 +10,12 @@ mod tracing;
 async fn check_replication_simple_case() -> io::Result<()> {
     let mut net = MasterAndReplica::new().await?;
 
-    let bytes = [1, 2, 3, 4];
-    let snapshot = net.master_write(|s| s.write(0, bytes)).await;
-    assert_eq!(&*snapshot.read(0, 4), &bytes);
+    let expected = [1, 2, 3, 4];
+    let snapshot = net.master_write(|s| s.write(0, expected)).await;
+    let bytes = spawn_blocking(move || snapshot.read(0, 4).to_vec())
+        .await
+        .unwrap();
+    assert_eq!(&bytes, &expected);
     Ok(())
 }
 

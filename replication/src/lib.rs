@@ -202,6 +202,7 @@ async fn client_worker(
         while let Some((lsn, redo, undo)) = commit_rx.blocking_recv() {
             let commit = Commit::new(redo, undo, lsn);
 
+            // TODO in case of error we should fail the main thread
             volume.apply_commit(commit).expect("Unable to apply commit");
             info!(lsn, "Commit applied to volume");
         }
@@ -216,8 +217,7 @@ async fn client_worker(
                 Message::PageRequest(corelation_id, page_no).write_to(write.as_mut()).await?;
             }
             msg = Message::read_from(read.as_mut()) => {
-                let msg = msg.expect("Unable to read message");
-                if let Some(command) = assembler.feed_packet(msg)? {
+                if let Some(command) = assembler.feed_packet(msg?)? {
                     match command {
                         AssembledCommand::Commit(lsn, redo, undo) => {
                             trace!(
@@ -300,7 +300,7 @@ struct NetworkDriver {
 
 impl PageDriver for NetworkDriver {
     #[instrument(skip(self, page), err, ret(level = "trace"))]
-    fn read_page(&self, page_no: PageNo, page: &mut [u8; PAGE_SIZE]) -> io::Result<LSN> {
+    fn read_page(&self, page_no: PageNo, page: &mut [u8; PAGE_SIZE]) -> io::Result<Option<LSN>> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .blocking_send((page_no, reply_tx))
@@ -310,7 +310,8 @@ impl PageDriver for NetworkDriver {
             .map_err(|_| io_error("Unable to recv response"))??;
         page.copy_from_slice(remote_page.as_ref());
 
-        Ok(lsn)
+        // TODO there can be be None
+        Ok(Some(lsn))
     }
 
     fn write_page(&self, _page_no: PageNo, _page: &[u8; PAGE_SIZE], _lsn: LSN) -> io::Result<()> {
