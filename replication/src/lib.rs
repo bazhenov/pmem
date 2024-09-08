@@ -53,11 +53,24 @@ async fn server_worker(mut socket: TcpStream, mut handle: VolumeHandle) -> io::R
         return io_result("Invalid protocol version");
     }
 
-    // We do not want to send LSN=0 to the client, because it will cause a shift in LSNs
-    // between the client and the server. This problem should go away once we implement
-    // FSM for tracking in-flight patches and commits with a given LSN on a client.
-    let last_seen_lsn = handle.last_seen_lsn().max(1);
-    trace!(lsn = last_seen_lsn, "Starting log relay");
+    let mut socket = pin!(socket);
+
+    // Sending initial commit to the client
+    {
+        handle.advance_to_latest();
+        let current_commit = handle.current_commit();
+        let lsn = current_commit.lsn();
+        let redo = current_commit.patches();
+        let undo = current_commit.undo();
+        trace!(lsn, patches = redo.len(), "Starting log relay");
+        for (r, u) in redo.iter().zip(undo.iter()) {
+            Message::Patch(Cow::Borrowed(r), Cow::Borrowed(u))
+                .write_to(pin!(&mut socket))
+                .await?;
+        }
+        Message::Commit(lsn).write_to(socket.as_mut()).await?;
+    }
+
     let (tx, mut rx) = sync::mpsc::channel(10);
 
     {
@@ -75,8 +88,6 @@ async fn server_worker(mut socket: TcpStream, mut handle: VolumeHandle) -> io::R
             }
         });
     }
-
-    let mut socket = pin!(socket);
 
     loop {
         tokio::select! {
@@ -132,9 +143,33 @@ pub async fn replica_connect(
 
     let (tx, rx) = mpsc::channel(100);
     let driver = NetworkDriver { tx };
-    let volume = Volume::new_with_driver(pages, driver);
-    let read_handle = volume.handle();
+    let mut volume = Volume::new_with_driver(pages, driver);
 
+    // Receveing initial commit from the server
+    {
+        let mut assembler = PacketAssembler::default();
+        loop {
+            let msg = Message::read_from(pin!(&mut socket)).await?;
+            if let Some(command) = assembler.feed_packet(msg)? {
+                let AssembledCommand::Commit(lsn, redo, undo) = command else {
+                    return io_result("Invalid message: initial commit expected");
+                };
+                trace!(lsn, "Received initial commit from server");
+                if lsn == 0 {
+                    // Don't need to do nothing, because master has not commits (the volume is empty)
+                    // Need to check it is indeed the empty initial commit
+                    assert!(redo.is_empty(), "Initial commit must be empty");
+                } else {
+                    let commit = Commit::new(redo, undo, lsn);
+                    volume.apply_commit(commit)?;
+                    info!(lsn, "Initial commit applied to volume");
+                }
+                break;
+            }
+        }
+    }
+
+    let read_handle = volume.handle();
     let join_handle = tokio::spawn(client_worker(socket, volume, rx));
 
     Ok((read_handle, join_handle))
@@ -144,7 +179,10 @@ pub async fn replica_connect(
 async fn client_worker(
     mut client: TcpStream,
     mut volume: Volume,
-    mut rx: mpsc::Receiver<(PageNo, oneshot::Sender<io::Result<([u8; PAGE_SIZE], LSN)>>)>,
+    mut rx: mpsc::Receiver<(
+        PageNo,
+        oneshot::Sender<io::Result<(Box<[u8; PAGE_SIZE]>, LSN)>>,
+    )>,
 ) -> io::Result<()> {
     let mut assembler = PacketAssembler::default();
     let mut inflight_pages = HashMap::new();
@@ -158,13 +196,14 @@ async fn client_worker(
     // We're doing commits in a separate task so not to block Network IO-task from fetching pages
     // from the network.
     thread::spawn(move || {
+        let span = span!(Level::TRACE, "commit_applier");
+        let _ = span.enter();
+
         while let Some((lsn, redo, undo)) = commit_rx.blocking_recv() {
             let commit = Commit::new(redo, undo, lsn);
 
-            trace!(lsn, "Trying commit...");
             volume.apply_commit(commit).expect("Unable to apply commit");
-            // let my_lsn = volume.commit(tx).unwrap();
-            trace!(lsn = lsn, "Committed snapshot");
+            info!(lsn, "Commit applied to volume");
         }
     });
 
@@ -253,7 +292,10 @@ pub async fn next_snapshot(mut socket: &mut TcpStream) -> io::Result<(LSN, Vec<P
 }
 
 struct NetworkDriver {
-    tx: mpsc::Sender<(PageNo, oneshot::Sender<io::Result<([u8; PAGE_SIZE], LSN)>>)>,
+    tx: mpsc::Sender<(
+        PageNo,
+        oneshot::Sender<io::Result<(Box<[u8; PAGE_SIZE]>, LSN)>>,
+    )>,
 }
 
 impl PageDriver for NetworkDriver {
@@ -266,7 +308,7 @@ impl PageDriver for NetworkDriver {
         let (remote_page, lsn) = reply_rx
             .blocking_recv()
             .map_err(|_| io_error("Unable to recv response"))??;
-        page.copy_from_slice(&remote_page);
+        page.copy_from_slice(remote_page.as_ref());
 
         Ok(lsn)
     }

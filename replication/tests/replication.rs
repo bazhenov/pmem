@@ -1,6 +1,7 @@
+use ::tracing::info;
 use pmem::volume::{Addr, Snapshot, Transaction, TxRead, TxWrite, Volume, VolumeHandle, PAGE_SIZE};
 use replication::{replica_connect, start_replication_server};
-use std::{io, net::SocketAddr};
+use std::{io, net::SocketAddr, thread};
 use tokio::task::{spawn_blocking, JoinHandle};
 
 mod tracing;
@@ -26,6 +27,7 @@ async fn check_replication_work_if_connected_later() -> io::Result<()> {
     net.replica_reconnect().await?;
 
     let snapshot = net.slave_snapshot();
+    assert_eq!(1, snapshot.lsn());
     let data = spawn_blocking(move || snapshot.read(0, 4).to_vec())
         .await
         .unwrap();
@@ -76,6 +78,7 @@ impl MasterAndReplica {
 
     async fn replica_reconnect(&mut self) -> io::Result<()> {
         self.replica_ctrl.abort();
+        info!("Reconnecting");
         let (replica, replica_ctrl) = replica_connect(&self.master_addr).await?;
         self.replica_handle = replica;
         self.replica_ctrl = replica_ctrl;
@@ -83,12 +86,15 @@ impl MasterAndReplica {
     }
 
     fn slave_snapshot(&mut self) -> Snapshot {
+        self.replica_handle.advance_to_latest(); // TODO need to get rid of this
         self.replica_handle.snapshot()
     }
 
     /// Write to master, wait for replica to catch up and returns corresponding snapshot from replica
-    async fn master_write(&mut self, f: impl Fn(&mut Transaction)) -> impl TxRead {
-        let mut notify = self.master_volume.commit_notify();
+    async fn master_write(&mut self, f: impl Fn(&mut Transaction)) -> Snapshot {
+        // replica handle must be created before writing to master, otherwise it is a race condition
+        let mut replica = self.replica_handle.clone();
+
         let mut tx = self.master_volume.start();
         f(&mut tx);
         let lsn = self.master_volume.commit(tx).unwrap();
@@ -96,9 +102,10 @@ impl MasterAndReplica {
         // Waiting for replica to catch up
         // We need to spawn_blocking here because `next_commit()` is a blocking call
         // if `Runtime` is not multithreaded it may block the only thread that is running server async tasks
-        spawn_blocking(move || while notify.next_commit().lsn() < lsn {})
+        spawn_blocking(move || while replica.wait_commit().lsn() < lsn {})
             .await
             .unwrap();
-        self.master_volume.start()
+
+        self.slave_snapshot()
     }
 }

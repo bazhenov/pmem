@@ -70,6 +70,7 @@ use std::{
         Arc, Condvar, Mutex,
     },
 };
+use tracing::{error, info, trace};
 
 pub const PAGE_SIZE_BITS: usize = 16;
 pub const PAGE_SIZE: usize = 1 << PAGE_SIZE_BITS; // 64Kib
@@ -483,9 +484,11 @@ impl Volume {
     ///
     /// [`commit`]: Self::commit
     pub fn start(&self) -> Transaction {
+        let snapshot = self.do_create_snapshot();
+        trace!(base_lsn = snapshot.lsn(), "Creating transaction");
         Transaction {
             uncommitted: vec![],
-            base: self.snapshot(),
+            base: snapshot,
         }
     }
 
@@ -557,6 +560,8 @@ impl Volume {
         }
 
         // Updating commit log
+        let lsn = commit.lsn;
+        let changes = commit.changes.len();
         let commit = Arc::new(Some(commit));
         self.pages.flush(Arc::clone(&commit))?;
         last_commit
@@ -568,6 +573,7 @@ impl Volume {
         *last_commit = commit;
 
         notify.notify_all();
+        info!(lsn, changes, "Commit completed");
 
         Ok(())
     }
@@ -595,6 +601,12 @@ impl Volume {
     }
 
     pub fn snapshot(&self) -> Snapshot {
+        let snapshot = self.do_create_snapshot();
+        trace!(lsn = snapshot.lsn(), "Creating snapshot");
+        snapshot
+    }
+
+    fn do_create_snapshot(&self) -> Snapshot {
         let commit = self.latest_commit.0.lock().unwrap();
         debug_assert!(commit.is_some());
         Snapshot {
@@ -674,35 +686,51 @@ impl Pages {
             let mut data = Box::new([0; PAGE_SIZE]);
             let lsn = self.driver.read_page(page_no, data.as_mut())?;
 
-            let mut commit = self
-                .last_commit
-                .lock()
-                .expect("No commit was given")
+            // let mut commit = Arc::clone(&self.last_commit.lock().unwrap());
+
+            let current_commit = Arc::clone(&self.last_commit.lock().expect("No commit was given"));
+            let mut last_commit_lsn = (*current_commit)
                 .as_ref()
+                .expect("No commit was given")
+                .lsn();
+            let mut commit = (*current_commit)
                 .as_ref()
                 .expect("No commit was given")
                 .next
                 .load_full();
+            trace!(page_no, lsn, last_commit_lsn, "Implanting page");
 
             #[allow(clippy::single_range_in_vec_init)]
             let mut buf_mask = vec![0..PAGE_SIZE];
 
+            println!("---");
             while let Some(com) = commit.as_ref() {
-                if com.lsn() > lsn {
-                    commit = com.next.load_full();
-                    continue;
-                }
-                if buf_mask.is_empty() {
+                println!(
+                    "Applying {} to a a page LSN: {}, data: {:?}",
+                    com.lsn(),
+                    lsn,
+                    com.undo()
+                );
+                if buf_mask.is_empty() || com.lsn() > lsn {
                     break;
                 }
+                last_commit_lsn = com.lsn();
                 apply_patches(
                     com.undo(),
                     page_no as usize * PAGE_SIZE,
                     data.as_mut(),
                     buf_mask.as_mut(),
                 );
+
                 commit = com.next.load_full();
             }
+            assert!(
+                last_commit_lsn == lsn,
+                "Cannot compensate for a page no {} with lsn {}. Last commit LSN is {}",
+                page_no,
+                lsn,
+                last_commit_lsn
+            );
 
             let mut page = Page {
                 data,
@@ -789,6 +817,7 @@ impl Pages {
                 page.lsn = lsn;
             }
         }
+        println!("Upading commit to {}", (*commit).as_ref().unwrap().lsn());
         *self.last_commit.lock().unwrap() = commit;
         self.driver.flush()
     }
@@ -836,6 +865,14 @@ impl VolumeHandle {
         }
     }
 
+    pub fn current_commit(&self) -> &Commit {
+        (*self.notify.commit).as_ref().unwrap()
+    }
+
+    pub fn advance_to_latest(&mut self) -> u64 {
+        self.notify.advance_to_latest()
+    }
+
     pub fn wait_commit(&mut self) -> &Commit {
         self.notify.next_commit()
     }
@@ -853,11 +890,13 @@ impl VolumeHandle {
             self.commit_log = (*self.commit_log).as_ref().unwrap().next.load_full();
         }
 
-        Snapshot {
+        let snapshot = Snapshot {
             pages_count: self.pages_count,
             commit_log: Arc::clone(&self.commit_log),
             pages: Arc::clone(&self.pages),
-        }
+        };
+        trace!(lsn = snapshot.lsn(), "Creating snapshot");
+        snapshot
     }
 }
 
@@ -993,11 +1032,15 @@ impl Snapshot {
 
         self.pages.read(addr, &mut buf).unwrap();
 
+        println!("Reading: {:?}", &buf[0..4]);
+
         #[allow(clippy::single_range_in_vec_init)]
         let mut buf_mask = vec![0..len];
 
         // Apply own uncommitted changes
         apply_patches(uncommitted, addr as usize, &mut buf, &mut buf_mask);
+
+        println!("Reading: {:?}", &buf[0..4]);
 
         // Applying with undo log
         // We need to skip first entry in undo log, because it is describing how to undo the changes
@@ -1005,10 +1048,16 @@ impl Snapshot {
         let mut commit_log = (*self.commit_log).as_ref().unwrap().next.load_full();
         while let Some(commit) = commit_log.as_ref() {
             if commit.lsn > self.lsn() {
+                println!(
+                    "Applying undo code from LSN {} to snapshot {}",
+                    commit.lsn(),
+                    self.lsn()
+                );
                 apply_patches(&commit.undo, addr as usize, &mut buf, &mut buf_mask);
             }
             commit_log = commit.next.load_full();
         }
+        println!("Reading: {:?}", &buf[0..4]);
 
         Cow::Owned(buf)
     }
