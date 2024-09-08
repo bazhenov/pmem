@@ -98,21 +98,42 @@ fn stream_len<T: Seek>(file: &mut T) -> io::Result<u64> {
 }
 
 #[cfg(test)]
+pub struct TestPageDriver {
+    pub pages: Vec<(LSN, [u8; PAGE_SIZE])>,
+}
+
+#[cfg(test)]
+impl PageDriver for TestPageDriver {
+    fn read_page(&self, page_no: PageNo, page: &mut [u8; PAGE_SIZE]) -> io::Result<LSN> {
+        let (lsn, data) = self.pages[page_no as usize];
+        page.copy_from_slice(&data);
+        Ok(lsn)
+    }
+
+    fn write_page(&self, _page_no: PageNo, _page: &[u8; PAGE_SIZE], _lsn: LSN) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn flush(&self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 #[cfg(not(miri))]
 mod tests {
     use super::*;
     use tempfile;
 
-    // TODO proptest of the page driver
     #[test]
     fn can_read_and_write_page() -> io::Result<()> {
         let dir = tempfile::tempdir()?;
         let file = dir.path().join("test.db");
 
         let pages = [
-            (1 as LSN, [1; PAGE_SIZE]), // LSN + Page Content
-            (2, [2; PAGE_SIZE]),        // LSN + Page Content
-            (3, [3; PAGE_SIZE]),        // LSN + Page Content
+            (10 as LSN, [1; PAGE_SIZE]), // LSN + Page Content
+            (20, [2; PAGE_SIZE]),
+            (30, [3; PAGE_SIZE]),
         ];
 
         let driver = FileDriver::from_file(file)?;

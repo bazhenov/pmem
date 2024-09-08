@@ -456,11 +456,11 @@ impl Volume {
             next: ArcSwap::from_pointee(None),
             lsn: 0,
         };
-        let commit = Mutex::new(Arc::new(Some(commit)));
+        let commit = Arc::new(Some(commit));
         Self {
-            pages: Arc::new(Pages::new(driver)),
+            pages: Arc::new(Pages::new(driver, Arc::clone(&commit))),
             pages_count: page_cnt as PageNo,
-            latest_commit: Arc::new((commit, Condvar::new())),
+            latest_commit: Arc::new((Mutex::new(commit), Condvar::new())),
             lsn: AtomicU64::new(0),
         }
     }
@@ -555,10 +555,10 @@ impl Volume {
                 Patch::Reclaim(addr, len) => self.pages.zero(*addr, *len)?,
             }
         }
-        self.pages.flush(commit.lsn)?;
 
         // Updating commit log
         let commit = Arc::new(Some(commit));
+        self.pages.flush(Arc::clone(&commit))?;
         last_commit
             .as_ref()
             .as_ref()
@@ -649,14 +649,16 @@ impl Default for Volume {
 
 struct Pages {
     pages: Mutex<BTreeMap<PageNo, Page>>,
+    last_commit: Mutex<Arc<Option<Commit>>>,
     driver: Box<dyn PageDriver>,
 }
 
 impl Pages {
-    pub fn new(driver: impl PageDriver + 'static) -> Self {
+    pub fn new(driver: impl PageDriver + 'static, commit: Arc<Option<Commit>>) -> Self {
         Self {
             pages: Mutex::new(BTreeMap::new()),
             driver: Box::new(driver),
+            last_commit: Mutex::new(commit),
         }
     }
 
@@ -668,8 +670,46 @@ impl Pages {
         } else {
             // Driver may block due disk or network IO. Dropping lock before reading page.
             drop(pages);
-            let mut page = Page::new();
-            self.driver.read_page(page_no, page.data.as_mut())?;
+
+            let mut data = Box::new([0; PAGE_SIZE]);
+            let lsn = self.driver.read_page(page_no, data.as_mut())?;
+
+            let mut commit = self
+                .last_commit
+                .lock()
+                .expect("No commit was given")
+                .as_ref()
+                .as_ref()
+                .expect("No commit was given")
+                .next
+                .load_full();
+
+            #[allow(clippy::single_range_in_vec_init)]
+            let mut buf_mask = vec![0..PAGE_SIZE];
+
+            while let Some(com) = commit.as_ref() {
+                if com.lsn() > lsn {
+                    commit = com.next.load_full();
+                    continue;
+                }
+                if buf_mask.is_empty() {
+                    break;
+                }
+                apply_patches(
+                    com.undo(),
+                    page_no as usize * PAGE_SIZE,
+                    data.as_mut(),
+                    buf_mask.as_mut(),
+                );
+                commit = com.next.load_full();
+            }
+
+            let mut page = Page {
+                data,
+                lsn,
+                dirty: false,
+            };
+
             let mut pages = self.pages.lock().unwrap();
             f(&mut page);
             pages.insert(page_no, page);
@@ -738,34 +778,38 @@ impl Pages {
         Ok(())
     }
 
-    fn flush(&self, lsn: LSN) -> io::Result<()> {
-        let pages = self.pages.lock().unwrap();
-        for (page_no, page) in pages.iter() {
+    fn flush(&self, commit: Arc<Option<Commit>>) -> io::Result<()> {
+        let lsn = (*commit).as_ref().unwrap().lsn();
+        let mut pages = self.pages.lock().unwrap();
+        for (page_no, page) in pages.iter_mut() {
             if page.dirty {
                 println!("Flushing page: {}", page_no);
                 self.driver.write_page(*page_no, page.data.as_ref(), lsn)?;
+                page.dirty = false;
+                page.lsn = lsn;
             }
         }
+        *self.last_commit.lock().unwrap() = commit;
         self.driver.flush()
     }
 
     fn into_inner(self) -> Box<dyn PageDriver> {
         self.driver
     }
+
+    /// Clears the loaded pages cache
+    ///
+    /// All subsequent reads will be done from the driver
+    #[cfg(test)]
+    fn clear_cache(&self) {
+        self.pages.lock().unwrap().clear();
+    }
 }
 
 struct Page {
     data: Box<[u8; PAGE_SIZE]>,
     dirty: bool,
-}
-
-impl Page {
-    fn new() -> Self {
-        Self {
-            data: Box::new([0; PAGE_SIZE]),
-            dirty: false,
-        }
-    }
+    lsn: LSN,
 }
 
 #[derive(Clone)]
@@ -1382,7 +1426,7 @@ mod tests {
     use rand::{rngs::SmallRng, Rng, SeedableRng};
     use tempfile::tempdir;
 
-    use crate::driver::FileDriver;
+    use crate::driver::{FileDriver, TestPageDriver};
 
     use super::*;
     use std::thread;
@@ -1742,7 +1786,6 @@ mod tests {
         let mut tx = volume.start();
         tx.write(0, [42]);
         volume.commit(tx).unwrap();
-        drop(volume);
 
         let volume = Volume::new_with_driver(1, FileDriver::from_file(&db_file)?);
         assert_eq!(&*volume.read(0, 1), [42]);
@@ -1810,7 +1853,7 @@ mod tests {
 
     #[test]
     fn check_pages_read_write() -> io::Result<()> {
-        let pages = Pages::new(NoDriver);
+        let pages = Pages::new(NoDriver, commit_log(&[]));
 
         let mut buf = vec![0; 5];
         pages.read(0, &mut buf)?;
@@ -1822,6 +1865,73 @@ mod tests {
         assert_eq!(buf, &[1, 2, 3, 4, 5]);
 
         Ok(())
+    }
+
+    #[test]
+    fn check_implant_page() -> io::Result<()> {
+        let driver = TestPageDriver {
+            pages: vec![
+                (3, [3; PAGE_SIZE]), // LSN + PageContent
+            ],
+        };
+
+        let commit = commit_log(&[
+            &[Patch::Write(0, vec![1, 1, 1])],
+            &[Patch::Write(0, vec![2, 2, 2])],
+            &[Patch::Write(0, vec![3, 3, 3])],
+        ]);
+
+        let mut buf = [0; 3];
+
+        let pages = Pages::new(driver, Arc::clone(&commit));
+
+        pages.read(0, &mut buf)?;
+        assert_eq!(buf, [0, 0, 0]);
+
+        let commit = (*commit).as_ref().unwrap().next();
+        pages.flush(Arc::clone(&commit))?;
+        pages.clear_cache();
+        pages.read(0, &mut buf)?;
+        assert_eq!(buf, [1, 1, 1]);
+
+        let commit = (*commit).as_ref().unwrap().next();
+        pages.flush(Arc::clone(&commit))?;
+        pages.clear_cache();
+        pages.read(0, &mut buf)?;
+        assert_eq!(buf, [2, 2, 2]);
+
+        let commit = (*commit).as_ref().unwrap().next();
+        pages.flush(Arc::clone(&commit))?;
+        pages.clear_cache();
+        pages.read(0, &mut buf)?;
+        assert_eq!(buf, [3, 3, 3]);
+
+        // pages.write(0, &[1, 2, 3, 4, 5])?;
+
+        // pages.read(0, &mut buf)?;
+        // assert_eq!(buf, &[1, 2, 3, 4, 5]);
+
+        Ok(())
+    }
+
+    fn commit_log(changes: &[&[Patch]]) -> Arc<Option<Commit>> {
+        let mut volume = Volume::new_in_memory(1);
+        // Creating a snapshot before the changes are applied
+        // so that it will accumulate the commit log.
+        let snapshot = volume.snapshot();
+
+        for change in changes {
+            let mut tx = volume.start();
+            for patch in *change {
+                match patch {
+                    Patch::Write(addr, bytes) => tx.write(*addr, bytes.as_slice()),
+                    Patch::Reclaim(_, _) => todo!(),
+                };
+            }
+            volume.commit(tx).unwrap();
+        }
+
+        snapshot.commit_log
     }
 
     mod patch {
