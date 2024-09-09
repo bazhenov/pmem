@@ -419,7 +419,7 @@ pub struct Volume {
     /// for the snapshot to be created. Unfortunately, this is not possible due to the fact
     /// that [`Commit::next`] which is [`ArcSwap`] must contains `Option` to be able
     /// to stop reference chain at some point and we can not have both `Arc<T>` and `Arc<Option<T>>` as the same time.
-    latest_commit: Arc<(Mutex<Arc<Option<Commit>>>, Condvar)>,
+    latest_commit: Arc<(Mutex<Arc<Commit>>, Condvar)>,
 }
 
 impl Volume {
@@ -458,7 +458,7 @@ impl Volume {
             next: ArcSwap::from_pointee(None),
             lsn: 0,
         };
-        let commit = Arc::new(Some(commit));
+        let commit = Arc::new(commit);
         Self {
             pages: Arc::new(Pages::new(driver, Arc::clone(&commit))),
             pages_count: page_cnt as PageNo,
@@ -551,14 +551,9 @@ impl Volume {
         // undo logs to be able to rollback in-flight ch
         let lsn = commit.lsn;
         let changes = commit.changes.len();
-        let commit = Arc::new(Some(commit));
+        let commit = Arc::new(commit);
         let commit_clone = Arc::clone(&commit);
-        last_commit
-            .as_ref()
-            .as_ref()
-            .expect("Commit log is missing")
-            .next
-            .store(Arc::clone(&commit));
+        last_commit.next.store(Arc::new(Some(Arc::clone(&commit))));
         *last_commit = commit;
 
         // Updating page content
@@ -579,7 +574,7 @@ impl Volume {
     pub fn commit_notify(&self) -> CommitNotify {
         let commit = self.latest_commit.0.lock().unwrap();
         CommitNotify {
-            last_seen_lsn: (*commit.as_ref()).as_ref().unwrap().lsn(),
+            last_seen_lsn: commit.lsn(),
             latest_commit: Arc::clone(&self.latest_commit),
             commit: Arc::clone(&commit),
             pages_count: self.pages_count,
@@ -606,7 +601,6 @@ impl Volume {
 
     fn do_create_snapshot(&self) -> Snapshot {
         let commit = self.latest_commit.0.lock().unwrap();
-        debug_assert!(commit.is_some());
         Snapshot {
             pages_count: self.pages_count,
             pages: Arc::clone(&self.pages),
@@ -674,12 +668,12 @@ impl Default for Volume {
 
 struct Pages {
     pages: Mutex<BTreeMap<PageNo, Page>>,
-    last_commit: Mutex<Arc<Option<Commit>>>,
+    last_commit: Mutex<Arc<Commit>>,
     driver: Box<dyn PageDriver>,
 }
 
 impl Pages {
-    pub fn new(driver: impl PageDriver + 'static, commit: Arc<Option<Commit>>) -> Self {
+    pub fn new(driver: impl PageDriver + 'static, commit: Arc<Commit>) -> Self {
         Self {
             pages: Mutex::new(BTreeMap::new()),
             driver: Box::new(driver),
@@ -700,15 +694,8 @@ impl Pages {
             if let Some(lsn) = self.driver.read_page(page_no, data.as_mut())? {
                 let current_commit =
                     Arc::clone(&self.last_commit.lock().expect("No commit was given"));
-                let mut last_commit_lsn = (*current_commit)
-                    .as_ref()
-                    .expect("No commit was given")
-                    .lsn();
-                let mut commit = (*current_commit)
-                    .as_ref()
-                    .expect("No commit was given")
-                    .next
-                    .load_full();
+                let mut last_commit_lsn = current_commit.lsn();
+                let mut commit = current_commit.next.load_full();
                 trace!(page_no, lsn, last_commit_lsn, "Implanting page");
 
                 #[allow(clippy::single_range_in_vec_init)]
@@ -747,11 +734,7 @@ impl Pages {
 
             let mut page = Page {
                 data,
-                lsn: (*self.last_commit.lock().unwrap())
-                    .as_ref()
-                    .as_ref()
-                    .unwrap()
-                    .lsn(),
+                lsn: self.last_commit.lock().unwrap().lsn(),
                 dirty: false,
             };
 
@@ -823,8 +806,8 @@ impl Pages {
         Ok(())
     }
 
-    fn flush(&self, commit: Arc<Option<Commit>>) -> io::Result<()> {
-        let lsn = (*commit).as_ref().unwrap().lsn();
+    fn flush(&self, commit: Arc<Commit>) -> io::Result<()> {
+        let lsn = commit.lsn();
         let mut pages = self.pages.lock().unwrap();
         for (page_no, page) in pages.iter_mut() {
             if page.dirty {
@@ -834,7 +817,6 @@ impl Pages {
                 page.lsn = lsn;
             }
         }
-        println!("Updating commit to {}", (*commit).as_ref().unwrap().lsn());
         *self.last_commit.lock().unwrap() = commit;
         self.driver.flush()
     }
@@ -862,7 +844,7 @@ struct Page {
 pub struct VolumeHandle {
     notify: CommitNotify,
     pages_count: PageNo,
-    commit_log: Arc<Option<Commit>>, // TODO we can get rid of this
+    commit_log: Arc<Commit>,
     pages: Arc<Pages>,
 }
 
@@ -885,7 +867,7 @@ impl VolumeHandle {
     }
 
     pub fn current_commit(&self) -> &Commit {
-        (*self.notify.commit).as_ref().unwrap()
+        self.notify.commit.as_ref()
     }
 
     pub fn advance_to_latest(&mut self) -> u64 {
@@ -905,8 +887,15 @@ impl VolumeHandle {
     }
 
     pub fn snapshot(&mut self) -> Snapshot {
-        while (*self.commit_log).as_ref().unwrap().next.load().is_some() {
-            self.commit_log = (*self.commit_log).as_ref().unwrap().next.load_full();
+        while self.commit_log.next.load().is_some() {
+            self.commit_log = self
+                .commit_log
+                .next
+                .load_full()
+                .as_ref()
+                .as_ref()
+                .unwrap()
+                .clone();
         }
 
         let snapshot = Snapshot {
@@ -922,11 +911,11 @@ impl VolumeHandle {
 #[derive(Clone)]
 pub struct CommitNotify {
     // Last processed commit.
-    commit: Arc<Option<Commit>>,
+    commit: Arc<Commit>,
     last_seen_lsn: u64,
 
     /// Latest commit that is available for reading in the volume. May be way ahead of `commit`.
-    latest_commit: Arc<(Mutex<Arc<Option<Commit>>>, Condvar)>,
+    latest_commit: Arc<(Mutex<Arc<Commit>>, Condvar)>,
     pages_count: PageNo,
 }
 
@@ -945,7 +934,7 @@ impl CommitNotify {
         // Access to `commit` is synchronized by `Arc` and most of the times we don't need to acquire
         // the lock to check if there is a new commit available. We need to acquire global lock
         // if we are contending for the latest commit in the volume.
-        let commit = (*self.commit).as_ref().unwrap();
+        let commit = Arc::clone(&self.commit);
         let current_lsn = commit.lsn();
 
         let mut latest_commit = self.latest_commit.0.lock().unwrap();
@@ -953,31 +942,30 @@ impl CommitNotify {
         //    because we speculatively checked the condition before acquiring the lock to prevent
         //    contention when possible
         // 2. spourious wakeups are possible, so we need to check the condition in a loop
-        while (*latest_commit).as_ref().as_ref().unwrap().lsn() == current_lsn {
+        while latest_commit.lsn() == current_lsn {
             latest_commit = self.latest_commit.1.wait(latest_commit).unwrap();
         }
-        let thread = thread::current();
-        let name = thread.name().unwrap_or("unnamed");
-        println!(
-            "[{}] Moved to commit {}",
-            name,
-            (*latest_commit).as_ref().as_ref().unwrap().lsn()
-        );
 
-        let next_commit = commit.next();
-        debug_assert!((*next_commit).as_ref().unwrap().lsn() > self.last_seen_lsn());
+        let next_commit = commit.next.load_full().as_ref().as_ref().unwrap().clone();
         self.commit = Arc::clone(&next_commit);
-        self.last_seen_lsn = (*self.commit).as_ref().unwrap().lsn();
-        (*self.commit).as_ref().unwrap()
+        self.last_seen_lsn = self.commit.lsn();
+        self.commit.as_ref()
     }
 
     /// Advances the `commit` to the latest commit available in the volume.
     fn advance_to_latest(&mut self) -> u64 {
-        while (*self.commit).as_ref().unwrap().next.load().is_some() {
-            self.commit = (*self.commit).as_ref().unwrap().next.load_full();
+        while self.commit.next.load().is_some() {
+            self.commit = self
+                .commit
+                .next
+                .load_full()
+                .as_ref()
+                .as_ref()
+                .unwrap()
+                .clone();
         }
-        self.last_seen_lsn = (*self.commit).as_ref().unwrap().lsn();
-        (*self.commit).as_ref().unwrap().lsn()
+        self.last_seen_lsn = self.commit.lsn();
+        self.last_seen_lsn
     }
 
     pub fn last_seen_lsn(&self) -> u64 {
@@ -1038,7 +1026,7 @@ pub trait TxWrite: TxRead {
 #[derive(Clone)]
 pub struct Snapshot {
     pages_count: PageNo,
-    commit_log: Arc<Option<Commit>>,
+    commit_log: Arc<Commit>,
     pages: Arc<Pages>,
 }
 
@@ -1068,7 +1056,7 @@ impl Snapshot {
         // Applying with undo log
         // We need to skip first entry in undo log, because it is describing how to undo the changes
         // of previously applied transaction.
-        let mut commit_log = (*self.commit_log).as_ref().unwrap().next.load_full();
+        let mut commit_log = self.commit_log.as_ref().next.load_full();
         let thread = thread::current();
         let name = thread.name().unwrap_or("unnamed");
         println!("[{}] Compensating at LSN {}", name, self.lsn());
@@ -1077,20 +1065,6 @@ impl Snapshot {
                 break;
             };
             if commit.lsn() > self.lsn() {
-                // println!(
-                //     "Applying undo patches from LSN {} to snapshot {}",
-                //     commit.lsn(),
-                //     self.lsn()
-                // );
-                if let Patch::Write(_, bytes) = &commit.undo[0] {
-                    // println!(
-                    //     "[{}] Applying undo patches from LSN {} to snapshot {}, patch: {:?}",
-                    //     name,
-                    //     commit.lsn(),
-                    //     self.lsn(),
-                    //     &bytes[0..10]
-                    // );
-                }
                 apply_patches(&commit.undo, addr as usize, &mut buf, &mut buf_mask);
             }
             commit_log = commit.next.load_full();
@@ -1100,7 +1074,7 @@ impl Snapshot {
     }
 
     pub fn lsn(&self) -> LSN {
-        (*self.commit_log).as_ref().unwrap().lsn()
+        self.commit_log.as_ref().lsn()
     }
 }
 
@@ -1133,7 +1107,7 @@ pub struct Commit {
     /// A reference to the next commit in the chain.
     ///
     /// This is updated atomically by the thread that executing commit operation.
-    next: ArcSwap<Option<Commit>>,
+    next: ArcSwap<Option<Arc<Commit>>>,
 
     /// A log sequence number (LSN) that uniquely identifies this commit.
     /// LSN numbers are monotonically increasing.
@@ -1162,8 +1136,12 @@ impl Commit {
         self.lsn
     }
 
-    pub fn next(&self) -> Arc<Option<Commit>> {
-        self.next.load_full()
+    pub fn next(&self) -> Option<Arc<Commit>> {
+        if let Some(inner) = self.next.load_full().as_ref() {
+            Some(Arc::clone(&inner))
+        } else {
+            None
+        }
     }
 }
 
@@ -1983,33 +1961,28 @@ mod tests {
         pages.read(0, &mut buf)?;
         assert_eq!(buf, [0, 0, 0]);
 
-        let commit = (*commit).as_ref().unwrap().next();
-        pages.flush(Arc::clone(&commit))?;
+        let commit = commit.next();
+        pages.flush(commit.as_ref().unwrap().clone())?;
         pages.clear_cache();
         pages.read(0, &mut buf)?;
         assert_eq!(buf, [1, 1, 1]);
 
-        let commit = (*commit).as_ref().unwrap().next();
-        pages.flush(Arc::clone(&commit))?;
+        let commit = commit.unwrap().next();
+        pages.flush(commit.as_ref().unwrap().clone())?;
         pages.clear_cache();
         pages.read(0, &mut buf)?;
         assert_eq!(buf, [2, 2, 2]);
 
-        let commit = (*commit).as_ref().unwrap().next();
-        pages.flush(Arc::clone(&commit))?;
+        let commit = commit.unwrap().next();
+        pages.flush(commit.as_ref().unwrap().clone())?;
         pages.clear_cache();
         pages.read(0, &mut buf)?;
         assert_eq!(buf, [3, 3, 3]);
 
-        // pages.write(0, &[1, 2, 3, 4, 5])?;
-
-        // pages.read(0, &mut buf)?;
-        // assert_eq!(buf, &[1, 2, 3, 4, 5]);
-
         Ok(())
     }
 
-    fn commit_log(changes: &[&[Patch]]) -> Arc<Option<Commit>> {
+    fn commit_log(changes: &[&[Patch]]) -> Arc<Commit> {
         let mut volume = Volume::new_in_memory(1);
         // Creating a snapshot before the changes are applied
         // so that it will accumulate the commit log.
