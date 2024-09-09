@@ -69,6 +69,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Condvar, Mutex,
     },
+    thread,
 };
 use tracing::{error, info, trace};
 
@@ -519,6 +520,7 @@ impl Volume {
             next: ArcSwap::from_pointee(None),
             lsn,
         };
+
         self.apply_commit(new_commit)?;
 
         Ok(lsn)
@@ -530,18 +532,34 @@ impl Volume {
         assert_patches_equals(&commit.changes, &commit.undo);
 
         let (lock, notify) = self.latest_commit.as_ref();
+        let current_lsn = self.lsn.load(Ordering::Acquire);
+        println!("Commit started {}", current_lsn + 1);
         let mut last_commit = lock.lock().unwrap();
 
-        let current_lsn = self.lsn.load(Ordering::Relaxed);
+        let current_lsn = self.lsn.load(Ordering::Acquire);
         if commit.lsn != current_lsn + 1 {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
                 "The volume was changed since the transaction was created",
             ));
         }
-        self.lsn.store(commit.lsn, Ordering::Relaxed);
+        self.lsn.store(commit.lsn, Ordering::Release);
 
-        for patch in &commit.changes {
+        let patches = commit.changes.clone();
+
+        // Updating commit log
+        let lsn = commit.lsn;
+        let changes = commit.changes.len();
+        let commit = Arc::new(Some(commit));
+        let commit_clone = Arc::clone(&commit);
+        last_commit
+            .as_ref()
+            .as_ref()
+            .expect("Commit log is missing")
+            .next
+            .store(Arc::clone(&commit));
+        // Updating pages
+        for patch in &patches {
             // TODO: make undo vec<u8> and read addr from commit.changes?
             // TODO return this check
             // let Patch::Write(_, undo) = undo else {
@@ -558,21 +576,12 @@ impl Volume {
                 Patch::Reclaim(addr, len) => self.pages.zero(*addr, *len)?,
             }
         }
-
-        // Updating commit log
-        let lsn = commit.lsn;
-        let changes = commit.changes.len();
-        let commit = Arc::new(Some(commit));
-        self.pages.flush(Arc::clone(&commit))?;
-        last_commit
-            .as_ref()
-            .as_ref()
-            .expect("Commit log is missing")
-            .next
-            .store(Arc::clone(&commit));
         *last_commit = commit;
-
+        self.pages.flush(commit_clone)?;
+        drop(last_commit);
         notify.notify_all();
+
+        println!("Commit completed {}", lsn);
         info!(lsn, changes, "Commit completed");
 
         Ok(())
@@ -581,7 +590,7 @@ impl Volume {
     pub fn commit_notify(&self) -> CommitNotify {
         let commit = self.latest_commit.0.lock().unwrap();
         CommitNotify {
-            last_seen_lsn: self.lsn.load(Ordering::Relaxed),
+            last_seen_lsn: (*commit.as_ref()).as_ref().unwrap().lsn(),
             latest_commit: Arc::clone(&self.latest_commit),
             commit: Arc::clone(&commit),
             pages_count: self.pages_count,
@@ -685,8 +694,6 @@ impl Pages {
 
             let mut data = Box::new([0; PAGE_SIZE]);
             if let Some(lsn) = self.driver.read_page(page_no, data.as_mut())? {
-                // let mut commit = Arc::clone(&self.last_commit.lock().unwrap());
-
                 let current_commit =
                     Arc::clone(&self.last_commit.lock().expect("No commit was given"));
                 let mut last_commit_lsn = (*current_commit)
@@ -761,6 +768,7 @@ impl Pages {
 
     fn read(&self, addr: Addr, buf: &mut [u8]) -> io::Result<()> {
         let segments = PageSegments::new(addr, buf.len());
+        println!("---");
         for (addr, slice_range) in segments {
             let (page_no, offset) = split_ptr(addr);
             let offset = offset as usize;
@@ -770,6 +778,12 @@ impl Pages {
             let buf_slice = &mut buf[slice_range];
             self.with_page(page_no, move |page| {
                 let page_range = offset..offset + len;
+                println!(
+                    "Reading page {}/{} - {:?}",
+                    page_no,
+                    page.lsn,
+                    &page.data[0..4]
+                );
                 buf_slice.copy_from_slice(&page.data[page_range]);
             })?;
         }
@@ -785,6 +799,7 @@ impl Pages {
             let len = slice_range.len();
 
             self.with_page_opt(page_no, move |page| {
+                println!("Writing page {} - {:?}", page_no, &buf[0..4]);
                 let slice_range = slice_range.clone();
                 let page_range = offset..offset + len;
                 let page_buf = page.data.as_mut_slice();
@@ -817,7 +832,7 @@ impl Pages {
         let mut pages = self.pages.lock().unwrap();
         for (page_no, page) in pages.iter_mut() {
             if page.dirty {
-                println!("Flushing page: {}", page_no);
+                info!(page_no, "Flushing page");
                 self.driver.write_page(*page_no, page.data.as_ref(), lsn)?;
                 page.dirty = false;
                 page.lsn = lsn;
@@ -862,7 +877,9 @@ impl VolumeHandle {
     /// It might be several snapshots ahead of the last seen snapshot.
     pub fn wait(&mut self) -> Snapshot {
         // TODO: this is incorrect, we should return not the next, but latest snapshot
-        self.notify.next_commit();
+        let last_lsn = self.notify.last_seen_lsn();
+        let commit = self.notify.next_commit();
+        debug_assert!(commit.lsn() == last_lsn + 1);
 
         Snapshot {
             pages_count: self.pages_count,
@@ -933,15 +950,24 @@ impl CommitNotify {
         // the lock to check if there is a new commit available. We need to acquire global lock
         // if we are contending for the latest commit in the volume.
         let commit = (*self.commit).as_ref().unwrap();
+        let current_lsn = commit.lsn();
+        // TODO puta :)
         if commit.next().is_none() {
             let mut latest_commit = self.latest_commit.0.lock().unwrap();
             // 1. Need to check again after acquiring the lock, otherwise it is a race condition
             //    because we speculatively checked the condition before acquiring the lock to prevent
             //    contention when possible
             // 2. spourious wakeups are possible, so we need to check the condition in a loop
-            while commit.next().is_none() {
+            while (*latest_commit).as_ref().as_ref().unwrap().lsn() == current_lsn {
                 latest_commit = self.latest_commit.1.wait(latest_commit).unwrap();
             }
+            let thread = thread::current();
+            let name = thread.name().unwrap_or("unnamed");
+            println!(
+                "[{}] Moved to commit {}",
+                name,
+                (*latest_commit).as_ref().as_ref().unwrap().lsn()
+            );
         }
         let next_commit = commit.next();
         debug_assert!((*next_commit).as_ref().unwrap().lsn() > self.last_seen_lsn());
@@ -1048,13 +1074,28 @@ impl Snapshot {
         // We need to skip first entry in undo log, because it is describing how to undo the changes
         // of previously applied transaction.
         let mut commit_log = (*self.commit_log).as_ref().unwrap().next.load_full();
+        let thread = thread::current();
+        let name = thread.name().unwrap_or("unnamed");
+        println!("[{}] Compensating at LSN {}", name, self.lsn());
         while let Some(commit) = commit_log.as_ref() {
-            if commit.lsn > self.lsn() {
-                println!(
-                    "Applying undo code from LSN {} to snapshot {}",
-                    commit.lsn(),
-                    self.lsn()
-                );
+            if buf_mask.is_empty() {
+                break;
+            };
+            if commit.lsn() > self.lsn() {
+                // println!(
+                //     "Applying undo patches from LSN {} to snapshot {}",
+                //     commit.lsn(),
+                //     self.lsn()
+                // );
+                if let Patch::Write(_, bytes) = &commit.undo[0] {
+                    println!(
+                        "[{}] Applying undo patches from LSN {} to snapshot {}, patch: {:?}",
+                        name,
+                        commit.lsn(),
+                        self.lsn(),
+                        &bytes[0..10]
+                    );
+                }
                 apply_patches(&commit.undo, addr as usize, &mut buf, &mut buf_mask);
             }
             commit_log = commit.next.load_full();
@@ -1860,13 +1901,19 @@ mod tests {
                 .unwrap()
         }
 
-        fn check_transaction_consistency(mut handle: VolumeHandle) {
-            let mut lsn = 0u64;
-            while lsn < TRANSACTIONS as u64 {
+        fn check_transaction_consistency(mut handle: VolumeHandle) -> io::Result<()> {
+            for _ in 0..TRANSACTIONS {
                 let snapshot = handle.wait();
-                lsn = snapshot.lsn();
-                assert_eq!(wrapping_sum(&snapshot), 0);
+                let sum = wrapping_sum(&snapshot);
+                if sum != 0 {
+                    let lsn = snapshot.lsn();
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Wrapping sum is {} on LSN: {} (should be 0)", sum, lsn),
+                    ));
+                }
             }
+            Ok(())
         }
 
         let mut rng = SmallRng::from_entropy();
@@ -1896,7 +1943,68 @@ mod tests {
         }
 
         for join in join_handles {
-            join.join().unwrap();
+            join.join().unwrap()?;
+        }
+
+        Ok(())
+    }
+
+    /// This tests writes random data to the volume in a way that the total sum of all bytes is always 0.
+    /// It then checks that the sum is still 0 when observing volume snapshots from a different thread.
+    #[test]
+    fn consistency_simple_check() -> io::Result<()> {
+        const PAGES: usize = 2;
+        const SIZE: usize = PAGE_SIZE * PAGES;
+        const TRANSACTIONS: usize = 5;
+
+        fn check_transaction_consistency(mut handle: VolumeHandle) -> io::Result<()> {
+            for i in 1..=TRANSACTIONS {
+                let snapshot = handle.wait();
+                let buf = snapshot.read(0, SIZE);
+                let correct = buf.iter().all(|b| *b == i as u8);
+                if !correct {
+                    let lsn = snapshot.lsn();
+                    let mismatch = buf.iter().position(|b| *b != i as u8).unwrap();
+                    let values = &buf[mismatch..(mismatch + 10)];
+                    let thread = thread::current();
+                    let name = thread.name().unwrap_or("unnamed");
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "[{}] LSN: {}, expected: {}, got: {:?} at [{}..]",
+                            name, lsn, i, values, mismatch
+                        ),
+                    ));
+                }
+            }
+            Ok(())
+        }
+
+        let mut volume = Volume::new_in_memory(PAGES as PageNo);
+        let mut join_handles = vec![];
+
+        // Spawn 4 threads that will check the consistency of the volume snapshots.
+        for i in 0..20 {
+            let handle = volume.handle();
+            let join = thread::Builder::new()
+                .name(format!("consistency_check-{}", i))
+                .spawn(move || check_transaction_consistency(handle))
+                .unwrap();
+            // thread::spawn(move || check_transaction_consistency(handle));
+            join_handles.push(join);
+        }
+
+        // Write random patches to the volume and correct the first byte to keep the sum 0.
+        for i in 1..=TRANSACTIONS {
+            let buf = vec![i as u8; SIZE];
+
+            let mut tx = volume.start();
+            tx.write(0, buf.as_slice());
+            volume.commit(tx)?;
+        }
+
+        for join in join_handles {
+            join.join().unwrap()?;
         }
 
         Ok(())

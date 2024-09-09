@@ -42,7 +42,6 @@ impl PageDriver for NoDriver {
     }
 
     fn write_page(&self, page_no: PageNo, page: &[u8; PAGE_SIZE], lsn: LSN) -> io::Result<()> {
-        println!("Writing page {}/{}", page_no, lsn);
         let mut pages = self.pages.lock().unwrap();
         pages.insert(page_no, (lsn, Box::new(*page)));
         Ok(())
