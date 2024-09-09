@@ -768,7 +768,6 @@ impl Pages {
 
     fn read(&self, addr: Addr, buf: &mut [u8]) -> io::Result<()> {
         let segments = PageSegments::new(addr, buf.len());
-        println!("---");
         for (addr, slice_range) in segments {
             let (page_no, offset) = split_ptr(addr);
             let offset = offset as usize;
@@ -778,12 +777,6 @@ impl Pages {
             let buf_slice = &mut buf[slice_range];
             self.with_page(page_no, move |page| {
                 let page_range = offset..offset + len;
-                println!(
-                    "Reading page {}/{} - {:?}",
-                    page_no,
-                    page.lsn,
-                    &page.data[0..4]
-                );
                 buf_slice.copy_from_slice(&page.data[page_range]);
             })?;
         }
@@ -799,7 +792,6 @@ impl Pages {
             let len = slice_range.len();
 
             self.with_page_opt(page_no, move |page| {
-                println!("Writing page {} - {:?}", page_no, &buf[0..4]);
                 let slice_range = slice_range.clone();
                 let page_range = offset..offset + len;
                 let page_buf = page.data.as_mut_slice();
@@ -951,24 +943,23 @@ impl CommitNotify {
         // if we are contending for the latest commit in the volume.
         let commit = (*self.commit).as_ref().unwrap();
         let current_lsn = commit.lsn();
-        // TODO puta :)
-        if commit.next().is_none() {
-            let mut latest_commit = self.latest_commit.0.lock().unwrap();
-            // 1. Need to check again after acquiring the lock, otherwise it is a race condition
-            //    because we speculatively checked the condition before acquiring the lock to prevent
-            //    contention when possible
-            // 2. spourious wakeups are possible, so we need to check the condition in a loop
-            while (*latest_commit).as_ref().as_ref().unwrap().lsn() == current_lsn {
-                latest_commit = self.latest_commit.1.wait(latest_commit).unwrap();
-            }
-            let thread = thread::current();
-            let name = thread.name().unwrap_or("unnamed");
-            println!(
-                "[{}] Moved to commit {}",
-                name,
-                (*latest_commit).as_ref().as_ref().unwrap().lsn()
-            );
+
+        let mut latest_commit = self.latest_commit.0.lock().unwrap();
+        // 1. Need to check again after acquiring the lock, otherwise it is a race condition
+        //    because we speculatively checked the condition before acquiring the lock to prevent
+        //    contention when possible
+        // 2. spourious wakeups are possible, so we need to check the condition in a loop
+        while (*latest_commit).as_ref().as_ref().unwrap().lsn() == current_lsn {
+            latest_commit = self.latest_commit.1.wait(latest_commit).unwrap();
         }
+        let thread = thread::current();
+        let name = thread.name().unwrap_or("unnamed");
+        println!(
+            "[{}] Moved to commit {}",
+            name,
+            (*latest_commit).as_ref().as_ref().unwrap().lsn()
+        );
+
         let next_commit = commit.next();
         debug_assert!((*next_commit).as_ref().unwrap().lsn() > self.last_seen_lsn());
         self.commit = Arc::clone(&next_commit);
@@ -1088,13 +1079,13 @@ impl Snapshot {
                 //     self.lsn()
                 // );
                 if let Patch::Write(_, bytes) = &commit.undo[0] {
-                    println!(
-                        "[{}] Applying undo patches from LSN {} to snapshot {}, patch: {:?}",
-                        name,
-                        commit.lsn(),
-                        self.lsn(),
-                        &bytes[0..10]
-                    );
+                    // println!(
+                    //     "[{}] Applying undo patches from LSN {} to snapshot {}, patch: {:?}",
+                    //     name,
+                    //     commit.lsn(),
+                    //     self.lsn(),
+                    //     &bytes[0..10]
+                    // );
                 }
                 apply_patches(&commit.undo, addr as usize, &mut buf, &mut buf_mask);
             }
@@ -1892,6 +1883,7 @@ mod tests {
         const SIZE: usize = PAGE_SIZE * PAGES;
         const PATCH_LEN: usize = 100;
         const TRANSACTIONS: usize = 100;
+        const THREADS: usize = 20;
 
         fn wrapping_sum(tx: &impl TxRead) -> u8 {
             tx.read(0, SIZE)
@@ -1902,8 +1894,9 @@ mod tests {
         }
 
         fn check_transaction_consistency(mut handle: VolumeHandle) -> io::Result<()> {
-            for _ in 0..TRANSACTIONS {
+            for i in 1..=TRANSACTIONS {
                 let snapshot = handle.wait();
+                assert_eq!(i as LSN, snapshot.lsn());
                 let sum = wrapping_sum(&snapshot);
                 if sum != 0 {
                     let lsn = snapshot.lsn();
@@ -1922,8 +1915,8 @@ mod tests {
         let mut volume = Volume::new_in_memory(PAGES as PageNo);
         let mut join_handles = vec![];
 
-        // Spawn 4 threads that will check the consistency of the volume snapshots.
-        for _ in 0..4 {
+        // Spawn threads that will check the consistency of the volume snapshots.
+        for _ in 0..THREADS {
             let handle = volume.handle();
             let join = thread::spawn(move || check_transaction_consistency(handle));
             join_handles.push(join);
@@ -1937,69 +1930,8 @@ mod tests {
             let mut tx = volume.start();
             tx.write(offset as Addr, patch.as_slice());
             let sum = wrapping_sum(&tx);
-            let corrector = 255 - sum.wrapping_sub(tx.read(0, 1)[0]).wrapping_sub(1);
-            tx.write(0, [corrector]);
-            volume.commit(tx)?;
-        }
-
-        for join in join_handles {
-            join.join().unwrap()?;
-        }
-
-        Ok(())
-    }
-
-    /// This tests writes random data to the volume in a way that the total sum of all bytes is always 0.
-    /// It then checks that the sum is still 0 when observing volume snapshots from a different thread.
-    #[test]
-    fn consistency_simple_check() -> io::Result<()> {
-        const PAGES: usize = 2;
-        const SIZE: usize = PAGE_SIZE * PAGES;
-        const TRANSACTIONS: usize = 5;
-
-        fn check_transaction_consistency(mut handle: VolumeHandle) -> io::Result<()> {
-            for i in 1..=TRANSACTIONS {
-                let snapshot = handle.wait();
-                let buf = snapshot.read(0, SIZE);
-                let correct = buf.iter().all(|b| *b == i as u8);
-                if !correct {
-                    let lsn = snapshot.lsn();
-                    let mismatch = buf.iter().position(|b| *b != i as u8).unwrap();
-                    let values = &buf[mismatch..(mismatch + 10)];
-                    let thread = thread::current();
-                    let name = thread.name().unwrap_or("unnamed");
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "[{}] LSN: {}, expected: {}, got: {:?} at [{}..]",
-                            name, lsn, i, values, mismatch
-                        ),
-                    ));
-                }
-            }
-            Ok(())
-        }
-
-        let mut volume = Volume::new_in_memory(PAGES as PageNo);
-        let mut join_handles = vec![];
-
-        // Spawn 4 threads that will check the consistency of the volume snapshots.
-        for i in 0..20 {
-            let handle = volume.handle();
-            let join = thread::Builder::new()
-                .name(format!("consistency_check-{}", i))
-                .spawn(move || check_transaction_consistency(handle))
-                .unwrap();
-            // thread::spawn(move || check_transaction_consistency(handle));
-            join_handles.push(join);
-        }
-
-        // Write random patches to the volume and correct the first byte to keep the sum 0.
-        for i in 1..=TRANSACTIONS {
-            let buf = vec![i as u8; SIZE];
-
-            let mut tx = volume.start();
-            tx.write(0, buf.as_slice());
+            let delta = 255 - sum.wrapping_sub(tx.read(0, 1)[0]).wrapping_sub(1);
+            tx.write(0, [delta]);
             volume.commit(tx)?;
         }
 
@@ -2064,11 +1996,6 @@ mod tests {
         pages.clear_cache();
         pages.read(0, &mut buf)?;
         assert_eq!(buf, [3, 3, 3]);
-
-        // pages.write(0, &[1, 2, 3, 4, 5])?;
-
-        // pages.read(0, &mut buf)?;
-        // assert_eq!(buf, &[1, 2, 3, 4, 5]);
 
         Ok(())
     }
