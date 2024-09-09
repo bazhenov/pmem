@@ -935,15 +935,14 @@ impl CommitNotify {
         // the lock to check if there is a new commit available. We need to acquire global lock
         // if we are contending for the latest commit in the volume.
         let commit = Arc::clone(&self.commit);
-        let current_lsn = commit.lsn();
 
-        let mut latest_commit = self.latest_commit.0.lock().unwrap();
+        let mut lock = self.latest_commit.0.lock().unwrap();
         // 1. Need to check again after acquiring the lock, otherwise it is a race condition
         //    because we speculatively checked the condition before acquiring the lock to prevent
         //    contention when possible
         // 2. spourious wakeups are possible, so we need to check the condition in a loop
-        while latest_commit.lsn() == current_lsn {
-            latest_commit = self.latest_commit.1.wait(latest_commit).unwrap();
+        while commit.next().is_none() {
+            lock = self.latest_commit.1.wait(lock).unwrap();
         }
 
         let next_commit = commit.next.load_full().as_ref().as_ref().unwrap().clone();
