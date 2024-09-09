@@ -1,6 +1,6 @@
 use pmem::{
     driver::PageDriver,
-    volume::{Addr, Commit, PageNo, Patch, TxRead, TxWrite, Volume, VolumeHandle, LSN, PAGE_SIZE},
+    volume::{Addr, Commit, PageNo, Patch, TxRead, Volume, VolumeHandle, LSN, PAGE_SIZE},
 };
 use protocol::{Message, PROTOCOL_VERSION};
 use std::{
@@ -11,7 +11,7 @@ use tokio::{
     sync::{self, mpsc, oneshot},
     task::JoinHandle,
 };
-use tracing::{event, info, instrument, span, trace, warn, Level};
+use tracing::{info, instrument, span, trace, warn, Level};
 
 mod protocol;
 

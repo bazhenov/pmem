@@ -1,10 +1,9 @@
-use ::tracing::info;
 use pmem::volume::{Addr, Snapshot, Transaction, TxRead, TxWrite, Volume, VolumeHandle, PAGE_SIZE};
 use replication::{replica_connect, start_replication_server};
-use std::{io, net::SocketAddr, thread};
+use std::{io, net::SocketAddr};
 use tokio::task::{spawn_blocking, JoinHandle};
-
-mod tracing;
+use tracing::info;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 #[tokio::test]
 async fn check_replication_simple_case() -> io::Result<()> {
@@ -21,8 +20,6 @@ async fn check_replication_simple_case() -> io::Result<()> {
 
 #[tokio::test]
 async fn check_replication_work_if_connected_later() -> io::Result<()> {
-    tracing::init_tracing();
-
     let mut net = MasterAndReplica::new().await?;
 
     let bytes = [1, 2, 3, 4];
@@ -111,4 +108,15 @@ impl MasterAndReplica {
 
         self.slave_snapshot()
     }
+}
+
+#[allow(unused)]
+pub(crate) fn init_tracing() {
+    let fmt_layer = tracing_subscriber::fmt::layer().with_writer(io::stderr);
+    let filter_layer = EnvFilter::from_default_env();
+
+    tracing_subscriber::registry()
+        .with(fmt_layer)
+        .with(filter_layer)
+        .init();
 }

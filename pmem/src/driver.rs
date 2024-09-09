@@ -29,7 +29,6 @@ impl Default for NoDriver {
 
 impl PageDriver for NoDriver {
     fn read_page(&self, page_no: PageNo, buf: &mut [u8; PAGE_SIZE]) -> io::Result<Option<LSN>> {
-        println!("Trying to read page {}", page_no);
         let pages = self.pages.lock().unwrap();
         if let Some((lsn, page)) = pages.get(&page_no) {
             buf.copy_from_slice(page.as_slice());

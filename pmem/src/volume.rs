@@ -69,7 +69,6 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Condvar, Mutex,
     },
-    thread,
 };
 use tracing::{error, info, trace};
 
@@ -688,12 +687,6 @@ impl Pages {
                 let mut buf_mask = vec![0..PAGE_SIZE];
 
                 while let Some(com) = commit.as_ref() {
-                    println!(
-                        "Applying {} to a a page LSN: {}, data: {:?}",
-                        com.lsn(),
-                        lsn,
-                        com.undo()
-                    );
                     if buf_mask.is_empty() || com.lsn() > lsn {
                         break;
                     }
@@ -709,7 +702,7 @@ impl Pages {
                 }
                 assert!(
                     last_commit_lsn == lsn,
-                    "Can not compensate page no. {} with lsn {}. Last commit LSN is {}",
+                    "Could not compensate page no. {} with lsn {}. Last commit LSN is {}",
                     page_no,
                     lsn,
                     last_commit_lsn
@@ -1033,16 +1026,13 @@ impl Snapshot {
         #[allow(clippy::single_range_in_vec_init)]
         let mut buf_mask = vec![0..len];
 
-        // Apply own uncommitted changes
+        // Apply own uncommitted changes from the given transaction
         apply_patches(uncommitted, addr as usize, &mut buf, &mut buf_mask);
 
         // Applying with undo log
         // We need to skip first entry in undo log, because it is describing how to undo the changes
-        // of previously applied transaction.
+        // of current snapshot itself.
         let mut commit_log = self.commit_log.as_ref().next.load_full();
-        let thread = thread::current();
-        let name = thread.name().unwrap_or("unnamed");
-        println!("[{}] Compensating at LSN {}", name, self.lsn());
         while let Some(commit) = commit_log.as_ref() {
             if buf_mask.is_empty() {
                 break;
@@ -1057,7 +1047,7 @@ impl Snapshot {
     }
 
     pub fn lsn(&self) -> LSN {
-        self.commit_log.as_ref().lsn()
+        self.commit_log.lsn()
     }
 }
 
