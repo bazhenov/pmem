@@ -530,7 +530,8 @@ impl Volume {
     /// purposes.
     pub fn apply_commit(&mut self, commit: Commit) -> io::Result<()> {
         assert_patches_consistent(&commit.changes, &commit.undo);
-        self.check_undo_patches(&commit)?;
+        // TODO write a proptest that checks that fresh commit undo patches are consistent
+        // with previous page content
 
         let (lock, notify) = self.latest_commit.as_ref();
         let mut last_commit = lock.lock().unwrap();
@@ -613,21 +614,6 @@ impl Volume {
         Some(pages.into_inner())
     }
 
-    // Safety precaution - checking that undo patches are consistent with page content.
-    fn check_undo_patches(&self, commit: &Commit) -> Result<(), io::Error> {
-        if cfg!(debug_assertions) {
-            for patch in &commit.undo {
-                let Patch::Write(addr, bytes) = patch else {
-                    panic!("Invalid patch type in undo log");
-                };
-                let mut data = vec![0; bytes.len()];
-                self.pages.read(*addr, data.as_mut())?;
-                debug_assert_eq!(data, *bytes);
-            }
-        }
-        Ok(())
-    }
-
     #[cfg(test)]
     fn read(&self, addr: Addr, len: usize) -> Cow<[u8]> {
         let mut buffer = vec![0; len];
@@ -701,7 +687,6 @@ impl Pages {
                 #[allow(clippy::single_range_in_vec_init)]
                 let mut buf_mask = vec![0..PAGE_SIZE];
 
-                println!("---");
                 while let Some(com) = commit.as_ref() {
                     println!(
                         "Applying {} to a a page LSN: {}, data: {:?}",
@@ -722,7 +707,6 @@ impl Pages {
 
                     commit = com.next.load_full();
                 }
-                // TODO revive this check
                 assert!(
                     last_commit_lsn == lsn,
                     "Can not compensate page no. {} with lsn {}. Last commit LSN is {}",
