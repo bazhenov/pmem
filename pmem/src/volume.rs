@@ -529,11 +529,10 @@ impl Volume {
     /// This is internal function and is not supposed to be used by the end user. Made public for replication
     /// purposes.
     pub fn apply_commit(&mut self, commit: Commit) -> io::Result<()> {
-        assert_patches_equals(&commit.changes, &commit.undo);
+        assert_patches_consistent(&commit.changes, &commit.undo);
+        self.check_undo_patches(&commit)?;
 
         let (lock, notify) = self.latest_commit.as_ref();
-        let current_lsn = self.lsn.load(Ordering::Acquire);
-        println!("Commit started {}", current_lsn + 1);
         let mut last_commit = lock.lock().unwrap();
 
         let current_lsn = self.lsn.load(Ordering::Acquire);
@@ -548,6 +547,8 @@ impl Volume {
         let patches = commit.changes.clone();
 
         // Updating commit log
+        // We need to update commit log before updating pages. Reading process should always have
+        // undo logs to be able to rollback in-flight ch
         let lsn = commit.lsn;
         let changes = commit.changes.len();
         let commit = Arc::new(Some(commit));
@@ -558,32 +559,20 @@ impl Volume {
             .expect("Commit log is missing")
             .next
             .store(Arc::clone(&commit));
-        // Updating pages
+        *last_commit = commit;
+
+        // Updating page content
         for patch in &patches {
-            // TODO: make undo vec<u8> and read addr from commit.changes?
-            // TODO return this check
-            // let Patch::Write(_, undo) = undo else {
-            //     panic!("Undo can only be of type `Patch::Write`");
-            // };
-            // debug_assert_eq!(
-            //     &undo[slice_range.clone()],
-            //     &page[page_range.clone()],
-            //     "Undo patch is not consistent with the current page content"
-            // );
-            // Applying change to the page
             match patch {
                 Patch::Write(addr, data) => self.pages.write(*addr, data)?,
                 Patch::Reclaim(addr, len) => self.pages.zero(*addr, *len)?,
             }
         }
-        *last_commit = commit;
         self.pages.flush(commit_clone)?;
-        drop(last_commit);
+
         notify.notify_all();
 
-        println!("Commit completed {}", lsn);
         info!(lsn, changes, "Commit completed");
-
         Ok(())
     }
 
@@ -630,6 +619,21 @@ impl Volume {
         Some(pages.into_inner())
     }
 
+    // Safety precaution - checking that undo patches are consistent with page content.
+    fn check_undo_patches(&self, commit: &Commit) -> Result<(), io::Error> {
+        if cfg!(debug_assertions) {
+            for patch in &commit.undo {
+                let Patch::Write(addr, bytes) = patch else {
+                    panic!("Invalid patch type in undo log");
+                };
+                let mut data = vec![0; bytes.len()];
+                self.pages.read(*addr, data.as_mut())?;
+                debug_assert_eq!(data, *bytes);
+            }
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     fn read(&self, addr: Addr, len: usize) -> Cow<[u8]> {
         let mut buffer = vec![0; len];
@@ -641,7 +645,7 @@ impl Volume {
     }
 }
 
-fn assert_patches_equals(changes: &[Patch], undo: &[Patch]) {
+fn assert_patches_consistent(changes: &[Patch], undo: &[Patch]) {
     assert_eq!(
         changes.len(),
         undo.len(),
@@ -1996,6 +2000,11 @@ mod tests {
         pages.clear_cache();
         pages.read(0, &mut buf)?;
         assert_eq!(buf, [3, 3, 3]);
+
+        // pages.write(0, &[1, 2, 3, 4, 5])?;
+
+        // pages.read(0, &mut buf)?;
+        // assert_eq!(buf, &[1, 2, 3, 4, 5]);
 
         Ok(())
     }
