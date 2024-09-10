@@ -1,6 +1,6 @@
-use std::io;
-
 use rfs::{Filesystem, FsTree};
+use std::io;
+use tokio::task::spawn_blocking;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 #[tokio::main]
@@ -21,7 +21,9 @@ async fn main() {
         let snapshot = volume.wait();
         println!("New snapshot LSN: {}", snapshot.lsn());
 
-        let fs = Filesystem::open(snapshot);
-        println!("{:?}", FsTree(&fs));
+        spawn_blocking(move || {
+            let fs = Filesystem::open(snapshot);
+            println!("{:?}", FsTree(&fs));
+        });
     }
 }

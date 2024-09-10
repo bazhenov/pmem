@@ -70,7 +70,7 @@ use std::{
         Arc, Condvar, Mutex,
     },
 };
-use tracing::{error, info, trace};
+use tracing::{debug, error, info, trace};
 
 pub const PAGE_SIZE_BITS: usize = 16;
 
@@ -443,6 +443,25 @@ impl Volume {
         Self::new_with_driver(page_cnt, NoDriver::default())
     }
 
+    // TODO page_cnt should be saved with driver
+    pub fn from_commit(
+        page_cnt: PageNo,
+        commit: Commit,
+        driver: impl PageDriver + 'static,
+    ) -> Self {
+        let commit = Arc::new(commit);
+        let pages = Arc::new(Pages::new(driver, commit.clone()));
+        let lsn = commit.lsn;
+        let pages_count = page_cnt;
+        let latest_commit = Arc::new((Mutex::new(commit), Condvar::new()));
+        Self {
+            pages,
+            pages_count,
+            lsn: AtomicU64::new(lsn),
+            latest_commit,
+        }
+    }
+
     pub fn with_capacity(bytes: usize) -> Self {
         let pages = (bytes + PAGE_SIZE) / PAGE_SIZE;
         let pages = u32::try_from(pages).expect("Too large capacity for the volume");
@@ -794,7 +813,7 @@ impl Pages {
         let mut pages = self.pages.lock().unwrap();
         for (page_no, page) in pages.iter_mut() {
             if page.dirty {
-                info!(page_no, "Flushing page");
+                debug!(page_no, "Flushing page");
                 self.driver.write_page(*page_no, page.data.as_ref(), lsn)?;
                 page.dirty = false;
                 page.lsn = lsn;
@@ -1955,6 +1974,24 @@ mod tests {
         assert_eq!(buf, [3, 3, 3]);
 
         Ok(())
+    }
+
+    #[test]
+    fn volume_can_be_created_from_initial_commit() {
+        let commit_log = commit_log(&[
+            &[Patch::Write(0, vec![1, 2, 3])],
+            &[Patch::Write(3, vec![4, 5, 6])],
+        ]);
+
+        // Skipping commit 0 (initial) and 1
+        // TODO move to Commit::advance()/Commit::latest()
+        let commit = commit_log.next().as_ref().unwrap().next();
+        drop(commit_log);
+        let commit = Arc::into_inner(commit.unwrap()).expect("Unable to take ownership of commit");
+        println!("Commit LSN: {}", commit.lsn());
+
+        let volume = Volume::from_commit(1, commit, NoDriver::default());
+        assert_eq!(volume.snapshot().lsn(), 2);
     }
 
     fn commit_log(changes: &[&[Patch]]) -> Arc<Commit> {

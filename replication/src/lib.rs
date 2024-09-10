@@ -11,7 +11,7 @@ use tokio::{
     sync::{self, mpsc},
     task::JoinHandle,
 };
-use tracing::{info, instrument, span, trace, warn, Level};
+use tracing::{debug, info, instrument, span, trace, warn, Level};
 
 mod protocol;
 
@@ -143,10 +143,9 @@ pub async fn replica_connect(
 
     let (tx, rx) = request_reply::channel();
     let driver = NetworkDriver { tx };
-    let mut volume = Volume::new_with_driver(pages, driver);
 
     // Receveing initial commit from the server
-    {
+    let volume = {
         let mut assembler = PacketAssembler::default();
         loop {
             let msg = Message::read_from(pin!(&mut socket)).await?;
@@ -154,20 +153,21 @@ pub async fn replica_connect(
                 let AssembledCommand::Commit(lsn, redo, undo) = command else {
                     return io_result("Invalid message: initial commit expected");
                 };
-                trace!(lsn, "Received initial commit from server");
-                if lsn == 0 {
+                debug!(lsn, "Received initial commit from server");
+                break if lsn == 0 {
                     // Don't need to do nothing, because master has not commits (the volume is empty)
                     // Need to check it is indeed the empty initial commit
                     assert!(redo.is_empty(), "Initial commit must be empty");
+                    Volume::new_with_driver(pages, driver)
                 } else {
                     let commit = Commit::new(redo, undo, lsn);
-                    volume.apply_commit(commit)?;
-                    info!(lsn, "Initial commit applied to volume");
-                }
-                break;
+                    Volume::from_commit(pages, commit, driver)
+                };
             }
         }
-    }
+    };
+
+    debug!("Replicated volume created");
 
     let read_handle = volume.handle();
     let join_handle = tokio::spawn(client_worker(socket, volume, rx));
