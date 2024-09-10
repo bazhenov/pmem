@@ -15,8 +15,10 @@ pub trait PageDriver: Send + Sync {
     fn flush(&self) -> io::Result<()>;
 }
 
+type PageAndLsn = (LSN, Box<[u8; PAGE_SIZE]>);
+
 pub struct NoDriver {
-    pages: Mutex<BTreeMap<PageNo, (LSN, Box<[u8; PAGE_SIZE]>)>>,
+    pages: Mutex<BTreeMap<PageNo, PageAndLsn>>,
 }
 
 impl Default for NoDriver {

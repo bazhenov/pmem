@@ -8,7 +8,7 @@ use std::{
 };
 use tokio::{
     net::{TcpListener, TcpStream, ToSocketAddrs},
-    sync::{self, mpsc, oneshot},
+    sync::{self, mpsc},
     task::JoinHandle,
 };
 use tracing::{info, instrument, span, trace, warn, Level};
@@ -141,7 +141,7 @@ pub async fn replica_connect(
         return io_result("Invalid protocol version");
     }
 
-    let (tx, rx) = mpsc::channel(100);
+    let (tx, rx) = request_reply::channel();
     let driver = NetworkDriver { tx };
     let mut volume = Volume::new_with_driver(pages, driver);
 
@@ -179,10 +179,7 @@ pub async fn replica_connect(
 async fn client_worker(
     mut client: TcpStream,
     mut volume: Volume,
-    mut rx: mpsc::Receiver<(
-        PageNo,
-        oneshot::Sender<io::Result<(Box<[u8; PAGE_SIZE]>, LSN)>>,
-    )>,
+    mut rx: request_reply::RequestReceiver<PageNo, PageAndLsn>,
 ) -> io::Result<()> {
     let mut assembler = PacketAssembler::default();
     let mut inflight_pages = HashMap::new();
@@ -210,10 +207,10 @@ async fn client_worker(
 
     loop {
         tokio::select! {
-            Some((page_no, rx)) = rx.recv() => {
+            Some((page_no, reply)) = rx.recv() => {
                 corelation_id += 1;
                 trace!(page = page_no, cid = corelation_id, "Requesting page from network");
-                inflight_pages.insert(corelation_id, (page_no, rx));
+                inflight_pages.insert(corelation_id, (page_no, reply));
                 Message::PageRequest(corelation_id, page_no).write_to(write.as_mut()).await?;
             }
             msg = Message::read_from(read.as_mut()) => {
@@ -225,18 +222,16 @@ async fn client_worker(
                                 patches = redo.len(),
                                 "Received snapshot from master"
                             );
-                            commit_tx.send((lsn, redo, undo)).await.expect("Unable to send page to client");
+                            commit_tx.send((lsn, redo, undo)).await.expect("Commit loop is broken");
                         }
                         AssembledCommand::Page(corelation_id, lsn, data) => {
                             if let Some((page_no, tx)) = inflight_pages.remove(&corelation_id) {
-                                trace!(page_no = page_no, lsn = lsn, "Received page");
-
                                 // TODO: page type should be consistent
-                                tx.send(Ok((data.try_into().unwrap(), lsn))).expect("Unable to send page to client");
-                            }else{
-                                warn!(cid = corelation_id, "Page not requested")
+                                let _ = tx.reply(Ok((data.try_into().unwrap(), lsn)));
+                                trace!(page_no = page_no, lsn = lsn, "Received page");
+                            } else {
+                                warn!(cid = corelation_id, "Spourious page detected")
                             }
-
                         }
                     }
                 }
@@ -291,23 +286,16 @@ pub async fn next_snapshot(mut socket: &mut TcpStream) -> io::Result<(LSN, Vec<P
     }
 }
 
+type PageAndLsn = io::Result<(Box<[u8; PAGE_SIZE]>, LSN)>;
+
 struct NetworkDriver {
-    tx: mpsc::Sender<(
-        PageNo,
-        oneshot::Sender<io::Result<(Box<[u8; PAGE_SIZE]>, LSN)>>,
-    )>,
+    tx: request_reply::Sender<PageNo, PageAndLsn>,
 }
 
 impl PageDriver for NetworkDriver {
     #[instrument(skip(self, page), err, ret(level = "trace"))]
     fn read_page(&self, page_no: PageNo, page: &mut [u8; PAGE_SIZE]) -> io::Result<Option<LSN>> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.tx
-            .blocking_send((page_no, reply_tx))
-            .map_err(|_| io_error("Unable to send request"))?;
-        let (remote_page, lsn) = reply_rx
-            .blocking_recv()
-            .map_err(|_| io_error("Unable to recv response"))??;
+        let (remote_page, lsn) = self.tx.blocking_send(page_no)??;
         page.copy_from_slice(remote_page.as_ref());
 
         // TODO there can be be None
@@ -329,4 +317,75 @@ pub(crate) fn io_result<T>(error: &str) -> io::Result<T> {
 
 pub(crate) fn io_error(error: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error)
+}
+
+/// Simple request-reply channel. An abstraction over one mpsc channel. and a oneshot channel that is
+/// used to send the reply back.
+///
+/// Can be used in a following way:
+/// ```no_run
+/// # use tokio;
+/// use replication::request_reply;
+///
+/// let (sender, mut receiver) = request_reply::channel::<u32, String>();
+///
+/// // Spawn a task to handle requests
+/// tokio::spawn(async move {
+///     while let Some((request, reply)) = receiver.recv().await {
+///         let response = format!("Processed request: {}", request);
+///         let _ = reply.reply(response);
+///     }
+/// });
+///
+/// // Send a request and get the response
+/// let response = sender.blocking_send(42).unwrap();
+/// println!("Received response: {}", response);
+/// ```
+pub mod request_reply {
+    use std::io;
+
+    use super::io_error;
+    use tokio::sync::{mpsc, oneshot};
+
+    pub fn channel<Rq, Rp>() -> (Sender<Rq, Rp>, RequestReceiver<Rq, Rp>) {
+        let (tx, rx) = mpsc::channel(1);
+        (Sender { tx }, RequestReceiver { rx })
+    }
+
+    pub struct RequestReceiver<Rq, Rp> {
+        rx: mpsc::Receiver<(Rq, Reply<Rp>)>,
+    }
+
+    impl<Rq, Rp> RequestReceiver<Rq, Rp> {
+        pub async fn recv(&mut self) -> Option<(Rq, Reply<Rp>)> {
+            self.rx.recv().await
+        }
+    }
+
+    pub struct Sender<Rq, Rp> {
+        tx: mpsc::Sender<(Rq, Reply<Rp>)>,
+    }
+
+    impl<Rq, Rp> Sender<Rq, Rp> {
+        pub fn blocking_send(&self, request: Rq) -> io::Result<Rp> {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            self.tx
+                .blocking_send((request, Reply { reply_tx }))
+                .map_err(|_| io_error("Unable to send request"))?;
+            let response = reply_rx
+                .blocking_recv()
+                .map_err(|_| io_error("Unable to receive response"))?;
+            Ok(response)
+        }
+    }
+
+    pub struct Reply<Rp> {
+        reply_tx: oneshot::Sender<Rp>,
+    }
+
+    impl<Rp> Reply<Rp> {
+        pub fn reply(self, response: Rp) -> Result<(), Rp> {
+            self.reply_tx.send(response)
+        }
+    }
 }

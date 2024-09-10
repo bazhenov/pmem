@@ -1110,11 +1110,7 @@ impl Commit {
     }
 
     pub fn next(&self) -> Option<Arc<Commit>> {
-        if let Some(inner) = self.next.load_full().as_ref() {
-            Some(Arc::clone(&inner))
-        } else {
-            None
-        }
+        self.next.load_full().as_ref().as_ref().map(Arc::clone)
     }
 }
 
