@@ -1655,7 +1655,7 @@ mod tests {
             .reclaim(PAGE_SIZE as Addr - 10, 20);
     }
 
-    /// When dropping transaction with a long commit log stackoverflow may happend if removed recursively.
+    /// When dropping transaction with a long commit log stackoverflow may happened if removed recursively.
     #[test]
     fn deep_commit_notify_should_not_cause_stack_overflow() {
         thread::Builder::new()
