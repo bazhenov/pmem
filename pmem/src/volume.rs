@@ -73,7 +73,13 @@ use std::{
 use tracing::{error, info, trace};
 
 pub const PAGE_SIZE_BITS: usize = 16;
+
+/// The size of a page in bytes.
+///
+/// All memory is divided into pages of this size. The pages are the smallest unit of memory that can be
+/// read or written to disk or network.
 pub const PAGE_SIZE: usize = 1 << PAGE_SIZE_BITS; // 64Kib
+
 pub type Addr = u64;
 pub type PageOffset = u32;
 pub type PageNo = u32;
