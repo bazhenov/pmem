@@ -146,7 +146,6 @@ impl PageDriver for TestPageDriver {
 }
 
 #[cfg(test)]
-#[cfg(not(miri))]
 mod tests {
     use super::*;
     use tempfile;

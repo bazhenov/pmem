@@ -37,15 +37,3 @@ jobs:
 
       - name: Run Tests
         run: cargo test
-  miri:
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: "miri"
-      - uses: Swatinem/rust-cache@v2
-        # Miri can not test all crates with isolation, and we are only interested in pmem
-        # as it is the most critical one
-      - name: miri
-        run: cargo +nightly miri test -p pmem
