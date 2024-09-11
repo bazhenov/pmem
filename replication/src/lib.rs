@@ -114,7 +114,7 @@ async fn server_worker(mut socket: TcpStream, mut handle: VolumeHandle) -> io::R
                         let page = snapshot.read(page_no as Addr * PAGE_SIZE as Addr, PAGE_SIZE).into_owned();
                         trace!(page_no, cid = corelation_id, lsn = handle.last_seen_lsn(), "Sending PageReply");
                         Message::PageReply(corelation_id, Cow::Owned(page), snapshot.lsn())
-                            .write_to(pin!(&mut socket))
+                            .write_to(socket.as_mut())
                             .await?;
                     }
                     _ => return io_result("Invalid message"),

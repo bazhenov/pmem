@@ -285,6 +285,19 @@ impl Patch {
             Patch::Reclaim(addr, _) => *addr = value,
         }
     }
+
+    #[cfg(test)]
+    fn read_corresponding_segment<'a>(&self, snapshot: &'a impl TxRead) -> Cow<'a, [u8]> {
+        snapshot.read(self.addr(), self.len())
+    }
+
+    #[cfg(test)]
+    fn write_to(self, tx: &mut impl TxWrite) {
+        match self {
+            Patch::Write(addr, bytes) => tx.write(addr, bytes),
+            Patch::Reclaim(addr, size) => tx.reclaim(addr, size),
+        }
+    }
 }
 
 fn are_on_the_same_page(a1: Addr, a2: Addr) -> bool {
@@ -550,12 +563,10 @@ impl Volume {
         Ok(lsn)
     }
 
-    /// This is internal function and is not supposed to be used by the end user. Made public for replication
-    /// purposes.
+    /// This is internal function and is not supposed to be used by the end user.
+    /// Made public for replication purposes.
     pub fn apply_commit(&mut self, commit: Commit) -> io::Result<()> {
         assert_patches_consistent(&commit.changes, &commit.undo);
-        // TODO write a proptest that checks that fresh commit undo patches are consistent
-        // with previous page content
 
         let (lock, notify) = self.latest_commit.as_ref();
         let mut last_commit = lock.lock().unwrap();
@@ -2215,6 +2226,29 @@ mod tests {
         const DB_SIZE: usize = PAGE_SIZE * 2;
 
         proptest! {
+            #[test]
+            fn undo_log_is_consistent_with_previous_snapshot_content(patches in vec(patches::any_patch(), 10)) {
+                let mut v = Volume::with_capacity(DB_SIZE);
+                let mut commit_notify = v.commit_notify();
+
+                for patch in patches {
+                    let snapshot = v.snapshot();
+                    let prev = patch.read_corresponding_segment(&snapshot);
+
+                    let mut tx = v.start();
+                    patch.write_to(&mut tx);
+                    v.commit(tx)?;
+
+                    let commit = commit_notify.next_commit();
+                    prop_assert_eq!(commit.undo.len(), 1);
+                    let Patch::Write(_, bytes) = &commit.undo[0] else {
+                        panic!("Invalid patch type")
+                    };
+
+                    prop_assert_eq!(bytes, &*prev);
+                }
+            }
+
             #[test]
             fn page_segments_len((addr, len) in any_addr_and_len()) {
                 let interval = PageSegments::new(addr, len);
