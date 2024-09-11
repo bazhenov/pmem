@@ -57,7 +57,6 @@ async fn server_worker(mut socket: TcpStream, mut handle: VolumeHandle) -> io::R
 
     // Sending initial commit to the client
     {
-        handle.advance_to_latest();
         let current_commit = handle.current_commit();
         let lsn = current_commit.lsn();
         let redo = current_commit.patches();

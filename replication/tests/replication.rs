@@ -67,11 +67,11 @@ impl MasterAndReplica {
 
     async fn with_volume(volume: Volume) -> io::Result<Self> {
         let (master_addr, _) = start_replication_server("127.0.0.1:0", volume.handle()).await?;
-        let (replica, replica_ctrl) = replica_connect(master_addr).await?;
+        let (replica_handle, replica_ctrl) = replica_connect(master_addr).await?;
         Ok(Self {
             master_volume: volume,
             master_addr,
-            replica_handle: replica,
+            replica_handle,
             replica_ctrl,
         })
     }
@@ -86,7 +86,6 @@ impl MasterAndReplica {
     }
 
     fn slave_snapshot(&mut self) -> Snapshot {
-        self.replica_handle.advance_to_latest(); // TODO need to get rid of this
         self.replica_handle.snapshot()
     }
 

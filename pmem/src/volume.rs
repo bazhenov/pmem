@@ -614,6 +614,7 @@ impl Volume {
             latest_commit: Arc::clone(&self.latest_commit),
             commit: Arc::clone(&commit),
             pages_count: self.pages_count,
+            pages: Arc::clone(&self.pages),
         }
     }
 
@@ -640,7 +641,7 @@ impl Volume {
         Snapshot {
             pages_count: self.pages_count,
             pages: Arc::clone(&self.pages),
-            commit_log: Arc::clone(&commit),
+            commit: Arc::clone(&commit),
         }
     }
 
@@ -869,23 +870,21 @@ impl VolumeHandle {
     /// It might be several snapshots ahead of the last seen snapshot.
     pub fn wait(&mut self) -> Snapshot {
         // TODO: this is incorrect, we should return not the next, but latest snapshot
+        // self.advance_to_latest();
         let last_lsn = self.notify.last_seen_lsn();
         let commit = self.notify.next_commit();
         debug_assert!(commit.lsn() == last_lsn + 1);
 
         Snapshot {
             pages_count: self.pages_count,
-            commit_log: Arc::clone(&self.notify.commit),
+            commit: Arc::clone(&self.notify.commit),
             pages: Arc::clone(&self.pages),
         }
     }
 
-    pub fn current_commit(&self) -> &Commit {
+    pub fn current_commit(&mut self) -> &Commit {
+        self.notify.advance_to_latest();
         self.notify.commit.as_ref()
-    }
-
-    pub fn advance_to_latest(&mut self) -> u64 {
-        self.notify.advance_to_latest()
     }
 
     pub fn wait_commit(&mut self) -> &Commit {
@@ -901,6 +900,7 @@ impl VolumeHandle {
     }
 
     pub fn snapshot(&mut self) -> Snapshot {
+        self.notify.advance_to_latest();
         while self.commit_log.next.load().is_some() {
             self.commit_log = self
                 .commit_log
@@ -914,7 +914,7 @@ impl VolumeHandle {
 
         let snapshot = Snapshot {
             pages_count: self.pages_count,
-            commit_log: Arc::clone(&self.commit_log),
+            commit: Arc::clone(&self.commit_log),
             pages: Arc::clone(&self.pages),
         };
         trace!(lsn = snapshot.lsn(), "Creating snapshot");
@@ -930,6 +930,7 @@ pub struct CommitNotify {
 
     /// Latest commit that is available for reading in the volume. May be way ahead of `commit`.
     latest_commit: Arc<(Mutex<Arc<Commit>>, Condvar)>,
+    pages: Arc<Pages>,
     pages_count: PageNo,
 }
 
@@ -938,7 +939,7 @@ impl CommitNotify {
     ///
     /// If several commits happened since the last call to this method, this function will return
     /// all of them in order.
-    pub fn next_commit(&mut self) -> &Commit {
+    pub fn next_commit(&mut self) -> &Arc<Commit> {
         // Pay attention to the order of operations and the fact that algorithm uses 2 commits:
         // 1. `commit` - the last processed commit by this method.
         // 2. `latest_commit` - the latest commit that is available for reading in the volume.
@@ -962,7 +963,16 @@ impl CommitNotify {
         let next_commit = commit.next.load_full().as_ref().as_ref().unwrap().clone();
         self.commit = Arc::clone(&next_commit);
         self.last_seen_lsn = self.commit.lsn();
-        self.commit.as_ref()
+        &self.commit
+    }
+
+    /// Returns snapshot for a current commit
+    pub fn snapshot(&mut self) -> Snapshot {
+        Snapshot {
+            commit: Arc::clone(&self.commit),
+            pages_count: self.pages_count,
+            pages: Arc::clone(&self.pages),
+        }
     }
 
     /// Advances the `commit` to the latest commit available in the volume.
@@ -983,11 +993,6 @@ impl CommitNotify {
 
     pub fn last_seen_lsn(&self) -> u64 {
         self.last_seen_lsn
-    }
-
-    pub fn pages(&self) -> PageNo {
-        // TODO is this correct? Can the number of pages change?
-        self.pages_count
     }
 }
 
@@ -1039,7 +1044,7 @@ pub trait TxWrite: TxRead {
 #[derive(Clone)]
 pub struct Snapshot {
     pages_count: PageNo,
-    commit_log: Arc<Commit>,
+    commit: Arc<Commit>,
     pages: Arc<Pages>,
 }
 
@@ -1069,7 +1074,7 @@ impl Snapshot {
         // Applying with undo log
         // We need to skip first entry in undo log, because it is describing how to undo the changes
         // of current snapshot itself.
-        let mut commit_log = self.commit_log.as_ref().next.load_full();
+        let mut commit_log = self.commit.as_ref().next.load_full();
         while let Some(commit) = commit_log.as_ref() {
             if buf_mask.is_empty() {
                 break;
@@ -1084,7 +1089,7 @@ impl Snapshot {
     }
 
     pub fn lsn(&self) -> LSN {
-        self.commit_log.lsn()
+        self.commit.lsn()
     }
 }
 
@@ -1725,6 +1730,7 @@ mod tests {
     fn data_can_be_read_from_a_different_thread() {
         let mut volume = Volume::default();
 
+        let mut notify = volume.commit_notify();
         let mut handle = volume.handle();
 
         let lsn = thread::spawn(move || {
@@ -1733,7 +1739,8 @@ mod tests {
             volume.commit(tx).unwrap()
         });
 
-        let s1 = handle.wait();
+        notify.next_commit();
+        let s1 = notify.snapshot();
         let lsn = lsn.join().unwrap();
         let s2 = handle.snapshot();
 
@@ -1881,9 +1888,10 @@ mod tests {
                 .unwrap()
         }
 
-        fn check_transaction_consistency(mut handle: VolumeHandle) -> io::Result<()> {
+        fn check_transaction_consistency(mut notify: CommitNotify) -> io::Result<()> {
             for i in 1..=TRANSACTIONS {
-                let snapshot = handle.wait();
+                notify.next_commit();
+                let snapshot = notify.snapshot();
                 assert_eq!(i as LSN, snapshot.lsn());
                 let sum = wrapping_sum(&snapshot);
                 if sum != 0 {
@@ -1905,8 +1913,8 @@ mod tests {
 
         // Spawn threads that will check the consistency of the volume snapshots.
         for _ in 0..THREADS {
-            let handle = volume.handle();
-            let join = thread::spawn(move || check_transaction_consistency(handle));
+            let notify = volume.commit_notify();
+            let join = thread::spawn(move || check_transaction_consistency(notify));
             join_handles.push(join);
         }
 
@@ -2023,7 +2031,7 @@ mod tests {
             volume.commit(tx).unwrap();
         }
 
-        snapshot.commit_log
+        snapshot.commit
     }
 
     mod patch {
