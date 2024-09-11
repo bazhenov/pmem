@@ -747,12 +747,14 @@ impl Pages {
         }
     }
 
-    fn with_page_opt(&self, page_no: PageNo, mut f: impl FnMut(&mut Page)) -> io::Result<()> {
+    fn with_page_opt(&self, page_no: PageNo, mut f: impl FnMut(&mut Page)) -> io::Result<bool> {
         let mut pages = self.pages.lock().unwrap();
         if let Some(page) = pages.get_mut(&page_no) {
             f(page);
+            Ok(true)
+        } else {
+            Ok(false)
         }
-        Ok(())
     }
 
     fn read(&self, addr: Addr, buf: &mut [u8]) -> io::Result<()> {
@@ -762,7 +764,6 @@ impl Pages {
             let offset = offset as usize;
             let len = slice_range.len();
 
-            // TODO need to check if page is missing and then zero out the buffer
             let buf_slice = &mut buf[slice_range];
             self.with_page(page_no, move |page| {
                 let page_range = offset..offset + len;

@@ -36,8 +36,6 @@ impl PageDriver for NoDriver {
             buf.copy_from_slice(page.as_slice());
             Ok(Some(*lsn))
         } else {
-            // TODO Option?
-            // Ok(0)
             Ok(None)
         }
     }
