@@ -151,7 +151,7 @@ pub async fn replica_connect(
     let (tx, rx) = request_reply::channel();
     let driver = NetworkDriver { tx };
 
-    // Receveing initial commit from the server
+    // Receiving initial commit from the server
     let volume = {
         let mut assembler = PacketAssembler::default();
         loop {
