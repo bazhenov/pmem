@@ -2244,6 +2244,22 @@ mod tests {
             }
 
             #[test]
+            fn redo_log_is_consistent_with_current_snapshot_content(patches in vec(patches::any_patch(), 10)) {
+                let mut v = Volume::with_capacity(DB_SIZE);
+                let mut commit_notify = v.commit_notify();
+
+                for patch in patches {
+                    let mut tx = v.start();
+                    patch.clone().write_to(&mut tx);
+                    v.commit(tx)?;
+
+                    let commit = commit_notify.next_commit();
+                    prop_assert_eq!(commit.changes.len(), 1);
+                    prop_assert_eq!(&commit.changes, &[patch]);
+                }
+            }
+
+            #[test]
             fn page_segments_len((addr, len) in any_addr_and_len()) {
                 let interval = PageSegments::new(addr, len);
                 let len_sum = interval.map(|(_, slice_range)| slice_range.len()).sum::<usize>();
