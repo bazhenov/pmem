@@ -476,13 +476,13 @@ impl Volume {
     }
 
     pub fn with_capacity(bytes: usize) -> Self {
-        let pages = (bytes + PAGE_SIZE) / PAGE_SIZE;
+        let pages = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
         let pages = u32::try_from(pages).expect("Too large capacity for the volume");
         Self::new_in_memory(pages)
     }
 
     pub fn with_capacity_and_driver(bytes: usize, driver: impl PageDriver + 'static) -> Self {
-        let pages = (bytes + PAGE_SIZE) / PAGE_SIZE;
+        let pages = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
         let pages = u32::try_from(pages).expect("Too large capacity for the volume");
         Self::new_with_driver(pages, driver)
     }
@@ -1995,7 +1995,6 @@ mod tests {
         let commit = commit_log.next().as_ref().unwrap().next();
         drop(commit_log);
         let commit = Arc::into_inner(commit.unwrap()).expect("Unable to take ownership of commit");
-        println!("Commit LSN: {}", commit.lsn());
 
         let volume = Volume::from_commit(1, commit, NoDriver::default());
         assert_eq!(volume.snapshot().lsn(), 2);
