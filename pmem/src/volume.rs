@@ -903,7 +903,7 @@ impl VolumeHandle {
 /// Allows to read the volume commit-by-commit. In most cases, when you need an access to the most recent
 /// volume data, you should use [`VolumeHandle`] instead.
 ///
-/// Should be used in a tight loop to process all individual commits, becase it captures undo/redo logs
+/// Should be used in a tight loop to process all individual commits, because it captures undo/redo logs
 /// until corresponding commit is processed. It may lead to memory exhaustion if commit processing is slower
 /// than commit rate.
 #[derive(Clone)]
