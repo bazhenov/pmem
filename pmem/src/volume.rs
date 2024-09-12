@@ -1497,43 +1497,43 @@ mod tests {
     fn first_commit_should_have_lsn_1() {
         // In several places in codebase we assume that first commit has LSN 1
         // and LSN 0 is synthetic LSN used for base empty snapshot
-        let mut mem = Volume::default();
-        let tx = mem.start();
-        assert_eq!(mem.commit(tx).unwrap(), 1);
+        let mut vol = Volume::default();
+        let tx = vol.start();
+        assert_eq!(vol.commit(tx).unwrap(), 1);
     }
 
     #[test]
     fn non_linear_commits_must_be_rejected() {
-        let mut mem = Volume::default();
-        let mut tx1 = mem.start();
-        let mut tx2 = mem.start();
+        let mut vol = Volume::default();
+        let mut tx1 = vol.start();
+        let mut tx2 = vol.start();
 
         tx1.write(0, b"Hello");
-        mem.commit(tx1).unwrap();
+        vol.commit(tx1).unwrap();
 
         tx2.write(0, b"World");
-        assert!(mem.commit(tx2).is_err());
+        assert!(vol.commit(tx2).is_err());
     }
 
     #[test]
     fn committed_changes_should_be_visible_on_a_page() {
-        let mut mem = Volume::from("Jekyll");
+        let mut vol = Volume::from("Jekyll");
 
-        let mut tx = mem.start();
+        let mut tx = vol.start();
         tx.write(0, b"Hide");
-        mem.commit(tx).unwrap();
+        vol.commit(tx).unwrap();
 
-        assert_str_eq(mem.read(0, 4), b"Hide");
+        assert_str_eq(vol.read(0, 4), b"Hide");
     }
 
     #[test]
     fn committed_changes_should_be_visible_via_handle() {
-        let mut mem = Volume::from("Jekyll");
-        let mut handle = mem.handle();
+        let mut vol = Volume::from("Jekyll");
+        let mut handle = vol.handle();
 
-        let mut tx = mem.start();
+        let mut tx = vol.start();
         tx.write(0, b"Hide");
-        let expected_lsn = mem.commit(tx).unwrap();
+        let expected_lsn = vol.commit(tx).unwrap();
 
         let s = handle.snapshot();
         assert_str_eq(s.read(0, 4), b"Hide");
@@ -1544,30 +1544,30 @@ mod tests {
 
     #[test]
     fn uncommitted_changes_should_be_visible_only_on_the_snapshot() {
-        let mem = Volume::from("Jekyll");
+        let vol = Volume::from("Jekyll");
 
-        let mut tx = mem.start();
+        let mut tx = vol.start();
         tx.write(0, b"Hide");
 
         assert_str_eq(tx.read(0, 4), "Hide");
-        assert_str_eq(mem.read(0, 6), "Jekyll");
+        assert_str_eq(vol.read(0, 6), "Jekyll");
     }
 
     #[test]
     fn snapshot_should_provide_repeatable_read_isolation() {
-        let mut mem = Volume::default();
+        let mut vol = Volume::default();
 
-        let zero = mem.snapshot();
+        let zero = vol.snapshot();
 
-        let mut hide = mem.start();
+        let mut hide = vol.start();
         hide.write(0, b"Hide");
-        mem.commit(hide).unwrap();
-        let hide = mem.start();
+        vol.commit(hide).unwrap();
+        let hide = vol.start();
 
-        let mut jekyll = mem.start();
+        let mut jekyll = vol.start();
         jekyll.write(0, b"Jekyll");
-        mem.commit(jekyll).unwrap();
-        let jekyll = mem.start();
+        vol.commit(jekyll).unwrap();
+        let jekyll = vol.start();
 
         assert_eq!(&*zero.read(0, 6), b"\0\0\0\0\0\0");
         assert_eq!(&*hide.read(0, 6), b"Hide\0\0");
@@ -1576,86 +1576,86 @@ mod tests {
 
     #[test]
     fn patch_page() {
-        let mut mem = Volume::from("Hello panic!");
+        let mut vol = Volume::from("Hello panic!");
 
-        let mut tx = mem.start();
+        let mut tx = vol.start();
         tx.write(6, b"world");
-        mem.commit(tx).unwrap();
+        vol.commit(tx).unwrap();
 
-        assert_str_eq(mem.read(0, 12), "Hello world!");
-        assert_str_eq(mem.read(0, 8), "Hello wo");
-        assert_str_eq(mem.read(3, 9), "lo world!");
-        assert_str_eq(mem.read(6, 5), "world");
-        assert_str_eq(mem.read(8, 4), "rld!");
-        assert_str_eq(mem.read(7, 3), "orl");
+        assert_str_eq(vol.read(0, 12), "Hello world!");
+        assert_str_eq(vol.read(0, 8), "Hello wo");
+        assert_str_eq(vol.read(3, 9), "lo world!");
+        assert_str_eq(vol.read(6, 5), "world");
+        assert_str_eq(vol.read(8, 4), "rld!");
+        assert_str_eq(vol.read(7, 3), "orl");
     }
 
     #[test]
     fn test_regression() {
-        let mut mem = Volume::default();
+        let mut vol = Volume::default();
 
-        let mut tx = mem.start();
+        let mut tx = vol.start();
         tx.write(70, [0, 0, 1]);
-        mem.commit(tx).unwrap();
-        let mut tx = mem.start();
+        vol.commit(tx).unwrap();
+        let mut tx = vol.start();
         tx.reclaim(71, 2);
         tx.write(73, [0]);
-        mem.commit(tx).unwrap();
+        vol.commit(tx).unwrap();
 
-        assert_eq!(mem.read(70, 4).as_ref(), [0, 0, 0, 0]);
+        assert_eq!(vol.read(70, 4).as_ref(), [0, 0, 0, 0]);
     }
 
     #[test]
     fn test_regression2() {
-        let mut mem = Volume::default();
+        let mut vol = Volume::default();
 
-        let mut tx = mem.start();
+        let mut tx = vol.start();
         tx.write(70, [0, 0, 1]);
-        mem.commit(tx).unwrap();
-        let mut tx = mem.start();
+        vol.commit(tx).unwrap();
+        let mut tx = vol.start();
         tx.write(0, [0]);
-        mem.commit(tx).unwrap();
-        let mut tx = mem.start();
+        vol.commit(tx).unwrap();
+        let mut tx = vol.start();
         tx.reclaim(71, 2);
-        mem.commit(tx).unwrap();
+        vol.commit(tx).unwrap();
 
-        assert_eq!(mem.read(70, 4).as_ref(), [0, 0, 0, 0]);
+        assert_eq!(vol.read(70, 4).as_ref(), [0, 0, 0, 0]);
     }
 
     #[test]
     fn data_across_multiple_pages_can_be_written() {
-        let mut mem = Volume::new_in_memory(2);
+        let mut vol = Volume::new_in_memory(2);
 
         // Choosing address so that data is split across 2 pages
         let addr = PAGE_SIZE as Addr - 2;
         let alice = b"Alice";
 
-        let mut tx = mem.start();
+        let mut tx = vol.start();
         tx.write(addr, alice);
 
         // Checking that data is visible in snapshot
         assert_str_eq(tx.read(addr, alice.len()), alice);
 
         // Checking that data is visible after commit to volume
-        mem.commit(tx).unwrap();
-        assert_str_eq(mem.read(addr, alice.len()), alice);
+        vol.commit(tx).unwrap();
+        assert_str_eq(vol.read(addr, alice.len()), alice);
     }
 
     #[test]
     fn data_can_be_read_from_snapshot() {
         let data = [1, 2, 3, 4, 5];
-        let mem = Volume::from(data.as_slice());
+        let vol = Volume::from(data.as_slice());
 
-        let tx = mem.start();
+        let tx = vol.start();
         assert_eq!(tx.read(0, 5), data.as_slice());
     }
 
     #[test]
     fn data_can_be_removed_on_snapshot() {
         let data = [1, 2, 3, 4, 5];
-        let mem = Volume::from(data.as_slice());
+        let vol = Volume::from(data.as_slice());
 
-        let mut tx = mem.start();
+        let mut tx = vol.start();
         tx.reclaim(1, 3);
 
         assert_eq!(tx.read(0, 5), [1u8, 0, 0, 0, 5].as_slice());
@@ -1693,15 +1693,15 @@ mod tests {
             // and not to rely on the environment
             .stack_size(100 * 1024)
             .spawn(|| {
-                let mut mem = Volume::new_in_memory(100);
+                let mut vol = Volume::new_in_memory(100);
 
                 // Creating notify handle and a snapshot to check if in both cases
                 // stack overflow is not happening
-                let notify = mem.commit_notify();
-                let tx = mem.start();
+                let notify = vol.commit_notify();
+                let tx = vol.start();
 
                 for _ in 0..1000 {
-                    mem.commit(mem.start()).unwrap();
+                    vol.commit(vol.start()).unwrap();
                 }
 
                 // Explicitly dropping both, so they will not be eliminated before transactions are done
@@ -2277,10 +2277,10 @@ mod tests {
             #[test]
             fn shadow_write(snapshots in vec(any_snapshot(), 0..3)) {
                 let mut shadow_buffer = vec![0; DB_SIZE];
-                let mut mem = Volume::with_capacity(DB_SIZE);
+                let mut vol = Volume::with_capacity(DB_SIZE);
 
                 for patches in snapshots {
-                    let mut tx = mem.start();
+                    let mut tx = vol.start();
                     for patch in patches {
                         let offset = patch.addr() as usize;
                         let range = offset..offset + patch.len();
@@ -2296,10 +2296,10 @@ mod tests {
                             }
                         }
                     }
-                    mem.commit(tx).unwrap();
+                    vol.commit(tx).unwrap();
                 }
 
-                assert_buffers_eq(&mem.read(0, DB_SIZE), shadow_buffer.as_slice())?;
+                assert_buffers_eq(&vol.read(0, DB_SIZE), shadow_buffer.as_slice())?;
             }
 
             /// This test ensure that no matter transactions are committed, snapshot should always
@@ -2308,11 +2308,11 @@ mod tests {
             fn repeatable_read(snapshots in vec(any_snapshot(), 1..5)) {
                 const VALUE: u8 = 42;
                 let initial = vec![VALUE; DB_SIZE];
-                let mut mem = Volume::from(initial.as_slice());
-                let s = mem.snapshot();
+                let mut vol = Volume::from(initial.as_slice());
+                let s = vol.snapshot();
 
                 for patches in snapshots {
-                    let mut tx = mem.start();
+                    let mut tx = vol.start();
                     for patch in patches {
                         match patch {
                             Patch::Write(offset, bytes) => {
@@ -2325,7 +2325,7 @@ mod tests {
                     }
 
                     prop_assert!(s.read(0, DB_SIZE).iter().all(|b| *b == VALUE));
-                    mem.commit(tx).unwrap();
+                    vol.commit(tx).unwrap();
                     prop_assert!(s.read(0, DB_SIZE).iter().all(|b| *b == VALUE));
                 }
             }
