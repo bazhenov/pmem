@@ -20,6 +20,7 @@ async fn check_replication_simple_case() -> io::Result<()> {
 
 #[tokio::test]
 async fn check_replication_work_if_connected_later() -> io::Result<()> {
+    init_tracing();
     let mut net = MasterAndReplica::new().await?;
 
     let bytes = [1, 2, 3, 4];
@@ -92,7 +93,7 @@ impl MasterAndReplica {
     /// Write to master, wait for replica to catch up and returns corresponding snapshot from replica
     async fn master_write(&mut self, f: impl Fn(&mut Transaction)) -> Snapshot {
         // replica handle must be created before writing to master, otherwise it is a race condition
-        let mut replica = self.replica_handle.clone();
+        let mut commit_notify = self.replica_handle.commit_notify();
 
         let mut tx = self.master_volume.start();
         f(&mut tx);
@@ -101,7 +102,7 @@ impl MasterAndReplica {
         // Waiting for replica to catch up
         // We need to spawn_blocking here because `next_commit()` is a blocking call
         // if `Runtime` is not multithreaded it may block the only thread that is running server async tasks
-        spawn_blocking(move || while replica.wait_commit().lsn() < lsn {})
+        spawn_blocking(move || while commit_notify.next_commit().lsn() < lsn {})
             .await
             .unwrap();
 

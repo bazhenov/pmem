@@ -45,7 +45,7 @@
 //! tx.write(0, &[1, 2, 3, 4]);   // Write 4 bytes at offset 0
 //! volume.commit(tx);            // Commit the changes back to the volume
 //!
-//! let snapshot = handle.wait();
+//! let snapshot = handle.snapshot();
 //! assert_eq!(snapshot.read(0, 4), vec![1, 2, 3, 4]); // Read using TxRead trait
 //! ```
 //!
@@ -610,7 +610,6 @@ impl Volume {
     pub fn commit_notify(&self) -> CommitNotify {
         let commit = self.latest_commit.0.lock().unwrap();
         CommitNotify {
-            last_seen_lsn: commit.lsn(),
             latest_commit: Arc::clone(&self.latest_commit),
             commit: Arc::clone(&commit),
             pages_count: self.pages_count,
@@ -625,6 +624,7 @@ impl Volume {
         VolumeHandle {
             pages: Arc::clone(&self.pages),
             pages_count: self.pages_count,
+            latest_commit: Arc::clone(&self.latest_commit),
             notify,
             commit_log,
         }
@@ -861,44 +861,10 @@ pub struct VolumeHandle {
     pages_count: PageNo,
     commit_log: Arc<Commit>,
     pages: Arc<Pages>,
+    latest_commit: Arc<(Mutex<Arc<Commit>>, Condvar)>,
 }
 
 impl VolumeHandle {
-    /// Blocks until next snapshot is available and returns it
-    ///
-    /// The next snapshot is the one that is the most recent at the time this method is called.
-    /// It might be several snapshots ahead of the last seen snapshot.
-    pub fn wait(&mut self) -> Snapshot {
-        // TODO: this is incorrect, we should return not the next, but latest snapshot
-        // self.advance_to_latest();
-        let last_lsn = self.notify.last_seen_lsn();
-        let commit = self.notify.next_commit();
-        debug_assert!(commit.lsn() == last_lsn + 1);
-
-        Snapshot {
-            pages_count: self.pages_count,
-            commit: Arc::clone(&self.notify.commit),
-            pages: Arc::clone(&self.pages),
-        }
-    }
-
-    pub fn current_commit(&mut self) -> &Commit {
-        self.notify.advance_to_latest();
-        self.notify.commit.as_ref()
-    }
-
-    pub fn wait_commit(&mut self) -> &Commit {
-        self.notify.next_commit()
-    }
-
-    pub fn pages(&self) -> PageNo {
-        self.pages_count
-    }
-
-    pub fn last_seen_lsn(&self) -> u64 {
-        self.notify.last_seen_lsn()
-    }
-
     pub fn snapshot(&mut self) -> Snapshot {
         self.notify.advance_to_latest();
         while self.commit_log.next.load().is_some() {
@@ -920,13 +886,30 @@ impl VolumeHandle {
         trace!(lsn = snapshot.lsn(), "Creating snapshot");
         snapshot
     }
+
+    pub fn commit_notify(&self) -> CommitNotify {
+        let commit = self.latest_commit.0.lock().unwrap();
+        CommitNotify {
+            latest_commit: Arc::clone(&self.latest_commit),
+            commit: Arc::clone(&commit),
+            pages_count: self.pages_count,
+            pages: Arc::clone(&self.pages),
+        }
+    }
 }
 
+/// Commit notification reader. Created by [`VolumeHandle::commit_notify`] or [`Volume::commit_notify`] methods.
+///
+/// Allows to read the volume commit-by-commit. In most cases, when you need an access to the most recent
+/// volume data, you should use [`VolumeHandle`] instead.
+///
+/// Should be used in a tight loop to process all individual commits, becase it captures undo/redo logs
+/// until corresponding commit is processed. It may lead to memory exhaustion if commit processing is slower
+/// than commit rate.
 #[derive(Clone)]
 pub struct CommitNotify {
-    // Last processed commit.
+    /// Last processed commit.
     commit: Arc<Commit>,
-    last_seen_lsn: u64,
 
     /// Latest commit that is available for reading in the volume. May be way ahead of `commit`.
     latest_commit: Arc<(Mutex<Arc<Commit>>, Condvar)>,
@@ -940,34 +923,39 @@ impl CommitNotify {
     /// If several commits happened since the last call to this method, this function will return
     /// all of them in order.
     pub fn next_commit(&mut self) -> &Arc<Commit> {
-        // Pay attention to the order of operations and the fact that algorithm uses 2 commits:
-        // 1. `commit` - the last processed commit by this method.
-        // 2. `latest_commit` - the latest commit that is available for reading in the volume.
-        //    `latest_commit` may be way ahead of `commit` if client of this function can't keep up with
-        //    ongoing commits.
-        //
-        // Access to `commit` is synchronized by `Arc` and most of the times we don't need to acquire
-        // the lock to check if there is a new commit available. We need to acquire global lock
-        // if we are contending for the latest commit in the volume.
-        let commit = Arc::clone(&self.commit);
-
-        let mut lock = self.latest_commit.0.lock().unwrap();
-        // 1. Need to check again after acquiring the lock, otherwise it is a race condition
-        //    because we speculatively checked the condition before acquiring the lock to prevent
-        //    contention when possible
-        // 2. spourious wakeups are possible, so we need to check the condition in a loop
-        while commit.next().is_none() {
-            lock = self.latest_commit.1.wait(lock).unwrap();
+        {
+            let mut lock = self.latest_commit.0.lock().unwrap();
+            // spourious wakeups are possible, so we need to check the condition in a loop
+            while self.commit.next().is_none() {
+                lock = self.latest_commit.1.wait(lock).unwrap();
+            }
         }
 
-        let next_commit = commit.next.load_full().as_ref().as_ref().unwrap().clone();
+        let next_commit = self.commit.next.load().as_ref().as_ref().unwrap().clone();
         self.commit = Arc::clone(&next_commit);
-        self.last_seen_lsn = self.commit.lsn();
         &self.commit
     }
 
-    /// Returns snapshot for a current commit
-    pub fn snapshot(&mut self) -> Snapshot {
+    /// Blocks until next commit is available and returns a snapshot for it
+    ///
+    /// If several commits happened since the last call to this method, this function will return
+    /// snapshot for the next one, not the latest one.
+    pub fn next_snapshot(&mut self) -> Snapshot {
+        let commit = Arc::clone(self.next_commit());
+        Snapshot {
+            commit,
+            pages_count: self.pages_count,
+            pages: Arc::clone(&self.pages),
+        }
+    }
+
+    /// Returns current commit without advancing to the next one
+    pub fn commit(&self) -> &Arc<Commit> {
+        &self.commit
+    }
+
+    /// Returns snapshot for a current commit. Does not advance to the next commit.
+    pub fn snapshot(&self) -> Snapshot {
         Snapshot {
             commit: Arc::clone(&self.commit),
             pages_count: self.pages_count,
@@ -975,8 +963,12 @@ impl CommitNotify {
         }
     }
 
+    pub fn pages(&self) -> PageNo {
+        self.pages_count
+    }
+
     /// Advances the `commit` to the latest commit available in the volume.
-    fn advance_to_latest(&mut self) -> u64 {
+    pub fn advance_to_latest(&mut self) -> &Arc<Commit> {
         while self.commit.next.load().is_some() {
             self.commit = self
                 .commit
@@ -987,12 +979,7 @@ impl CommitNotify {
                 .unwrap()
                 .clone();
         }
-        self.last_seen_lsn = self.commit.lsn();
-        self.last_seen_lsn
-    }
-
-    pub fn last_seen_lsn(&self) -> u64 {
-        self.last_seen_lsn
+        &self.commit
     }
 }
 

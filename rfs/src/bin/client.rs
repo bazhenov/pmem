@@ -13,12 +13,13 @@ async fn main() {
         .with(filter_layer)
         .init();
 
-    let (mut volume, _) = replication::replica_connect("127.0.0.1:1111")
+    let (volume, _) = replication::replica_connect("127.0.0.1:1111")
         .await
         .unwrap();
 
+    let mut commit_notify = volume.commit_notify();
     loop {
-        let snapshot = volume.wait();
+        let snapshot = commit_notify.next_snapshot();
         println!("New snapshot LSN: {}", snapshot.lsn());
 
         spawn_blocking(move || {

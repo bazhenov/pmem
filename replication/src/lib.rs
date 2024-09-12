@@ -1,10 +1,13 @@
 use pmem::{
     driver::PageDriver,
-    volume::{Addr, Commit, PageNo, Patch, TxRead, Volume, VolumeHandle, LSN, PAGE_SIZE},
+    volume::{
+        Addr, Commit, CommitNotify, PageNo, Patch, TxRead, Volume, VolumeHandle, LSN, PAGE_SIZE,
+    },
 };
 use protocol::{Message, PROTOCOL_VERSION};
 use std::{
-    borrow::Cow, collections::HashMap, fmt::Debug, io, mem, net::SocketAddr, pin::pin, thread,
+    borrow::Cow, collections::HashMap, fmt::Debug, io, mem, net::SocketAddr, pin::pin, sync::Arc,
+    thread,
 };
 use tokio::{
     net::{TcpListener, TcpStream, ToSocketAddrs},
@@ -33,16 +36,13 @@ pub async fn accept_loop(listener: TcpListener, handle: VolumeHandle) -> io::Res
             info!(addr = ?addr, "Accepted connection");
         }
 
-        // TODO: Here is the leak. advance_to_latest() is called only on a new connection.
-        // let lsn = notify.advance_to_latest();
-        // trace!(lsn = lsn, "Advancing to latest");
-        tokio::spawn(server_worker(socket, handle.clone()));
+        tokio::spawn(server_worker(socket, handle.commit_notify()));
     }
 }
 
-#[instrument(skip(socket, handle), fields(addr = %socket.peer_addr().unwrap()))]
-async fn server_worker(mut socket: TcpStream, mut handle: VolumeHandle) -> io::Result<()> {
-    Message::ServerHello(PROTOCOL_VERSION, handle.pages())
+#[instrument(skip(socket, notify), fields(addr = %socket.peer_addr().unwrap()))]
+async fn server_worker(mut socket: TcpStream, notify: CommitNotify) -> io::Result<()> {
+    Message::ServerHello(PROTOCOL_VERSION, notify.pages())
         .write_to(pin!(&mut socket))
         .await?;
     let msg = Message::read_from(pin!(&mut socket)).await?;
@@ -55,12 +55,19 @@ async fn server_worker(mut socket: TcpStream, mut handle: VolumeHandle) -> io::R
 
     let mut socket = pin!(socket);
 
+    // Keeping track of current snapshot that is updated on every commit.
+    // We need it to send consistent page snapshots to the client, because clients rely on happens-before
+    // guarantees between commits and page snapshots. Meaning if client receives commit with LSN 10, it should
+    // receive only page snapshot with LSN >= 10 after that. Otherwise, it might not be able to recover
+    // page using undo logs at a given LSN that is <10.
+    let mut current_snapshot = notify.snapshot();
+
     // Sending initial commit to the client
     {
-        let current_commit = handle.current_commit();
-        let lsn = current_commit.lsn();
-        let redo = current_commit.patches();
-        let undo = current_commit.undo();
+        let initial_commit = notify.commit();
+        let lsn = initial_commit.lsn();
+        let redo = initial_commit.patches();
+        let undo = initial_commit.undo();
         trace!(lsn, patches = redo.len(), "Starting log relay");
         for (r, u) in redo.iter().zip(undo.iter()) {
             Message::Patch(Cow::Borrowed(r), Cow::Borrowed(u))
@@ -68,38 +75,39 @@ async fn server_worker(mut socket: TcpStream, mut handle: VolumeHandle) -> io::R
                 .await?;
         }
         Message::Commit(lsn).write_to(socket.as_mut()).await?;
-    }
+    };
 
-    let (tx, mut rx) = sync::mpsc::channel(10);
-
+    let (commit_tx, mut commit_rx) = sync::mpsc::channel(10);
     {
-        let mut handle = handle.clone();
+        let mut notify = notify.clone();
         thread::spawn(move || loop {
             let mut result = Ok(());
             while result.is_ok() {
-                let commit = handle.wait_commit();
+                let commit = Arc::clone(notify.next_commit());
+                let snapshot = notify.snapshot();
                 trace!(lsn = commit.lsn(), "Got next commit");
-                result = tx.blocking_send((
-                    commit.lsn(),
-                    commit.patches().to_vec(),
-                    commit.undo().to_vec(),
-                ));
+                result = commit_tx.blocking_send((commit, snapshot));
             }
         });
     }
 
     loop {
         tokio::select! {
-            snapshot = rx.recv() => {
-                if let Some((lsn, redo, undo)) = snapshot {
-                    trace!(lsn = lsn, patches = redo.len(), "Sending snapshot");
+            next_commit = commit_rx.recv() => {
+                if let Some((commit, snapshot)) = next_commit {
+                    debug_assert!(commit.lsn() == snapshot.lsn(), "LSN mismatch");
+                    let redo = commit.patches();
+                    let undo = commit.undo();
+                    let lsn = commit.lsn();
+                    trace!(lsn = lsn, patches = redo.len(), "Sending commit log");
                     for (r, u) in redo.iter().zip(undo.iter()) {
                         Message::Patch(Cow::Borrowed(r), Cow::Borrowed(u))
                             .write_to(pin!(&mut socket))
                             .await?;
                     }
                     Message::Commit(lsn).write_to(socket.as_mut()).await?;
-                }else{
+                    current_snapshot = snapshot;
+                } else {
                     info!("No more snapshots");
                     return Ok(());
                 }
@@ -109,10 +117,10 @@ async fn server_worker(mut socket: TcpStream, mut handle: VolumeHandle) -> io::R
                     Message::PageRequest(corelation_id, page_no) => {
                         trace!(page_no, cid = corelation_id, "PageRequest received");
 
-                        let snapshot = handle.snapshot();
-                        let page = snapshot.read(page_no as Addr * PAGE_SIZE as Addr, PAGE_SIZE).into_owned();
-                        trace!(page_no, cid = corelation_id, lsn = handle.last_seen_lsn(), "Sending PageReply");
-                        Message::PageReply(corelation_id, Cow::Owned(page), snapshot.lsn())
+                        let page = current_snapshot.read(page_no as Addr * PAGE_SIZE as Addr, PAGE_SIZE).into_owned();
+                        let lsn = current_snapshot.lsn();
+                        trace!(page_no, cid = corelation_id, lsn, "Sending PageReply");
+                        Message::PageReply(corelation_id, Cow::Owned(page), lsn)
                             .write_to(socket.as_mut())
                             .await?;
                     }
@@ -341,9 +349,8 @@ pub(crate) fn io_error(error: &str) -> io::Error {
 /// println!("Received response: {}", response);
 /// ```
 pub mod request_reply {
-    use std::io;
-
     use super::io_error;
+    use std::io;
     use tokio::sync::{mpsc, oneshot};
 
     pub fn channel<Rq, Rp>() -> (Sender<Rq, Rp>, RequestReceiver<Rq, Rp>) {
