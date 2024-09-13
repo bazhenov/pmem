@@ -534,7 +534,7 @@ impl Change {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum ChangeKind {
     Add,
     Delete,

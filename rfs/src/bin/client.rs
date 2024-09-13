@@ -1,4 +1,4 @@
-use rfs::{Filesystem, FsTree};
+use rfs::Filesystem;
 use std::io;
 use tokio::task::spawn_blocking;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -13,18 +13,26 @@ async fn main() {
         .with(filter_layer)
         .init();
 
-    let (volume, _) = replication::replica_connect("127.0.0.1:1111")
+    let (mut volume, _) = replication::replica_connect("127.0.0.1:1111")
         .await
         .unwrap();
 
     let mut commit_notify = volume.commit_notify();
+    let mut snapshot = volume.snapshot();
     loop {
-        let snapshot = commit_notify.next_snapshot();
-        println!("New snapshot LSN: {}", snapshot.lsn());
+        let next_snapshot = commit_notify.next_snapshot();
+        println!("New snapshot LSN: {}", next_snapshot.lsn());
 
+        let a = snapshot.clone();
+        let b = next_snapshot.clone();
         spawn_blocking(move || {
-            let fs = Filesystem::open(snapshot);
-            println!("{:?}", FsTree(&fs));
+            let fs_a = Filesystem::open(a);
+            let fs_b = Filesystem::open(b);
+            let changes = fs_b.changes_from(&fs_a);
+            for change in changes {
+                println!("{:?} {}", change.kind(), change.into_path().display());
+            }
         });
+        snapshot = next_snapshot;
     }
 }
