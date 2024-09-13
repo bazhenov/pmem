@@ -61,7 +61,7 @@ use crate::driver::{NoDriver, PageDriver};
 use arc_swap::ArcSwap;
 use std::{
     borrow::Cow,
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fmt::{self, Display, Formatter},
     io,
     ops::Range,
@@ -689,7 +689,8 @@ impl Default for Volume {
 }
 
 struct Pages {
-    pages: Mutex<BTreeMap<PageNo, Page>>,
+    // Pages and the set of dirty pages
+    pages: Mutex<(BTreeMap<PageNo, Page>, HashSet<PageNo>)>,
     last_commit: Mutex<Arc<Commit>>,
     driver: Box<dyn PageDriver>,
 }
@@ -697,20 +698,21 @@ struct Pages {
 impl Pages {
     pub fn new(driver: impl PageDriver + 'static, commit: Arc<Commit>) -> Self {
         Self {
-            pages: Mutex::new(BTreeMap::new()),
+            pages: Mutex::new((BTreeMap::new(), HashSet::new())),
             driver: Box::new(driver),
             last_commit: Mutex::new(commit),
         }
     }
 
-    fn with_page(&self, page_no: PageNo, mut f: impl FnMut(&mut Page)) -> io::Result<()> {
-        let mut pages = self.pages.lock().unwrap();
-        if let Some(page) = pages.get_mut(&page_no) {
+    fn with_page_read(&self, page_no: PageNo, mut f: impl FnMut(&Page)) -> io::Result<()> {
+        let lock = self.pages.lock().unwrap();
+        let (pages, _) = &*lock;
+        if let Some(page) = pages.get(&page_no) {
             f(page);
             Ok(())
         } else {
             // Driver may block due disk or network IO. Dropping lock before reading page.
-            drop(pages);
+            drop(lock);
 
             let mut data = Box::new([0; PAGE_SIZE]);
             if let Some(lsn) = self.driver.read_page(page_no, data.as_mut())? {
@@ -749,20 +751,20 @@ impl Pages {
             let mut page = Page {
                 data,
                 lsn: self.last_commit.lock().unwrap().lsn(),
-                dirty: false,
             };
 
-            let mut pages = self.pages.lock().unwrap();
+            let (pages, _) = &mut *self.pages.lock().unwrap();
             f(&mut page);
             pages.insert(page_no, page);
             Ok(())
         }
     }
 
-    fn with_page_opt(&self, page_no: PageNo, mut f: impl FnMut(&mut Page)) -> io::Result<bool> {
-        let mut pages = self.pages.lock().unwrap();
+    fn with_page_write(&self, page_no: PageNo, mut f: impl FnMut(&mut Page)) -> io::Result<bool> {
+        let (pages, dirty) = &mut *self.pages.lock().unwrap();
         if let Some(page) = pages.get_mut(&page_no) {
             f(page);
+            dirty.insert(page_no);
             Ok(true)
         } else {
             Ok(false)
@@ -777,7 +779,7 @@ impl Pages {
             let len = slice_range.len();
 
             let buf_slice = &mut buf[slice_range];
-            self.with_page(page_no, move |page| {
+            self.with_page_read(page_no, move |page| {
                 let page_range = offset..offset + len;
                 buf_slice.copy_from_slice(&page.data[page_range]);
             })?;
@@ -793,12 +795,11 @@ impl Pages {
             let offset = offset as usize;
             let len = slice_range.len();
 
-            self.with_page_opt(page_no, move |page| {
+            self.with_page_write(page_no, move |page| {
                 let slice_range = slice_range.clone();
                 let page_range = offset..offset + len;
                 let page_buf = page.data.as_mut_slice();
                 page_buf[page_range].copy_from_slice(&buf[slice_range]);
-                page.dirty = true;
             })?;
         }
         Ok(())
@@ -811,11 +812,10 @@ impl Pages {
             let offset = offset as usize;
             let len = slice_range.len();
 
-            self.with_page_opt(page_no, |page| {
+            self.with_page_write(page_no, |page| {
                 let page_range = offset..offset + len;
                 let page_buf = page.data.as_mut_slice();
                 page_buf[page_range].fill(0);
-                page.dirty = true;
             })?;
         }
         Ok(())
@@ -823,15 +823,15 @@ impl Pages {
 
     fn flush(&self, commit: Arc<Commit>) -> io::Result<()> {
         let lsn = commit.lsn();
-        let mut pages = self.pages.lock().unwrap();
-        for (page_no, page) in pages.iter_mut() {
-            if page.dirty {
+        let (pages, dirty) = &mut *self.pages.lock().unwrap();
+        for page_no in dirty.iter() {
+            if let Some(page) = pages.get_mut(page_no) {
                 debug!(page_no, "Flushing page");
                 self.driver.write_page(*page_no, page.data.as_ref(), lsn)?;
-                page.dirty = false;
                 page.lsn = lsn;
             }
         }
+        dirty.clear();
         *self.last_commit.lock().unwrap() = commit;
         self.driver.flush()
     }
@@ -845,13 +845,14 @@ impl Pages {
     /// All subsequent reads will be done from the driver
     #[cfg(test)]
     fn clear_cache(&self) {
-        self.pages.lock().unwrap().clear();
+        let (pages, dirty) = &mut *self.pages.lock().unwrap();
+        pages.clear();
+        dirty.clear();
     }
 }
 
 struct Page {
     data: Box<[u8; PAGE_SIZE]>,
-    dirty: bool,
     lsn: LSN,
 }
 
