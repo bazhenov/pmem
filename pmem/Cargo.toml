@@ -7,6 +7,7 @@ edition = "2021"
 thiserror = { workspace = true }
 pmem-derive = { workspace = true }
 arc-swap = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 proptest = "1.0.0"

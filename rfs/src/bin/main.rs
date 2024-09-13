@@ -32,15 +32,13 @@ async fn main() {
         info!(path = file_path, "Opening FS");
     }
 
-    let commit_notify = volume.commit_notify();
-
     let rfs = RFS::new(volume.start());
     let state = rfs.state_handle();
     let listener = NFSTcpListener::bind(&format!("127.0.0.1:{HOSTPORT}"), rfs)
         .await
         .unwrap();
 
-    let _ = replication::start_replication_server("127.0.0.1:1111", commit_notify).await;
+    let _ = replication::start_replication_server("127.0.0.1:1111", volume.handle()).await;
 
     tokio::spawn(async move { listener.handle_forever().await });
 

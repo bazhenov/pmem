@@ -634,6 +634,7 @@ dependencies = [
  "tango-bench",
  "tempfile",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]

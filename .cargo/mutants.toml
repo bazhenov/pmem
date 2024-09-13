@@ -1,0 +1,7 @@
+exclude_re = [
+    "impl Debug",
+    "impl Display",
+    "Volume::with_capacity",
+    "Volume::into_driver",
+    "debug_assert_sorted_and_has_no_overlaps",
+]

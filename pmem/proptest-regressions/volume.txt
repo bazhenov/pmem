@@ -4,4 +4,5 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
-cc 34ee4fc9f003ef0aeb47378df2012b7b63f978a6138b110af1f1b038fc253f81 # shrinks to snapshots = [[Reclaim(65535, 2)]]
+cc 2f33a85ea685342ac1e13a88b289c379b1989a487658c1fbe1bc60de29944766 # shrinks to snapshots = [[Reclaim(0, 1)]]
+cc 0e52387685658b07d1ddb322df56e27b2352cdcd288517945db0030157427a2e # shrinks to snapshots = [[Write(0, [0])]]
