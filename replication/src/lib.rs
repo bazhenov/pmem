@@ -11,10 +11,10 @@ use std::{
 };
 use tokio::{
     net::{TcpListener, TcpStream, ToSocketAddrs},
-    sync::{self, mpsc},
+    sync,
     task::JoinHandle,
 };
-use tracing::{debug, info, instrument, span, trace, warn, Level};
+use tracing::{debug, info, instrument, trace, warn};
 
 mod protocol;
 
@@ -196,23 +196,6 @@ async fn client_worker(
     let mut read = pin!(read);
     let mut write = pin!(write);
 
-    let (commit_tx, mut commit_rx) = mpsc::channel(10);
-
-    // We're doing commits in a separate task so not to block Network IO-task from fetching pages
-    // from the network.
-    thread::spawn(move || {
-        let span = span!(Level::TRACE, "commit_applier");
-        let _ = span.enter();
-
-        while let Some((lsn, redo, undo)) = commit_rx.blocking_recv() {
-            let commit = Commit::new(redo, undo, lsn);
-
-            // TODO: in case of error we should fail the main thread
-            volume.apply_commit(commit).expect("Unable to apply commit");
-            info!(lsn, "Commit applied to volume");
-        }
-    });
-
     loop {
         tokio::select! {
             Some((page_no, reply)) = rx.recv() => {
@@ -230,11 +213,15 @@ async fn client_worker(
                                 patches = redo.len(),
                                 "Received snapshot from master"
                             );
-                            commit_tx.send((lsn, redo, undo)).await.expect("Commit loop is broken");
+                            let commit = Commit::new(redo, undo, lsn);
+                            // Committing on network IO event loop only works until Volume does not
+                            // block. Otherwise it might block event loop from processing Page
+                            // read requests and deadlocking commit process
+                            volume.apply_commit(commit).expect("Unable to apply commit");
                         }
                         AssembledCommand::Page(corelation_id, lsn, data) => {
                             if let Some((page_no, tx)) = inflight_pages.remove(&corelation_id) {
-                                let _ = tx.reply(Ok((data.try_into().unwrap(), lsn)));
+                                let _ = tx.reply(Ok((data, lsn)));
                                 trace!(page_no = page_no, lsn = lsn, "Received page");
                             } else {
                                 warn!(cid = corelation_id, "Spourious page detected")
