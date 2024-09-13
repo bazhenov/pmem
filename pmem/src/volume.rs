@@ -1822,15 +1822,23 @@ mod tests {
 
     #[test]
     fn check_iterator_over_page_segments() {
-        assert_eq!(PageSegments::new(10, 0).collect::<Vec<_>>(), vec![]);
+        // Pay notice to take(N) calls. It is needed to stop tests from infinite looping in case
+        // of errors in iteration logic
 
         assert_eq!(
-            PageSegments::new(0, 10).collect::<Vec<_>>(),
+            PageSegments::new(10, 0).take(10).collect::<Vec<_>>(),
+            vec![]
+        );
+
+        assert_eq!(
+            PageSegments::new(0, 10).take(10).collect::<Vec<_>>(),
             vec![(0, 0..10)]
         );
 
         assert_eq!(
-            PageSegments::new(PAGE_SIZE as Addr / 2, PAGE_SIZE).collect::<Vec<_>>(),
+            PageSegments::new(PAGE_SIZE as Addr / 2, PAGE_SIZE)
+                .take(10)
+                .collect::<Vec<_>>(),
             vec![
                 (PAGE_SIZE as Addr / 2, 0..PAGE_SIZE / 2),
                 (PAGE_SIZE as Addr, PAGE_SIZE / 2..PAGE_SIZE),
@@ -1838,7 +1846,9 @@ mod tests {
         );
 
         assert_eq!(
-            PageSegments::new(1, 2 * PAGE_SIZE).collect::<Vec<_>>(),
+            PageSegments::new(1, 2 * PAGE_SIZE)
+                .take(10)
+                .collect::<Vec<_>>(),
             vec![
                 (1, 0..PAGE_SIZE - 1),
                 (PAGE_SIZE as Addr, (PAGE_SIZE - 1)..(2 * PAGE_SIZE - 1)),
@@ -2284,9 +2294,11 @@ mod tests {
 
             #[test]
             fn page_segments_are_equivalent_to_reverted((addr, len) in any_addr_and_len()) {
-                let segments = PageSegments::new(addr, len).collect::<Vec<_>>();
+                // take(N) is needed to prevent infinite loop in case of logic errors in iteration logic
+                // otherwise fuzz testing generates a lot of timeout errors
+                let segments = PageSegments::new(addr, len).take(100).collect::<Vec<_>>();
 
-                let mut segments_rev = PageSegments::new(addr, len).rev().collect::<Vec<_>>();
+                let mut segments_rev = PageSegments::new(addr, len).rev().take(100).collect::<Vec<_>>();
                 segments_rev.sort_by_key(|(addr, _)| *addr);
 
                 prop_assert_eq!(segments, segments_rev);
