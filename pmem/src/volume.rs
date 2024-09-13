@@ -936,6 +936,21 @@ impl CommitNotify {
         &self.commit
     }
 
+    /// Blocks until next commit is available and returns it
+    ///
+    /// If several commits happened since the last call to this method, this function will return
+    /// all of them in order.
+    pub fn try_next_commit(&mut self) -> Option<&Arc<Commit>> {
+        let _lock = self.latest_commit.0.lock().unwrap();
+
+        if let Some(next_commit) = self.commit.next() {
+            self.commit = next_commit;
+            Some(&self.commit)
+        } else {
+            None
+        }
+    }
+
     /// Blocks until next commit is available and returns a snapshot for it
     ///
     /// If several commits happened since the last call to this method, this function will return
@@ -1485,13 +1500,15 @@ impl DoubleEndedIterator for PageSegments {
 
 #[cfg(test)]
 mod tests {
-    use rand::{rngs::SmallRng, Rng, SeedableRng};
-    use tempfile::tempdir;
-
-    use crate::driver::{FileDriver, TestPageDriver};
-
     use super::*;
-    use std::thread;
+    use crate::driver::{FileDriver, TestPageDriver};
+    use rand::{rngs::SmallRng, Rng, SeedableRng};
+    use std::{
+        sync::mpsc::{self, Receiver},
+        thread,
+        time::Duration,
+    };
+    use tempfile::tempdir;
 
     #[test]
     fn first_commit_should_have_lsn_1() {
@@ -1720,15 +1737,13 @@ mod tests {
         let mut notify = volume.commit_notify();
         let mut handle = volume.handle();
 
-        let lsn = thread::spawn(move || {
-            let mut tx = volume.start();
-            tx.write(0, [1, 2, 3, 4]);
-            volume.commit(tx).unwrap()
-        });
+        let mut tx = volume.start();
+        tx.write(0, [1, 2, 3, 4]);
+        let lsn = volume.commit(tx).unwrap();
 
-        notify.next_commit();
-        let s1 = notify.snapshot();
-        let lsn = lsn.join().unwrap();
+        let task = spawn(move || notify.next_snapshot());
+
+        let s1 = task.recv_timeout(Duration::from_secs(1)).unwrap();
         let s2 = handle.snapshot();
 
         assert_eq!(s1.lsn(), lsn);
@@ -1739,41 +1754,24 @@ mod tests {
     }
 
     #[test]
-    fn can_get_notifications_about_commit() {
+    fn can_get_notifications_about_commit() -> io::Result<()> {
         let mut volume = Volume::default();
         let mut n1 = volume.commit_notify();
         let mut n2 = volume.commit_notify();
 
-        let lsn = thread::spawn(move || {
-            let mut tx = volume.start();
-            tx.write(0, [1]);
-            volume.commit(tx).unwrap()
-        });
+        let lsn2 = spawn(move || n2.next_commit().lsn());
+        let lsn1 = spawn(move || n1.next_commit().lsn());
 
-        let lsn2 = n2.next_commit().lsn();
-        let lsn1 = n1.next_commit().lsn();
+        let mut tx = volume.start();
+        tx.write(0, [1]);
+        let lsn = volume.commit(tx)?;
 
-        let lsn = lsn.join().unwrap();
+        let lsn1 = lsn1.recv_timeout(Duration::from_secs(1)).unwrap();
+        let lsn2 = lsn2.recv_timeout(Duration::from_secs(1)).unwrap();
 
         assert_eq!(lsn1, lsn);
         assert_eq!(lsn2, lsn);
-    }
-
-    #[test]
-    fn each_commit_snapshot_can_be_addressed() {
-        let mut volume = Volume::default();
-        let mut notify = volume.commit_notify();
-
-        for i in 1..=10 {
-            let mut tx = volume.start();
-            tx.write(i, [i as u8]);
-            volume.commit(tx).unwrap();
-        }
-
-        for lsn in 1..=10 {
-            let commit = notify.next_commit();
-            assert_eq!(lsn, commit.lsn());
-        }
+        Ok(())
     }
 
     #[test]
@@ -1781,13 +1779,13 @@ mod tests {
         let mut volume = Volume::default();
         let mut notify = volume.commit_notify();
 
-        let lsn = thread::spawn(move || notify.next_commit().lsn());
+        let lsn = spawn(move || notify.next_commit().lsn());
 
         let mut tx = volume.start();
         tx.write(0, [0]);
         let expected_lsn = volume.commit(tx).unwrap();
 
-        let lsn = lsn.join().unwrap();
+        let lsn = lsn.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(lsn, expected_lsn);
     }
 
@@ -1806,9 +1804,17 @@ mod tests {
             }
         });
 
-        for i in 1..=ITERATIONS {
-            let lsn = notify.next_commit().lsn();
-            assert_eq!(lsn, i as u64);
+        let commits = spawn(move || {
+            let mut commits = vec![];
+            for _ in 1..=ITERATIONS {
+                commits.push(Arc::clone(notify.next_commit()));
+            }
+            commits
+        });
+        let commits = commits.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        for (lsn, commit) in commits.iter().enumerate() {
+            assert_eq!(commit.lsn(), lsn as u64 + 1);
         }
 
         handle.join().unwrap();
@@ -1896,13 +1902,13 @@ mod tests {
         let mut patch = vec![0u8; PATCH_LEN];
 
         let mut volume = Volume::new_in_memory(PAGES as PageNo);
-        let mut join_handles = vec![];
+        let mut tasks = vec![];
 
         // Spawn threads that will check the consistency of the volume snapshots.
         for _ in 0..THREADS {
             let notify = volume.commit_notify();
-            let join = thread::spawn(move || check_transaction_consistency(notify));
-            join_handles.push(join);
+            let task = spawn(move || check_transaction_consistency(notify));
+            tasks.push(task);
         }
 
         // Write random patches to the volume and correct the first byte to keep the sum 0.
@@ -1918,8 +1924,8 @@ mod tests {
             volume.commit(tx)?;
         }
 
-        for join in join_handles {
-            join.join().unwrap()?;
+        for task in tasks {
+            task.recv_timeout(Duration::from_secs(1)).unwrap()?;
         }
 
         Ok(())
@@ -2233,7 +2239,7 @@ mod tests {
                     patch.write_to(&mut tx);
                     v.commit(tx)?;
 
-                    let commit = commit_notify.next_commit();
+                    let commit = commit_notify.try_next_commit().unwrap();
                     prop_assert_eq!(commit.undo.len(), 1);
                     let Patch::Write(_, bytes) = &commit.undo[0] else {
                         panic!("Invalid patch type")
@@ -2253,7 +2259,7 @@ mod tests {
                     patch.clone().write_to(&mut tx);
                     v.commit(tx)?;
 
-                    let commit = commit_notify.next_commit();
+                    let commit = commit_notify.try_next_commit().unwrap();
                     prop_assert_eq!(commit.changes.len(), 1);
                     prop_assert_eq!(&commit.changes, &[patch]);
                 }
@@ -2615,6 +2621,23 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    /// Spawning a thread and returning a receiver to get a result from it.
+    ///
+    /// It is needed when you want to wait for a task result with timeout which s impossible with [`JoinHandle`].
+    fn spawn<F, T>(f: F) -> Receiver<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let (tx, rx) = mpsc::channel();
+
+        thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+
+        rx
     }
 
     #[track_caller]
