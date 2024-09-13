@@ -117,7 +117,8 @@ async fn server_worker(mut socket: TcpStream, notify: CommitNotify) -> io::Resul
                     Message::PageRequest(corelation_id, page_no) => {
                         trace!(page_no, cid = corelation_id, "PageRequest received");
 
-                        let page = current_snapshot.read(page_no as Addr * PAGE_SIZE as Addr, PAGE_SIZE).into_owned();
+                        let mut page = Box::new([0; PAGE_SIZE]);
+                        current_snapshot.read_to_buf(page_no as Addr * PAGE_SIZE as Addr, page.as_mut());
                         let lsn = current_snapshot.lsn();
                         trace!(page_no, cid = corelation_id, lsn, "Sending PageReply");
                         Message::PageReply(corelation_id, Cow::Owned(page), lsn)
@@ -206,7 +207,7 @@ async fn client_worker(
         while let Some((lsn, redo, undo)) = commit_rx.blocking_recv() {
             let commit = Commit::new(redo, undo, lsn);
 
-            // TODO in case of error we should fail the main thread
+            // TODO: in case of error we should fail the main thread
             volume.apply_commit(commit).expect("Unable to apply commit");
             info!(lsn, "Commit applied to volume");
         }
@@ -233,7 +234,6 @@ async fn client_worker(
                         }
                         AssembledCommand::Page(corelation_id, lsn, data) => {
                             if let Some((page_no, tx)) = inflight_pages.remove(&corelation_id) {
-                                // TODO: page type should be consistent
                                 let _ = tx.reply(Ok((data.try_into().unwrap(), lsn)));
                                 trace!(page_no = page_no, lsn = lsn, "Received page");
                             } else {
@@ -255,7 +255,7 @@ struct PacketAssembler {
 
 enum AssembledCommand {
     Commit(LSN, Vec<Patch>, Vec<Patch>),
-    Page(u64, LSN, Vec<u8>),
+    Page(u64, LSN, Box<[u8; PAGE_SIZE]>),
 }
 
 impl PacketAssembler {

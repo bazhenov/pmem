@@ -1007,7 +1007,17 @@ pub trait TxRead {
     ///
     /// # Panics
     /// Panic if the address is out of bounds. See [`Self::valid_range`] for bounds checking.
-    fn read(&self, addr: Addr, len: usize) -> Cow<[u8]>;
+    fn read(&self, addr: Addr, len: usize) -> Cow<[u8]> {
+        let mut buf = vec![0; len];
+        self.read_to_buf(addr, &mut buf);
+        Cow::Owned(buf)
+    }
+
+    /// Reads the specified number of bytes from the given address to a given buffer.
+    ///
+    /// # Panics
+    /// Panic if the address is out of bounds. See [`Self::valid_range`] for bounds checking.
+    fn read_to_buf(&self, addr: Addr, buf: &mut [u8]);
 
     /// Checks if the specified range of addresses is valid.
     ///
@@ -1062,17 +1072,15 @@ impl Snapshot {
     // 3. Apply changes from undo log, to restore the state of the page that is possibly changed
     //    by concurrently committed transaction. This is needed to maintain REPETABLE READ
     //    isolation guarantee.
-    fn read_uncommitted(&self, addr: Addr, len: usize, uncommitted: &[Patch]) -> Cow<[u8]> {
-        split_ptr_checked(addr, len, self.pages_count);
-        let mut buf = vec![0; len];
-
-        self.pages.read(addr, &mut buf).unwrap();
+    fn read_uncommitted(&self, addr: Addr, buf: &mut [u8], uncommitted: &[Patch]) {
+        split_ptr_checked(addr, buf.len(), self.pages_count);
+        self.pages.read(addr, buf).unwrap();
 
         #[allow(clippy::single_range_in_vec_init)]
-        let mut buf_mask = vec![0..len];
+        let mut buf_mask = vec![0..buf.len()];
 
         // Apply own uncommitted changes from the given transaction
-        apply_patches(uncommitted, addr as usize, &mut buf, &mut buf_mask);
+        apply_patches(uncommitted, addr as usize, buf, &mut buf_mask);
 
         // Applying with undo log
         // We need to skip first entry in undo log, because it is describing how to undo the changes
@@ -1083,12 +1091,10 @@ impl Snapshot {
                 break;
             };
             if commit.lsn() > self.lsn() {
-                apply_patches(&commit.undo, addr as usize, &mut buf, &mut buf_mask);
+                apply_patches(&commit.undo, addr as usize, buf, &mut buf_mask);
             }
             commit_log = commit.next.load_full();
         }
-
-        Cow::Owned(buf)
     }
 
     pub fn lsn(&self) -> LSN {
@@ -1101,8 +1107,8 @@ impl TxRead for Snapshot {
         is_valid_ptr(addr, len, self.pages_count)
     }
 
-    fn read(&self, addr: Addr, len: usize) -> Cow<[u8]> {
-        self.read_uncommitted(addr, len, &[])
+    fn read_to_buf(&self, addr: Addr, buf: &mut [u8]) {
+        self.read_uncommitted(addr, buf, &[])
     }
 }
 
@@ -1189,8 +1195,8 @@ impl TxRead for Transaction {
         self.base.valid_range(addr, len)
     }
 
-    fn read(&self, addr: Addr, len: usize) -> Cow<[u8]> {
-        self.base.read_uncommitted(addr, len, &self.uncommitted)
+    fn read_to_buf(&self, addr: Addr, buf: &mut [u8]) {
+        self.base.read_uncommitted(addr, buf, &self.uncommitted)
     }
 }
 

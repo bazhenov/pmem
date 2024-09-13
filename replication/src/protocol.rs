@@ -15,7 +15,7 @@ pub enum Message<'a> {
     Commit(LSN),
 
     PageRequest(u64, PageNo),
-    PageReply(u64, Cow<'a, Vec<u8>>, LSN),
+    PageReply(u64, Cow<'a, Box<[u8; PAGE_SIZE]>>, LSN),
 }
 
 pub const PROTOCOL_VERSION: u8 = 1;
@@ -77,8 +77,7 @@ impl<'a> Message<'a> {
                 out.write_u8(PAGE_REPLY).await?;
                 out.write_u64(*corelation_id).await?;
                 out.write_u64(*lsn).await?;
-                out.write_u64(data.len() as u64).await?;
-                out.write_all(data.as_ref()).await?;
+                out.write_all(data.as_ref().as_ref()).await?;
             }
         }
         Ok(())
@@ -143,10 +142,8 @@ impl<'a> Message<'a> {
             PAGE_REPLY => {
                 let corelation_id = input.read_u64().await?;
                 let lsn = input.read_u64().await?;
-                let size = input.read_u64().await? as usize;
-                assert!(size <= PAGE_SIZE, "Page size exceeds maximum");
-                let mut data = vec![0; size];
-                input.read_exact(&mut data).await?;
+                let mut data = Box::new([0; PAGE_SIZE]);
+                input.read_exact(data.as_mut_slice()).await?;
                 Ok(Message::PageReply(corelation_id, Cow::Owned(data), lsn))
             }
             _ => io_result("Invalid discriminator"),
@@ -172,7 +169,8 @@ mod tests {
         assert_read_write_eq(Message::Patch(Cow::Owned(reclaim), Cow::Borrowed(&undo))).await?;
 
         assert_read_write_eq(Message::PageRequest(100, 42)).await?;
-        assert_read_write_eq(Message::PageReply(100, Cow::Owned(vec![1, 2, 3, 4]), 42)).await?;
+        let data = Box::new([42; PAGE_SIZE]);
+        assert_read_write_eq(Message::PageReply(100, Cow::Owned(data), 60)).await?;
 
         assert_read_write_eq(Message::Commit(100)).await?;
         Ok(())
