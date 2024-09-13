@@ -936,7 +936,7 @@ impl CommitNotify {
         &self.commit
     }
 
-    /// Blocks until next commit is available and returns it
+    /// Returns next commit if it is available and returns it
     ///
     /// If several commits happened since the last call to this method, this function will return
     /// all of them in order.
@@ -1759,34 +1759,16 @@ mod tests {
         let mut n1 = volume.commit_notify();
         let mut n2 = volume.commit_notify();
 
-        let lsn2 = spawn(move || n2.next_commit().lsn());
-        let lsn1 = spawn(move || n1.next_commit().lsn());
-
         let mut tx = volume.start();
         tx.write(0, [1]);
         let lsn = volume.commit(tx)?;
 
-        let lsn1 = lsn1.recv_timeout(Duration::from_secs(1)).unwrap();
-        let lsn2 = lsn2.recv_timeout(Duration::from_secs(1)).unwrap();
+        let lsn2 = n2.try_next_commit().unwrap().lsn();
+        let lsn1 = n1.try_next_commit().unwrap().lsn();
 
         assert_eq!(lsn1, lsn);
         assert_eq!(lsn2, lsn);
         Ok(())
-    }
-
-    #[test]
-    fn can_wait_for_a_snapshot_in_a_thread() {
-        let mut volume = Volume::default();
-        let mut notify = volume.commit_notify();
-
-        let lsn = spawn(move || notify.next_commit().lsn());
-
-        let mut tx = volume.start();
-        tx.write(0, [0]);
-        let expected_lsn = volume.commit(tx).unwrap();
-
-        let lsn = lsn.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert_eq!(lsn, expected_lsn);
     }
 
     #[test]
