@@ -704,60 +704,68 @@ impl Pages {
         }
     }
 
-    fn with_page_read(&self, page_no: PageNo, mut f: impl FnMut(&Page)) -> io::Result<()> {
+    fn with_page_read(&self, page_no: PageNo, f: impl FnOnce(&Page)) -> io::Result<()> {
         let lock = self.pages.lock().unwrap();
         let (pages, _) = &*lock;
         if let Some(page) = pages.get(&page_no) {
             f(page);
-            Ok(())
         } else {
             // Driver may block due disk or network IO. Dropping lock before reading page.
             drop(lock);
 
             let mut data = Box::new([0; PAGE_SIZE]);
-            if let Some(lsn) = self.driver.read_page(page_no, data.as_mut())? {
-                let current_commit =
-                    Arc::clone(&self.last_commit.lock().expect("No commit was given"));
-                let mut last_commit_lsn = current_commit.lsn();
-                let mut commit = current_commit.next.load_full();
-                trace!(page_no, lsn, last_commit_lsn, "Implanting page");
-
-                #[allow(clippy::single_range_in_vec_init)]
-                let mut buf_mask = vec![0..PAGE_SIZE];
-
-                while let Some(com) = commit.as_ref() {
-                    if buf_mask.is_empty() || com.lsn() > lsn {
-                        break;
-                    }
-                    last_commit_lsn = com.lsn();
-                    apply_patches(
-                        com.undo(),
-                        page_no as usize * PAGE_SIZE,
-                        data.as_mut(),
-                        buf_mask.as_mut(),
-                    );
-
-                    commit = com.next.load_full();
-                }
-                assert!(
-                    last_commit_lsn == lsn,
-                    "Could not compensate page no. {} with lsn {}. Last commit LSN is {}",
-                    page_no,
-                    lsn,
-                    last_commit_lsn
-                );
-            }
-
-            let mut page = Page {
-                data,
-                lsn: self.last_commit.lock().unwrap().lsn(),
-            };
-
+            let lsn = self
+                .read_and_compensate_page(page_no, &mut data)?
+                // If page is not found, that's ok. We just return empty page assuming it is
+                // actual for current transaction.
+                .unwrap_or_else(|| self.last_commit.lock().unwrap().lsn());
+            let mut page = Page { data, lsn };
             let (pages, _) = &mut *self.pages.lock().unwrap();
             f(&mut page);
+
             pages.insert(page_no, page);
-            Ok(())
         }
+        Ok(())
+    }
+
+    fn read_and_compensate_page(
+        &self,
+        page_no: u32,
+        data: &mut [u8; PAGE_SIZE],
+    ) -> io::Result<Option<LSN>> {
+        let Some(lsn) = self.driver.read_page(page_no, data)? else {
+            return Ok(None);
+        };
+        let current_commit = Arc::clone(&self.last_commit.lock().expect("No commit was given"));
+        let mut last_commit_lsn = current_commit.lsn();
+        let mut commit = current_commit.next.load_full();
+        trace!(page_no, lsn, last_commit_lsn, "Implanting page");
+
+        #[allow(clippy::single_range_in_vec_init)]
+        let mut buf_mask = vec![0..PAGE_SIZE];
+
+        while let Some(com) = commit.as_ref() {
+            if buf_mask.is_empty() || com.lsn() > lsn {
+                break;
+            }
+            last_commit_lsn = com.lsn();
+            apply_patches(
+                com.undo(),
+                page_no as usize * PAGE_SIZE,
+                data,
+                buf_mask.as_mut(),
+            );
+
+            commit = com.next.load_full();
+        }
+        assert!(
+            last_commit_lsn == lsn,
+            "Could not compensate page no. {} with lsn {}. Last commit LSN is {}",
+            page_no,
+            lsn,
+            last_commit_lsn
+        );
+        Ok(Some(lsn))
     }
 
     fn with_page_write(&self, page_no: PageNo, mut f: impl FnMut(&mut Page)) -> io::Result<bool> {
