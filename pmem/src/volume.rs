@@ -84,6 +84,7 @@ pub type Addr = u64;
 pub type PageOffset = u32;
 pub type PageNo = u32;
 pub type LSN = u64;
+pub type Page = Box<[u8; PAGE_SIZE]>;
 
 /// Represents a modification recorded in a snapshot.
 ///
@@ -453,7 +454,7 @@ impl Volume {
     /// * `pages` - The number of pages the volume should initially contain. This determines
     ///   the range of valid addresses that can be written to in snapshots derived from this volume.
     pub fn new_in_memory(page_cnt: PageNo) -> Self {
-        Self::new_with_driver(page_cnt, NoDriver::default())
+        Self::new_with_driver(page_cnt, NoDriver::default()).unwrap()
     }
 
     // TODO page_cnt should be saved with driver
@@ -481,27 +482,33 @@ impl Volume {
         Self::new_in_memory(pages)
     }
 
-    pub fn with_capacity_and_driver(bytes: usize, driver: impl PageDriver + 'static) -> Self {
+    pub fn with_capacity_and_driver(
+        bytes: usize,
+        driver: impl PageDriver + 'static,
+    ) -> io::Result<Self> {
         let pages = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
         let pages = u32::try_from(pages).expect("Too large capacity for the volume");
         Self::new_with_driver(pages, driver)
     }
 
-    pub fn new_with_driver(page_cnt: u32, driver: impl PageDriver + 'static) -> Self {
+    pub fn new_with_driver(page_cnt: u32, driver: impl PageDriver + 'static) -> io::Result<Self> {
+        let lsn = driver.current_lsn();
+        let lsn = if lsn == 0 { 0 } else { lsn + 1 };
+        driver.write_pages(&[], lsn)?;
         assert!(page_cnt > 0, "The number of pages must be greater than 0");
         let commit = Commit {
             changes: vec![],
             undo: vec![],
             next: ArcSwap::from_pointee(None),
-            lsn: 0,
+            lsn,
         };
         let commit = Arc::new(commit);
-        Self {
+        Ok(Self {
             pages: Arc::new(Pages::new(driver, Arc::clone(&commit))),
             pages_count: page_cnt as PageNo,
             latest_commit: Arc::new((Mutex::new(commit), Condvar::new())),
             lsn: AtomicU64::new(0),
-        }
+        })
     }
 
     /// Creates a new transaction over the current state of the volume.
@@ -713,13 +720,11 @@ impl Pages {
             // Driver may block due disk or network IO. Dropping lock before reading page.
             drop(lock);
 
-            let mut data = Box::new([0; PAGE_SIZE]);
-            let lsn = self
-                .read_and_compensate_page(page_no, &mut data)?
+            let mut page = Box::new([0; PAGE_SIZE]);
+            self.read_and_compensate_page(page_no, &mut page)?
                 // If page is not found, that's ok. We just return empty page assuming it is
                 // actual for current transaction.
                 .unwrap_or_else(|| self.last_commit.lock().unwrap().lsn());
-            let mut page = Page { data, lsn };
             let (pages, _) = &mut *self.pages.lock().unwrap();
             f(&mut page);
 
@@ -789,7 +794,7 @@ impl Pages {
             let buf_slice = &mut buf[slice_range];
             self.with_page_read(page_no, move |page| {
                 let page_range = offset..offset + len;
-                buf_slice.copy_from_slice(&page.data[page_range]);
+                buf_slice.copy_from_slice(&page[page_range]);
             })?;
         }
         Ok(())
@@ -806,7 +811,7 @@ impl Pages {
             self.with_page_write(page_no, move |page| {
                 let slice_range = slice_range.clone();
                 let page_range = offset..offset + len;
-                let page_buf = page.data.as_mut_slice();
+                let page_buf = page.as_mut_slice();
                 page_buf[page_range].copy_from_slice(&buf[slice_range]);
             })?;
         }
@@ -822,7 +827,7 @@ impl Pages {
 
             self.with_page_write(page_no, |page| {
                 let page_range = offset..offset + len;
-                let page_buf = page.data.as_mut_slice();
+                let page_buf = page.as_mut_slice();
                 page_buf[page_range].fill(0);
             })?;
         }
@@ -832,16 +837,16 @@ impl Pages {
     fn flush(&self, commit: Arc<Commit>) -> io::Result<()> {
         let lsn = commit.lsn();
         let (pages, dirty) = &mut *self.pages.lock().unwrap();
-        for page_no in dirty.iter() {
-            if let Some(page) = pages.get_mut(page_no) {
-                debug!(page_no, "Flushing page");
-                self.driver.write_page(*page_no, page.data.as_ref(), lsn)?;
-                page.lsn = lsn;
-            }
-        }
+        let read_page_fn = |page_no: PageNo| {
+            let page = pages.get(&page_no).expect("Dirty page missing").as_ref();
+            (page_no, page)
+        };
+        let dirty_pages = dirty.iter().copied().map(read_page_fn).collect::<Vec<_>>();
+        debug!(pages = dirty_pages.len(), "Flushing pages");
+        self.driver.write_pages(&dirty_pages, lsn)?;
         dirty.clear();
         *self.last_commit.lock().unwrap() = commit;
-        self.driver.flush()
+        Ok(())
     }
 
     fn into_inner(self) -> Box<dyn PageDriver> {
@@ -857,11 +862,6 @@ impl Pages {
         pages.clear();
         dirty.clear();
     }
-}
-
-struct Page {
-    data: Box<[u8; PAGE_SIZE]>,
-    lsn: LSN,
 }
 
 #[derive(Clone)]
@@ -1855,17 +1855,16 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "temporary disabled. LSN should be restored after reopen"] // TODO
     fn page_volume_can_be_restored_after_reopen() -> io::Result<()> {
         let tempdir = tempdir()?;
         let db_file = tempdir.path().join("test.db");
-        let mut volume = Volume::new_with_driver(1, FileDriver::from_file(&db_file)?);
+        let mut volume = Volume::new_with_driver(1, FileDriver::from_file(&db_file)?)?;
 
         let mut tx = volume.start();
         tx.write(0, [42]);
         volume.commit(tx).unwrap();
 
-        let volume = Volume::new_with_driver(1, FileDriver::from_file(&db_file)?);
+        let volume = Volume::new_with_driver(1, FileDriver::from_file(&db_file)?)?;
         assert_eq!(&*volume.read(0, 1), [42]);
         Ok(())
     }
@@ -1957,9 +1956,8 @@ mod tests {
     #[test]
     fn check_implant_page() -> io::Result<()> {
         let driver = TestPageDriver {
-            pages: vec![
-                (3, [3; PAGE_SIZE]), // LSN + PageContent
-            ],
+            pages: vec![Box::new([3; PAGE_SIZE])],
+            lsn: 3,
         };
 
         let commit = commit_log(&[

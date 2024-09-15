@@ -162,15 +162,13 @@ pub async fn replica_connect(
                     return io_result("Invalid message: initial commit expected");
                 };
                 debug!(lsn, "Received initial commit from server");
-                break if lsn == 0 {
+                if lsn == 0 {
                     // Don't need to do nothing, because master has not commits (the volume is empty)
                     // Need to check it is indeed the empty initial commit
                     assert!(redo.is_empty(), "Initial commit must be empty");
-                    Volume::new_with_driver(pages, driver)
-                } else {
-                    let commit = Commit::new(redo, undo, lsn);
-                    Volume::from_commit(pages, commit, driver)
-                };
+                }
+                let commit = Commit::new(redo, undo, lsn);
+                break Volume::from_commit(pages, commit, driver);
             }
         }
     };
@@ -296,12 +294,12 @@ impl PageDriver for NetworkDriver {
         Ok(Some(lsn))
     }
 
-    fn write_page(&self, _page_no: PageNo, _page: &[u8; PAGE_SIZE], _lsn: LSN) -> io::Result<()> {
+    fn write_pages(&self, _pages: &[(PageNo, &[u8; PAGE_SIZE])], _lsn: LSN) -> io::Result<()> {
         Ok(())
     }
 
-    fn flush(&self) -> io::Result<()> {
-        Ok(())
+    fn current_lsn(&self) -> LSN {
+        unimplemented!()
     }
 }
 

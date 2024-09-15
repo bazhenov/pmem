@@ -1,4 +1,4 @@
-use rfs::Filesystem;
+use rfs::{Filesystem, FsTree};
 use std::io;
 use tokio::task::spawn_blocking;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -29,6 +29,7 @@ async fn main() {
             let fs_a = Filesystem::open(a);
             let fs_b = Filesystem::open(b);
             let changes = fs_b.changes_from(&fs_a);
+            println!("{:?}", FsTree(&fs_a));
             for change in changes {
                 println!("{:?} {}", change.kind(), change.into_path().display());
             }

@@ -23,7 +23,8 @@ async fn main() {
     let file_path = "./target/test.db";
     let db_exists = fs::metadata(file_path).is_err();
     let driver = FileDriver::from_file(file_path).unwrap();
-    let mut volume = Volume::with_capacity_and_driver(100 * 1024 * 1024, driver);
+    let mut volume = Volume::with_capacity_and_driver(100 * 1024 * 1024, driver)
+        .expect("Volume creation failed");
     if db_exists {
         warn!(path = file_path, "Allocating FS");
         let tx = Filesystem::allocate(volume.start()).finish();
