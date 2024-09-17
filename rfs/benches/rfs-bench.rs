@@ -3,8 +3,8 @@ use rand::{rngs::SmallRng, seq::SliceRandom, Rng, SeedableRng};
 use rfs::{FileMeta, Filesystem};
 use std::io::{Read, Seek, SeekFrom, Write};
 use tango_bench::{
-    benchmark_fn, tango_benchmarks, tango_main, Bencher, IntoBenchmarks, MeasurementSettings,
-    Sampler,
+    benchmark_fn, tango_benchmarks, tango_main, Bencher, ErasedSampler, IntoBenchmarks,
+    MeasurementSettings,
 };
 
 const BLOCK: [u8; 4096] = [0xAA; 4096];
@@ -21,7 +21,7 @@ fn page_benchmarks() -> impl IntoBenchmarks {
     ]
 }
 
-fn streaming_write_4m(b: Bencher) -> Box<dyn Sampler> {
+fn streaming_write_4m(b: Bencher) -> Box<dyn ErasedSampler> {
     let mut fs = create_fs();
     let root = fs.get_root().unwrap();
     let file = fs.create_file(&root, "file").unwrap();
@@ -36,7 +36,7 @@ fn streaming_write_4m(b: Bencher) -> Box<dyn Sampler> {
     })
 }
 
-fn streaming_read_4m(b: Bencher) -> Box<dyn Sampler> {
+fn streaming_read_4m(b: Bencher) -> Box<dyn ErasedSampler> {
     let mut fs = create_fs();
     let meta = create_test_file(&mut fs, FILE_SIZE);
     let mut buf = vec![0u8; BLOCK.len()];
@@ -47,7 +47,7 @@ fn streaming_read_4m(b: Bencher) -> Box<dyn Sampler> {
     })
 }
 
-fn random_write_4k(b: Bencher) -> Box<dyn Sampler> {
+fn random_write_4k(b: Bencher) -> Box<dyn ErasedSampler> {
     let mut fs = create_fs();
     let mut rand = SmallRng::seed_from_u64(b.seed);
     let meta = create_test_file(&mut fs, FILE_SIZE);
@@ -63,7 +63,7 @@ fn random_write_4k(b: Bencher) -> Box<dyn Sampler> {
     })
 }
 
-fn random_read_4k(b: Bencher) -> Box<dyn Sampler> {
+fn random_read_4k(b: Bencher) -> Box<dyn ErasedSampler> {
     let mut fs = create_fs();
     let mut rand = SmallRng::seed_from_u64(b.seed);
     let meta = create_test_file(&mut fs, FILE_SIZE);
@@ -80,7 +80,7 @@ fn random_read_4k(b: Bencher) -> Box<dyn Sampler> {
     })
 }
 
-fn create_100_empty_files(b: Bencher) -> Box<dyn Sampler> {
+fn create_100_empty_files(b: Bencher) -> Box<dyn ErasedSampler> {
     b.iter(move || {
         let mut fs = create_fs();
         let root = fs.get_root().unwrap();
@@ -106,7 +106,7 @@ fn create_test_file(fs: &mut Filesystem<impl TxWrite>, file_size: u64) -> FileMe
     meta
 }
 
-fn navigate_directories(b: Bencher) -> Box<dyn Sampler> {
+fn navigate_directories(b: Bencher) -> Box<dyn ErasedSampler> {
     // TODO: How to create this setup only once?
     let mut rnd = SmallRng::seed_from_u64(b.seed);
     let mut fs = create_fs();

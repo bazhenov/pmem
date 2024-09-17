@@ -2,8 +2,8 @@ use pmem::volume::{Addr, TxRead, TxWrite, Volume};
 use rand::{rngs::SmallRng, Rng, SeedableRng};
 use std::{hint::black_box, ops::Range};
 use tango_bench::{
-    benchmark_fn, tango_benchmarks, tango_main, Bencher, IntoBenchmarks, MeasurementSettings,
-    Sampler,
+    benchmark_fn, tango_benchmarks, tango_main, Bencher, ErasedSampler, IntoBenchmarks,
+    MeasurementSettings,
 };
 
 const DB_SIZE: usize = 100 * 1024 * 1024;
@@ -17,7 +17,7 @@ fn page_benchmarks() -> impl IntoBenchmarks {
     ]
 }
 
-fn arbitrary_read_1k(b: Bencher) -> Box<dyn Sampler> {
+fn arbitrary_read_1k(b: Bencher) -> Box<dyn ErasedSampler> {
     const PATCH_SIZE: usize = 1024;
     let mut rng = SmallRng::seed_from_u64(b.seed);
 
@@ -30,7 +30,7 @@ fn arbitrary_read_1k(b: Bencher) -> Box<dyn Sampler> {
     })
 }
 
-fn arbitrary_write_1k(b: Bencher) -> Box<dyn Sampler> {
+fn arbitrary_write_1k(b: Bencher) -> Box<dyn ErasedSampler> {
     const PATCH_SIZE: usize = 1024;
     let mut rng = SmallRng::seed_from_u64(b.seed);
 
@@ -52,13 +52,12 @@ fn arbitrary_write_1k(b: Bencher) -> Box<dyn Sampler> {
     })
 }
 
-fn write_commit_1k(b: Bencher) -> Box<dyn Sampler> {
+fn write_commit_1k(b: Bencher) -> Box<dyn ErasedSampler> {
     const PATCH_SIZE: usize = 1024;
     let mut rng = SmallRng::seed_from_u64(b.seed);
 
     let mut patch = vec![0u8; PATCH_SIZE];
     rng.fill(&mut patch[..]);
-
     let mut vol = Volume::with_capacity(DB_SIZE);
 
     b.iter(move || {
@@ -70,7 +69,7 @@ fn write_commit_1k(b: Bencher) -> Box<dyn Sampler> {
 }
 
 /// This benchmark measures the time it takes for a repeated read operation to read through the undo log.
-fn repeatable_read_tx_1k(b: Bencher) -> Box<dyn Sampler> {
+fn repeatable_read_tx_1k(b: Bencher) -> Box<dyn ErasedSampler> {
     const PATCH_SIZE: usize = 1024;
     const TRANSACTIONS: usize = 1000;
 
