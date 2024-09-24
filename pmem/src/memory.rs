@@ -59,6 +59,22 @@ pub struct Memory<T> {
 struct MemoryInfo {
     /// Next address to allocate objects
     next_addr: Addr,
+
+    /// Pointer to the first block in the memory that can be reused
+    free_list: Option<Ptr<FreeBlock>>,
+}
+
+/// Each allocation block has a header with the size of the block
+#[derive(Record)]
+struct AllocatedBlock {
+    size: u32,
+}
+
+/// Header of a block of memory that was freed using [`Memory::reclaim()`] call.
+#[derive(Record)]
+struct FreeBlock {
+    size: u32,
+    next: Option<Ptr<FreeBlock>>,
 }
 
 impl MemoryInfo {
@@ -90,19 +106,17 @@ impl<S: TxRead> Memory<S> {
     }
 
     pub fn read_super_block<T: Record>(&self) -> Result<Handle<T>> {
-        let ptr = Ptr::from_addr(START_ADDR + MemoryInfo::SIZE as Addr).unwrap();
-        self.lookup(ptr)
+        let addr = START_ADDR + (MemoryInfo::SIZE + AllocatedBlock::SIZE) as Addr;
+        self.lookup(Ptr::from_addr(addr).unwrap())
     }
 
     pub fn lookup<T: Record>(&self, ptr: Ptr<T>) -> Result<Handle<T>> {
         let bytes = self.read_uncommitted(ptr.addr, T::SIZE);
         let value = T::read(&bytes)?;
-        let size = T::SIZE;
 
         Ok(Handle {
             addr: ptr.addr,
             value,
-            size,
         })
     }
 
@@ -149,7 +163,10 @@ impl<S: TxWrite> Memory<S> {
     pub fn init(mut tx: S) -> Self {
         let next_addr = START_ADDR + MemoryInfo::SIZE as Addr;
 
-        let mem_info = MemoryInfo { next_addr };
+        let mem_info = MemoryInfo {
+            next_addr,
+            free_list: None,
+        };
 
         let mut bytes = [0u8; MemoryInfo::SIZE];
         mem_info.write(&mut bytes).unwrap();
@@ -160,12 +177,42 @@ impl<S: TxWrite> Memory<S> {
 
     fn alloc_space(&mut self, size: usize) -> Result<Addr> {
         assert!(size > 0);
+        // Trying to find a free block
+        let mut free_block = self.mem_info.free_list;
+        let mut prev_free_block: Option<Ptr<FreeBlock>> = None;
+        while let Some(ptr) = free_block {
+            let block = self.lookup(ptr)?;
+            if block.size >= size as u32 {
+                // Found a block that fits the size. Marking it as allocated
+                let allocated = AllocatedBlock { size: size as u32 };
+                self.write_at(Ptr::from_addr(ptr.addr).unwrap(), allocated)?;
+
+                // Removing the block from the free list
+                if let Some(prev) = prev_free_block {
+                    let mut prev_block = self.lookup(prev)?;
+                    prev_block.next = block.next;
+                    self.update(&prev_block)?;
+                } else {
+                    self.mem_info.free_list = block.next;
+                }
+
+                // We need to return the address after the header
+                return Ok(ptr.addr + AllocatedBlock::SIZE as Addr);
+            } else {
+                prev_free_block = free_block;
+                free_block = block.next;
+            }
+        }
+
+        // Creating new allocation
+        let size = size + AllocatedBlock::SIZE;
         let addr = self.mem_info.next_addr;
         if !self.tx.valid_range(addr, size) {
             return Err(Error::NoSpaceLeft);
         }
+        self.write_at(Ptr::from_addr(addr).unwrap(), size as u32)?;
         self.mem_info.next_addr += size as Addr;
-        Ok(addr)
+        Ok(addr + AllocatedBlock::SIZE as Addr)
     }
 
     pub fn alloc<T: Record>(&mut self) -> Result<Ptr<T>> {
@@ -174,15 +221,15 @@ impl<S: TxWrite> Memory<S> {
     }
 
     pub fn write_at<T: Record>(&mut self, ptr: Ptr<T>, value: T) -> Result<Handle<T>> {
-        let (ptr, size) = self.write_to_memory(&value, Some(ptr))?;
+        let ptr = self.write_to_memory(&value, Some(ptr))?;
         let addr = ptr.addr;
-        Ok(Handle { addr, value, size })
+        Ok(Handle { addr, value })
     }
 
     pub fn write<T: Record>(&mut self, value: T) -> Result<Handle<T>> {
-        let (ptr, size) = self.write_to_memory(&value, None)?;
+        let ptr = self.write_to_memory(&value, None)?;
         let addr = ptr.addr;
-        Ok(Handle { addr, value, size })
+        Ok(Handle { addr, value })
     }
 
     pub fn write_slice<T: Record>(&mut self, values: &[T]) -> Result<SlicePtr<T>> {
@@ -236,11 +283,7 @@ impl<S: TxWrite> Memory<S> {
 
     /// Writes object to a given address or allocates new memory for an object and writes to it
     /// Returns the pointer and the size of the block
-    fn write_to_memory<T: Record>(
-        &mut self,
-        value: &T,
-        ptr: Option<Ptr<T>>,
-    ) -> Result<(Ptr<T>, usize)> {
+    fn write_to_memory<T: Record>(&mut self, value: &T, ptr: Option<Ptr<T>>) -> Result<Ptr<T>> {
         let mut buffer = vec![0u8; T::SIZE];
 
         let size = buffer.len();
@@ -256,7 +299,7 @@ impl<S: TxWrite> Memory<S> {
             let addr = ptr.addr;
             this.tx.write(addr, buffer)
         };
-        Ok((ptr, size))
+        Ok(ptr)
     }
 
     pub fn update<T: Record>(&mut self, handle: &Handle<T>) -> Result<()> {
@@ -264,9 +307,23 @@ impl<S: TxWrite> Memory<S> {
         Ok(())
     }
 
-    pub fn reclaim<T>(&mut self, handle: Handle<T>) -> T {
-        self.tx.reclaim(handle.addr, handle.size);
-        handle.into_inner()
+    pub fn reclaim<T>(&mut self, ptr: Ptr<T>) -> Result<()> {
+        // Reading allocation size from the header
+        let ptr = Ptr::from_addr(ptr.addr - AllocatedBlock::SIZE as Addr).unwrap();
+        let block = self.lookup::<AllocatedBlock>(ptr)?;
+
+        // Marking block as free
+        self.tx.reclaim(ptr.addr, block.size as usize);
+        let free_block = FreeBlock {
+            size: block.size,
+            next: self.mem_info.free_list,
+        };
+        let ptr = Ptr::from_addr(block.addr).unwrap();
+        self.write_at(ptr, free_block)?;
+
+        // Updating free list head
+        self.mem_info.free_list = Some(ptr);
+        Ok(())
     }
 
     pub fn finish(self) -> S {
@@ -277,6 +334,34 @@ impl<S: TxWrite> Memory<S> {
         mem_info.update(&mut snapshot);
         snapshot
     }
+}
+
+#[derive(Record)]
+struct Slabs {
+    /// Objects of size smaller than 512KB are allocated in slabs – fixed size blocks.
+    ///
+    /// 16 slabs provides way to allocate objects of sizes from 2^3 (8 bytes) to 2^19 (512KB).
+    slabs: [Slab; 16],
+
+    /// Large objects of size greater than 512KB, are allocated in an adhoc way.
+    /// They have a separate linked list of free blocks which contains not only pointer to the next block
+    /// but also the size of the block.
+    next_allocation: Addr,
+    free_list: Addr,
+}
+
+/// Each slab provide fixed sized allocations for objects of the same size or roughly the same size.
+///
+/// Maintaining a set of N slabs of 2^N sizes provide a way to allocate/deallocate objects of different sizes
+/// without fragmentation.
+#[derive(Record, Default, Copy, Clone)]
+struct Slab {
+    /// Address of the allocation for the next object
+    current_block: Addr,
+
+    /// Linked list of free blocks, each block is of the same size defined by the number of
+    /// Slab in a Slabs array
+    free_list: Addr,
 }
 
 pub struct Ptr<T> {
@@ -492,7 +577,6 @@ impl<T: NonZeroRecord> Record for Option<T> {
 
 pub struct Handle<T> {
     addr: Addr,
-    size: usize,
     value: T,
 }
 
@@ -538,9 +622,8 @@ pub const fn max<const N: usize>(array: [usize; N]) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use crate::volume::Volume;
-
     use super::*;
+    use crate::volume::{Volume, PAGE_SIZE};
     use pmem_derive::Record;
     use std::mem;
 
@@ -606,6 +689,49 @@ mod tests {
     }
 
     #[test]
+    fn memory_can_reuse_memory() -> Result<()> {
+        let volume = Volume::with_capacity(PAGE_SIZE * 3);
+        let mut mem = Memory::init(volume.start());
+
+        for _ in 0..10 {
+            // We allocate several times to check if free list is handled correctly
+            let ptr_a = mem.alloc::<[u8; PAGE_SIZE]>()?;
+            let ptr_b = mem.alloc::<[u8; PAGE_SIZE]>()?;
+            mem.reclaim(ptr_a)?;
+            mem.reclaim(ptr_b)?;
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn memory_can_reuse_memory_after_reopen() -> Result<()> {
+        let mut volume = Volume::with_capacity(PAGE_SIZE * 3);
+        let mut mem = Memory::init(volume.start());
+
+        let ptr_a = mem.alloc::<[u8; PAGE_SIZE]>()?;
+        let ptr_b = mem.alloc::<[u8; PAGE_SIZE]>()?;
+        mem.reclaim(ptr_a)?;
+        mem.reclaim(ptr_b)?;
+        assert!(
+            mem.mem_info.free_list.is_some(),
+            "Free list should not be empty"
+        );
+
+        volume.commit(mem.finish()).unwrap();
+
+        let mut mem = Memory::open(volume.start());
+        assert!(
+            mem.mem_info.free_list.is_some(),
+            "Free list should not be empty"
+        );
+        mem.alloc::<[u8; PAGE_SIZE]>()?;
+        mem.alloc::<[u8; PAGE_SIZE]>()?;
+
+        Ok(())
+    }
+
+    #[test]
     fn check_error() {
         let mem = Memory::new();
 
@@ -625,7 +751,7 @@ mod tests {
 
         let handle = mem.write(Value(42))?;
         let ptr = handle.ptr();
-        mem.reclaim(handle);
+        mem.reclaim(ptr)?;
         let result = mem.read(ptr)?;
         // should be zero, because we use zero-fill semantics
         assert_eq!(result, Value(0));

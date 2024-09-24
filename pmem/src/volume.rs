@@ -591,7 +591,7 @@ impl Volume {
 
         // Updating commit log
         // We need to update commit log before updating pages. Reading process should always have
-        // undo logs to be able to rollback in-flight ch
+        // undo logs to be able to rollback in-flight changes
         let lsn = commit.lsn;
         let changes = commit.changes.len();
         let commit = Arc::new(commit);

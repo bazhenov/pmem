@@ -181,7 +181,7 @@ impl<S: TxWrite> Filesystem<S> {
         let file = self.find_child(children, name.as_ref())?;
 
         let next_ptr = file.node.next;
-        self.mem.reclaim(file.node);
+        self.mem.reclaim(file.node.ptr())?;
 
         if let Some(mut referent) = file.referent {
             // Child is not first in a list
