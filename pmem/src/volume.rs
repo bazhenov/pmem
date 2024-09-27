@@ -81,7 +81,7 @@ pub const PAGE_SIZE_BITS: usize = 16;
 pub const PAGE_SIZE: usize = 1 << PAGE_SIZE_BITS; // 64Kib
 
 pub type Addr = u64;
-pub type PageOffset = u32;
+pub type PageOffset = u16;
 pub type PageNo = u32;
 pub type LSN = u64;
 pub type Page = Box<[u8; PAGE_SIZE]>;
@@ -2199,8 +2199,8 @@ mod tests {
             let addr = PAGE_SIZE as Addr - 1; // Last address of the first page
             let (page_no, offset) = split_ptr(addr);
 
-            assert_eq!(page_no, 0,);
-            assert_eq!(offset, PAGE_SIZE as u32 - 1,);
+            assert_eq!(page_no, 0);
+            assert_eq!(offset, (PAGE_SIZE - 1) as PageOffset);
         }
 
         #[test]
