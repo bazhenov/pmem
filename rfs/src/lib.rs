@@ -181,6 +181,24 @@ impl<S: TxWrite> Filesystem<S> {
         let file = self.find_child(children, name.as_ref())?;
 
         let next_ptr = file.node.next;
+
+        // Delete all data blocks
+        for data_block_ptr in self.iter_blocks(&file.node.content)? {
+            self.mem.reclaim(data_block_ptr)?;
+        }
+        // Reclaiming memory of the indirect block it it exists
+        if let Some(indirect_ptr) = file.node.content.indirect {
+            self.mem.reclaim(indirect_ptr)?;
+        }
+        // Reclaiming memory of double indirect blocks if they exist
+        if let Some(double_indirect_ptr) = file.node.content.double_indirect {
+            let double_indirect = self.mem.lookup(double_indirect_ptr)?.into_iter();
+            for indirect_ptr in double_indirect.into_iter().flatten() {
+                self.mem.reclaim(indirect_ptr)?;
+            }
+            self.mem.reclaim(double_indirect_ptr)?;
+        }
+
         self.mem.reclaim(file.node.ptr())?;
 
         if let Some(mut referent) = file.referent {
@@ -329,6 +347,36 @@ impl<S: TxWrite> Filesystem<S> {
         };
         self.mem.update(&self.volume)?;
         Ok(self.mem.write(entry)?)
+    }
+
+    /// Returns iterator over pointers to all [`DataBlock`]: direct, indirect and double indirect
+    fn iter_blocks(&self, ptrs: &BlockPointers) -> Result<impl Iterator<Item = Ptr<DataBlock>>> {
+        let mut iters = vec![];
+
+        let direct = DataBlockPtrIterator {
+            block: ptrs.direct.to_vec(),
+            idx: 0,
+        };
+        iters.push(direct);
+
+        if let Some(indirect) = ptrs.indirect {
+            let iter = DataBlockPtrIterator {
+                block: self.mem.lookup(indirect)?.to_vec(),
+                idx: 0,
+            };
+            iters.push(iter);
+        }
+
+        if let Some(double_indirect) = ptrs.double_indirect {
+            let double_indirect = self.mem.lookup(double_indirect)?;
+            for ptr in double_indirect.into_iter().flatten() {
+                let block = self.mem.lookup(ptr)?.to_vec();
+                let iter = DataBlockPtrIterator { block, idx: 0 };
+                iters.push(iter);
+            }
+        }
+
+        Ok(iters.into_iter().flatten())
     }
 }
 
@@ -893,6 +941,25 @@ const LAST_DOUBLE_INDIRECT_BLOCK: usize = FIRST_DOUBLE_INDIRECT_BLOCK + DOUBLE_I
 type NullPtr<T> = Option<Ptr<T>>;
 type PointersBlock<T> = [NullPtr<T>; BLOCK_SIZE / PTR_SIZE];
 
+struct DataBlockPtrIterator {
+    block: Vec<NullPtr<DataBlock>>,
+    idx: usize,
+}
+
+impl Iterator for DataBlockPtrIterator {
+    type Item = Ptr<DataBlock>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.idx < self.block.len() {
+            let item = self.block[self.idx];
+            self.idx += 1;
+            item
+        } else {
+            None
+        }
+    }
+}
+
 /// This wrapper exists primarily to opt out of default implementation of `Record` trait
 /// for arrays. We want to have a custom implementation that will write the array directly as slice.
 struct DataBlock([u8; BLOCK_SIZE]);
@@ -1075,8 +1142,12 @@ impl<'a, S: TxRead> fmt::Debug for FsTree<'a, S> {
 mod tests {
     use super::*;
     use fmt::Debug;
-    use pmem::volume::{Transaction, Volume};
-    use std::{collections::HashSet, fs};
+    use pmem::volume::{Transaction, Volume, PAGE_SIZE};
+    use std::{cmp::max, collections::HashSet, fs};
+
+    // Maximum file size is 5184 bytes in test environment. So in order to trigger NoSpaceLeft
+    // we need to write 64Kib (1 page in Volume) / 5184 = 13 files.
+    const MAX_FILE_SIZE: usize = BLOCK_SIZE * LAST_DOUBLE_INDIRECT_BLOCK;
 
     macro_rules! assert_not_exists {
         ($fs:expr, $name:expr) => {
@@ -1362,7 +1433,7 @@ mod tests {
 
         let data = [1u8; BLOCK_SIZE * 2];
         write_file(&mut fs, &file_meta, &data, None)?;
-        let read_data = read_file(fs, file_meta, BLOCK_SIZE * 2, None)?;
+        let read_data = read_file(&mut fs, &file_meta, BLOCK_SIZE * 2, None)?;
 
         assert_eq!(&read_data, &data);
 
@@ -1379,7 +1450,7 @@ mod tests {
 
         let data = [1u8; 2 * BLOCK_SIZE];
         write_file(&mut fs, &meta, &data, Some(pos))?;
-        let read_data = read_file(fs, meta, 2 * BLOCK_SIZE, Some(pos))?;
+        let read_data = read_file(&mut fs, &meta, 2 * BLOCK_SIZE, Some(pos))?;
 
         assert_eq!(&read_data, &data);
         Ok(())
@@ -1395,20 +1466,20 @@ mod tests {
 
         let data = [1u8; 2 * BLOCK_SIZE];
         write_file(&mut fs, &meta, &data, Some(pos))?;
-        let read_data = read_file(fs, meta, 2 * BLOCK_SIZE, Some(pos))?;
+        let read_data = read_file(&mut fs, &meta, 2 * BLOCK_SIZE, Some(pos))?;
 
         assert_eq!(&read_data, &data);
         Ok(())
     }
 
     fn read_file(
-        mut fs: Filesystem<impl TxRead>,
-        meta: FileMeta,
+        fs: &mut Filesystem<impl TxRead>,
+        meta: &FileMeta,
         size: usize,
         pos: Option<SeekFrom>,
     ) -> Result<Vec<u8>> {
         let mut buf = vec![0u8; size];
-        let mut file = fs.open_file(&meta)?;
+        let mut file = fs.open_file(meta)?;
         if let Some(pos) = pos {
             file.seek(pos)?;
         }
@@ -1434,10 +1505,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "NoSpaceLeft")]
     fn no_space_left() {
-        // Maximum file size is 5184 bytes in test environment. So in order to trigger NoSpaceLeft
-        // we need to write 64Kib (1 page in Volume) / 5184 = 13 files.
-        const MAX_FILE_SIZE: usize = BLOCK_SIZE * LAST_DOUBLE_INDIRECT_BLOCK;
-
         let (mut fs, _) = create_fs();
         let root = fs.get_root().unwrap();
 
@@ -1488,6 +1555,58 @@ mod tests {
         expected.insert(PathBuf::from("/a/b"));
         expected.insert(PathBuf::from("/a/b/c"));
         assert_eq!(paths, expected);
+    }
+
+    #[test]
+    fn check_block_pointer_iterator() -> Result<()> {
+        let (mut fs, _) = create_fs();
+        let root = fs.get_root()?;
+        let file_meta = fs.create_file(&root, "test_file.txt")?;
+
+        let file_size = MAX_FILE_SIZE;
+        let data = vec![42u8; file_size];
+        write_file(&mut fs, &file_meta, &data, None)?;
+
+        let file_info = fs.lookup_inode(&file_meta)?;
+        let block_count = fs.iter_blocks(&file_info.content)?.count();
+
+        let expected_blocks = file_size / BLOCK_SIZE;
+        assert_eq!(block_count, expected_blocks);
+
+        Ok(())
+    }
+
+    #[test]
+    fn check_fs_reuses_freed_space() -> Result<()> {
+        let (mut fs, _) = create_fs_with_size(PAGE_SIZE);
+        let root = fs.get_root()?;
+
+        // Calculate the number of times we need to write to fill the volume
+        let writes_to_fill = max(1, PAGE_SIZE / MAX_FILE_SIZE);
+
+        let content = "A".repeat(MAX_FILE_SIZE);
+
+        // Write file severals times to fill the filesystem
+        for _ in 0..writes_to_fill {
+            let file = fs.create_file(&root, "file.txt")?;
+            write_file(&mut fs, &file, content.as_bytes(), None)?;
+            fs.delete(&root, "file.txt")?;
+        }
+
+        // If in previous step space was not reused, this write will fail
+        let file2 = fs.create_file(&root, "file2.txt")?;
+        let content2 = "B".repeat(MAX_FILE_SIZE);
+        write_file(&mut fs, &file2, content2.as_bytes(), None)?;
+
+        // Verify that file2 exists and has correct content
+        let read_content = read_file(&mut fs, &file2, content2.len(), None)?;
+        assert_eq!(
+            read_content,
+            content2.as_bytes(),
+            "file2.txt content is incorrect"
+        );
+
+        Ok(())
     }
 
     /// Iterates over all intermediate paths of the given path excluding the root.
@@ -1559,6 +1678,11 @@ mod tests {
             let dir_meta = fs.create_dirs(dir_name).unwrap();
             fs.create_file(&dir_meta, file_name).unwrap();
         }
+    }
+
+    fn create_fs_with_size(size: usize) -> (Filesystem<Transaction>, Volume) {
+        let volume = Volume::with_capacity(size);
+        (Filesystem::allocate(volume.start()), volume)
     }
 
     fn create_fs() -> (Filesystem<Transaction>, Volume) {
