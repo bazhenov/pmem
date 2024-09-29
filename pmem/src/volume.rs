@@ -65,10 +65,7 @@ use std::{
     fmt::{self, Display, Formatter},
     io,
     ops::Range,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Condvar, Mutex,
-    },
+    sync::{Arc, Condvar, Mutex},
 };
 use tracing::{debug, error, info, trace};
 
@@ -423,10 +420,6 @@ pub struct Volume {
     pages: Arc<Pages>,
     pages_count: PageNo,
 
-    /// A log sequence number (LSN) that uniquely identifies this snapshot. The LSN
-    /// is used internally to ensure that snapshots are applied in a linear and consistent order.
-    lsn: AtomicU64,
-
     /// Reference to the latest commit and condition variable used to notify waiting threads
     /// that a new commit has been completed
     ///
@@ -465,13 +458,11 @@ impl Volume {
     ) -> Self {
         let commit = Arc::new(commit);
         let pages = Arc::new(Pages::new(driver, commit.clone()));
-        let lsn = commit.lsn;
         let pages_count = page_cnt;
         let latest_commit = Arc::new((Mutex::new(commit), Condvar::new()));
         Self {
             pages,
             pages_count,
-            lsn: AtomicU64::new(lsn),
             latest_commit,
         }
     }
@@ -507,7 +498,6 @@ impl Volume {
             pages: Arc::new(Pages::new(driver, Arc::clone(&commit))),
             pages_count: page_cnt as PageNo,
             latest_commit: Arc::new((Mutex::new(commit), Condvar::new())),
-            lsn: AtomicU64::new(0),
         })
     }
 
@@ -578,14 +568,12 @@ impl Volume {
         let (lock, notify) = self.latest_commit.as_ref();
         let mut last_commit = lock.lock().unwrap();
 
-        let current_lsn = self.lsn.load(Ordering::Acquire);
+        let current_lsn = last_commit.lsn();
         if commit.lsn != current_lsn + 1 {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "The volume was changed since the transaction was created",
-            ));
+            let message = format!(
+                "The volume was changed since the transaction was created (LSN {} does not match expected LSN {})", commit.lsn, current_lsn + 1);
+            return Err(io::Error::new(io::ErrorKind::Other, message));
         }
-        self.lsn.store(commit.lsn, Ordering::Release);
 
         let patches = commit.changes.clone();
 
@@ -1866,6 +1854,31 @@ mod tests {
 
         let volume = Volume::new_with_driver(1, FileDriver::from_file(&db_file)?)?;
         assert_eq!(&*volume.read(0, 1), [42]);
+        Ok(())
+    }
+
+    #[test]
+    fn commit_after_reopen() -> io::Result<()> {
+        let tempdir = tempdir()?;
+        let db_file = tempdir.path().join("test.db");
+
+        // Create and write to the initial volume
+        let mut volume = Volume::new_with_driver(1, FileDriver::from_file(&db_file)?)?;
+        let mut tx = volume.start();
+        tx.write(0, [1, 2, 3]);
+        volume.commit(tx)?;
+
+        // Reopen the volume
+        let mut reopened_volume = Volume::new_with_driver(1, FileDriver::from_file(&db_file)?)?;
+
+        // Commit a new transaction
+        let mut new_tx = reopened_volume.start();
+        new_tx.write(3, [4, 5, 6]);
+        reopened_volume.commit(new_tx)?;
+
+        // Verify the content
+        assert_eq!(&*reopened_volume.read(0, 6), &[1, 2, 3, 4, 5, 6]);
+
         Ok(())
     }
 
