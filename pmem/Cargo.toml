@@ -18,3 +18,7 @@ tempfile.workspace = true
 [[bench]]
 name = "page"
 harness = false
+
+[[bench]]
+name = "memory"
+harness = false

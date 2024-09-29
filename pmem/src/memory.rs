@@ -67,12 +67,14 @@ struct MemoryInfo {
 /// Each allocation block has a header with the size of the block
 #[derive(Record)]
 struct AllocatedBlock {
+    // Size of of the memory block excluding header size (this structure)
     size: u32,
 }
 
 /// Header of a block of memory that was freed using [`Memory::reclaim()`] call.
 #[derive(Record)]
 struct FreeBlock {
+    // Size of of the memory block excluding the [`AllocatedBlock`] header
     size: u32,
     next: Option<Ptr<FreeBlock>>,
 }
@@ -175,7 +177,7 @@ impl<S: TxWrite> Memory<S> {
         Self { tx, mem_info }
     }
 
-    fn alloc_space(&mut self, size: usize) -> Result<Addr> {
+    pub fn alloc_addr(&mut self, size: usize) -> Result<Addr> {
         assert!(size > 0);
         // Trying to find a free block
         let mut free_block = self.mem_info.free_list;
@@ -184,7 +186,7 @@ impl<S: TxWrite> Memory<S> {
             let block = self.lookup(ptr)?;
             if block.size >= size as u32 {
                 // Found a block that fits the size. Marking it as allocated
-                let allocated = AllocatedBlock { size: size as u32 };
+                let allocated = AllocatedBlock { size: block.size };
                 self.write_at(Ptr::from_addr(ptr.addr).unwrap(), allocated)?;
 
                 // Removing the block from the free list
@@ -216,7 +218,7 @@ impl<S: TxWrite> Memory<S> {
     }
 
     pub fn alloc<T: Record>(&mut self) -> Result<Ptr<T>> {
-        let addr = self.alloc_space(T::SIZE)?;
+        let addr = self.alloc_addr(T::SIZE)?;
         Ok(Ptr::from_addr(addr).unwrap())
     }
 
@@ -236,7 +238,7 @@ impl<S: TxWrite> Memory<S> {
         assert!(values.len() <= u32::MAX as usize);
 
         let size = SLICE_HEADER_SIZE + T::SIZE * values.len();
-        let ptr = SlicePtr::from_addr(self.alloc_space(size)?).expect("Alloc failed");
+        let ptr = SlicePtr::from_addr(self.alloc_addr(size)?).expect("Alloc failed");
 
         let mut buffer = vec![0u8; size];
 
@@ -263,7 +265,7 @@ impl<S: TxWrite> Memory<S> {
         assert!(bytes.len() <= PageOffset::MAX as usize);
 
         let size = SLICE_HEADER_SIZE + bytes.len();
-        let ptr = SlicePtr::from_addr(self.alloc_space(size)?).expect("Alloc failed");
+        let ptr = SlicePtr::from_addr(self.alloc_addr(size)?).expect("Alloc failed");
 
         let mut buffer = vec![0u8; size];
 
@@ -290,7 +292,7 @@ impl<S: TxWrite> Memory<S> {
         let ptr = if let Some(ptr) = ptr {
             ptr
         } else {
-            Ptr::from_addr(self.alloc_space(size)?).expect("Alloc failed")
+            Ptr::from_addr(self.alloc_addr(size)?).expect("Alloc failed")
         };
 
         value.write(&mut buffer)?;
@@ -308,8 +310,12 @@ impl<S: TxWrite> Memory<S> {
     }
 
     pub fn reclaim<T>(&mut self, ptr: Ptr<T>) -> Result<()> {
+        self.reclaim_addr(ptr.addr)
+    }
+
+    pub fn reclaim_addr(&mut self, addr: Addr) -> Result<()> {
         // Reading allocation size from the header
-        let ptr = Ptr::from_addr(ptr.addr - AllocatedBlock::SIZE as Addr).unwrap();
+        let ptr = Ptr::from_addr(addr - AllocatedBlock::SIZE as Addr).unwrap();
         let block = self.lookup::<AllocatedBlock>(ptr)?;
 
         // Marking block as free
@@ -625,6 +631,7 @@ mod tests {
     use super::*;
     use crate::volume::{Volume, PAGE_SIZE};
     use pmem_derive::Record;
+    use rand::{rngs::SmallRng, Rng, SeedableRng};
     use std::mem;
 
     // Helper container used for testing read/writes
@@ -690,15 +697,31 @@ mod tests {
 
     #[test]
     fn memory_can_reuse_memory() -> Result<()> {
-        let volume = Volume::with_capacity(PAGE_SIZE * 3);
+        let volume = Volume::with_capacity(PAGE_SIZE);
         let mut mem = Memory::init(volume.start());
+        let mut rng = SmallRng::from_entropy();
 
-        for _ in 0..10 {
-            // We allocate several times to check if free list is handled correctly
-            let ptr_a = mem.alloc::<[u8; PAGE_SIZE]>()?;
-            let ptr_b = mem.alloc::<[u8; PAGE_SIZE]>()?;
-            mem.reclaim(ptr_a)?;
-            mem.reclaim(ptr_b)?;
+        // Each allocation of N bytes will required N + 4 bytes in total (size of [`AllocatedBlock`]).
+        // It means that if we will allocate one slot for each possible memory size up to N bytes, we will need
+        // (4 + 1) + (4 + 2) + ... + (4 + N) = 4N + N(N + 1) / 2 bytes in total.
+        //
+        // We need to ensure that this value is less than the size of the volume. This way we can be sure that
+        // even if we will allocate slots in most inefficient way possible (first 1 bytes, then 2 bytes and so on),
+        // so we can not reuse any of previously allocated slots, we will still have enough space to store all of them.
+        //
+        // For the volume of size `PAGE_SIZE`:
+        // 4N + N(N + 1) / 2 < P, where P = PAGE_SIZE
+        // N^2 + 9N - 2P < 0.
+        // The only positive solution is:
+        // N = (-9 + sqrt(9^2 + 4 * 2 * P)) / 2
+        // N = 357.56..
+        const MAX_ALLOCATION_SIZE: usize = 357;
+
+        for _ in 0..10_000 {
+            // TODO correct computation of max size
+            let size = rng.gen_range(1..=MAX_ALLOCATION_SIZE);
+            let ptr = mem.alloc_addr(size)?;
+            mem.reclaim_addr(ptr)?;
         }
 
         Ok(())
