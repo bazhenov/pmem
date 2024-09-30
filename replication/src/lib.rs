@@ -181,11 +181,11 @@ pub async fn replica_connect(
     Ok((read_handle, join_handle))
 }
 
-#[instrument(skip(client, volume, rx), fields(addr = %client.peer_addr().unwrap()))]
+#[instrument(skip(client, volume, request_channel), fields(addr = %client.peer_addr().unwrap()))]
 async fn client_worker(
     mut client: TcpStream,
     mut volume: Volume,
-    mut rx: request_reply::RequestReceiver<PageNo, PageAndLsn>,
+    mut request_channel: request_reply::RequestReceiver<PageNo, PageAndLsn>,
 ) -> io::Result<()> {
     let mut assembler = PacketAssembler::default();
     let mut inflight_pages = HashMap::new();
@@ -196,7 +196,7 @@ async fn client_worker(
 
     loop {
         tokio::select! {
-            Some((page_no, reply)) = rx.recv() => {
+            Some((page_no, reply)) = request_channel.recv() => {
                 corelation_id += 1;
                 trace!(page = page_no, cid = corelation_id, "Requesting page from network");
                 inflight_pages.insert(corelation_id, (page_no, reply));
@@ -219,7 +219,7 @@ async fn client_worker(
                         }
                         AssembledCommand::Page(corelation_id, lsn, data) => {
                             if let Some((page_no, tx)) = inflight_pages.remove(&corelation_id) {
-                                let _ = tx.reply(Ok((data, lsn)));
+                                let _ = tx.send(Ok((data, lsn)));
                                 trace!(page_no = page_no, lsn = lsn, "Received page");
                             } else {
                                 warn!(cid = corelation_id, "Spourious page detected")
@@ -232,6 +232,10 @@ async fn client_worker(
     }
 }
 
+/// Assembler used in a network loop code to asseble commands from the network messages.
+///
+/// It contains partial state that can not be processed yet, because it requires more data to be
+/// received.
 #[derive(Default)]
 struct PacketAssembler {
     redo_patches: Vec<Patch>,
@@ -244,6 +248,10 @@ enum AssembledCommand {
 }
 
 impl PacketAssembler {
+    /// Process packet from the network and return assembled command if possible.
+    ///
+    /// The order of the messages is important. The messages must be processed in the same order
+    /// they were received from the network.
     fn feed_packet(&mut self, msg: Message) -> io::Result<Option<AssembledCommand>> {
         match msg {
             Message::Patch(redo, undo) => {
@@ -281,7 +289,7 @@ pub async fn next_snapshot(mut socket: &mut TcpStream) -> io::Result<(LSN, Vec<P
 type PageAndLsn = io::Result<(Box<[u8; PAGE_SIZE]>, LSN)>;
 
 struct NetworkDriver {
-    tx: request_reply::Sender<PageNo, PageAndLsn>,
+    tx: request_reply::RequestSender<PageNo, PageAndLsn>,
 }
 
 impl PageDriver for NetworkDriver {
@@ -316,7 +324,6 @@ pub(crate) fn io_error(error: &str) -> io::Error {
 ///
 /// Can be used in a following way:
 /// ```no_run
-/// # use tokio;
 /// use replication::request_reply;
 ///
 /// let (sender, mut receiver) = request_reply::channel::<u32, String>();
@@ -325,7 +332,7 @@ pub(crate) fn io_error(error: &str) -> io::Error {
 /// tokio::spawn(async move {
 ///     while let Some((request, reply)) = receiver.recv().await {
 ///         let response = format!("Processed request: {}", request);
-///         let _ = reply.reply(response);
+///         let _ = reply.send(response);
 ///     }
 /// });
 ///
@@ -338,45 +345,25 @@ pub mod request_reply {
     use std::io;
     use tokio::sync::{mpsc, oneshot};
 
-    pub fn channel<Rq, Rp>() -> (Sender<Rq, Rp>, RequestReceiver<Rq, Rp>) {
+    pub type RequestReceiver<Rq, Rp> = mpsc::Receiver<(Rq, oneshot::Sender<Rp>)>;
+
+    pub fn channel<Rq, Rp>() -> (RequestSender<Rq, Rp>, RequestReceiver<Rq, Rp>) {
         let (tx, rx) = mpsc::channel(1);
-        (Sender { tx }, RequestReceiver { rx })
+        (RequestSender(tx), rx)
     }
 
-    pub struct RequestReceiver<Rq, Rp> {
-        rx: mpsc::Receiver<(Rq, Reply<Rp>)>,
-    }
+    pub struct RequestSender<Rq, Rp>(mpsc::Sender<(Rq, oneshot::Sender<Rp>)>);
 
-    impl<Rq, Rp> RequestReceiver<Rq, Rp> {
-        pub async fn recv(&mut self) -> Option<(Rq, Reply<Rp>)> {
-            self.rx.recv().await
-        }
-    }
-
-    pub struct Sender<Rq, Rp> {
-        tx: mpsc::Sender<(Rq, Reply<Rp>)>,
-    }
-
-    impl<Rq, Rp> Sender<Rq, Rp> {
+    impl<Rq, Rp> RequestSender<Rq, Rp> {
         pub fn blocking_send(&self, request: Rq) -> io::Result<Rp> {
             let (reply_tx, reply_rx) = oneshot::channel();
-            self.tx
-                .blocking_send((request, Reply { reply_tx }))
+            self.0
+                .blocking_send((request, reply_tx))
                 .map_err(|_| io_error("Unable to send request"))?;
             let response = reply_rx
                 .blocking_recv()
                 .map_err(|_| io_error("Unable to receive response"))?;
             Ok(response)
-        }
-    }
-
-    pub struct Reply<Rp> {
-        reply_tx: oneshot::Sender<Rp>,
-    }
-
-    impl<Rp> Reply<Rp> {
-        pub fn reply(self, response: Rp) -> Result<(), Rp> {
-            self.reply_tx.send(response)
         }
     }
 }
