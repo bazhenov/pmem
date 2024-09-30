@@ -33,6 +33,13 @@ pub enum Error {
     #[error("Unexpected variant code: {0}")]
     UnexpectedVariantCode(u64),
 
+    #[error("Unable to read record {addr}/{type_name}: {err:?}")]
+    RecordReadError {
+        addr: Addr,
+        type_name: &'static str,
+        err: Box<Error>,
+    },
+
     #[error("Page error: {0}")]
     Page(#[from] crate::volume::Error),
 }
@@ -44,6 +51,7 @@ impl From<Error> for io::Error {
             Error::NoSpaceLeft => io::ErrorKind::OutOfMemory,
             Error::NullPointer => io::ErrorKind::InvalidInput,
             Error::UnexpectedVariantCode(..) => io::ErrorKind::InvalidInput,
+            Error::RecordReadError { .. } => io::ErrorKind::InvalidData,
             Error::Page(..) => io::ErrorKind::Other,
         };
         io::Error::new(kind, error)
@@ -113,13 +121,7 @@ impl<S: TxRead> Memory<S> {
     }
 
     pub fn lookup<T: Record>(&self, ptr: Ptr<T>) -> Result<Handle<T>> {
-        let bytes = self.read_uncommitted(ptr.addr, T::SIZE);
-        let value = T::read(&bytes)?;
-
-        Ok(Handle {
-            addr: ptr.addr,
-            value,
-        })
+        read_value(ptr, &self.read_uncommitted(ptr.addr, T::SIZE))
     }
 
     pub fn read<T: Record>(&self, ptr: Ptr<T>) -> Result<T> {
@@ -133,8 +135,9 @@ impl<S: TxRead> Memory<S> {
         let items = u32::from_le_bytes(items) as usize;
         let bytes = self.read_uncommitted(addr + SLICE_HEADER_SIZE as Addr, items * T::SIZE);
         let mut result = Vec::with_capacity(items);
-        for chunk in bytes.chunks(T::SIZE) {
-            result.push(T::read(chunk)?);
+        for (idx, chunk) in bytes.chunks(T::SIZE).enumerate() {
+            let ptr = Ptr::<T>::from_addr(ptr.0.addr + (idx * T::SIZE) as Addr).unwrap();
+            result.push(read_value(ptr, chunk)?.into_inner());
         }
         Ok(result)
     }
@@ -158,6 +161,20 @@ impl<S: TxRead> Memory<S> {
 
     fn read_uncommitted(&self, addr: Addr, len: usize) -> Cow<[u8]> {
         self.tx.read(addr, len)
+    }
+}
+
+fn read_value<T: Record>(ptr: Ptr<T>, bytes: &[u8]) -> Result<Handle<T>> {
+    match T::read(bytes) {
+        Ok(value) => Ok(Handle {
+            addr: ptr.addr,
+            value,
+        }),
+        Err(err) => Err(Error::RecordReadError {
+            addr: ptr.addr,
+            type_name: type_name::<T>(),
+            err: Box::new(err),
+        }),
     }
 }
 

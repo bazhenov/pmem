@@ -22,7 +22,7 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::Mutex;
-use tracing::instrument;
+use tracing::{instrument, warn};
 
 pub struct RFS {
     state: Arc<Mutex<RfsState>>,
@@ -254,14 +254,19 @@ impl NFSFileSystem for RFS {
 }
 
 fn io_to_nfs_error(e: io::Error) -> nfsstat3 {
+    use io::ErrorKind::*;
+    if !matches!(e.kind(), NotFound | PermissionDenied | AlreadyExists) {
+        warn!("io error: {:?}", e);
+    }
+
     match e.kind() {
-        io::ErrorKind::NotFound => nfsstat3::NFS3ERR_NOENT,
-        io::ErrorKind::PermissionDenied => nfsstat3::NFS3ERR_PERM,
-        io::ErrorKind::AlreadyExists => nfsstat3::NFS3ERR_EXIST,
-        io::ErrorKind::InvalidInput => nfsstat3::NFS3ERR_INVAL,
-        io::ErrorKind::InvalidData => nfsstat3::NFS3ERR_INVAL,
-        io::ErrorKind::Unsupported => nfsstat3::NFS3ERR_NOTSUPP,
-        io::ErrorKind::OutOfMemory => nfsstat3::NFS3ERR_NOSPC,
+        NotFound => nfsstat3::NFS3ERR_NOENT,
+        PermissionDenied => nfsstat3::NFS3ERR_PERM,
+        AlreadyExists => nfsstat3::NFS3ERR_EXIST,
+        InvalidInput => nfsstat3::NFS3ERR_INVAL,
+        InvalidData => nfsstat3::NFS3ERR_INVAL,
+        Unsupported => nfsstat3::NFS3ERR_NOTSUPP,
+        OutOfMemory => nfsstat3::NFS3ERR_NOSPC,
         _ => nfsstat3::NFS3ERR_SERVERFAULT,
         // Unsupported in stable yet
         // io::ErrorKind::NotADirectory => nfsstat3::NFS3ERR_NOTDIR,
