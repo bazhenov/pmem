@@ -180,6 +180,10 @@ impl<S: TxWrite> Filesystem<S> {
         let children = dir.children.ok_or(ErrorKind::NotFound)?;
         let file = self.find_child(children, name.as_ref())?;
 
+        if file.node.node_type == NodeType::Directory && file.node.children.is_some() {
+            return Err(ErrorKind::InvalidData.into());
+        }
+
         let next_ptr = file.node.next;
 
         // Delete all data blocks
@@ -1252,6 +1256,18 @@ mod tests {
     }
 
     #[test]
+    fn will_not_delete_not_empty_directory() -> Result<()> {
+        let (mut fs, _) = create_fs();
+
+        let root = fs.get_root()?;
+        fs.create_dirs("/usr/bin")?;
+        assert!(fs.delete(&root, "usr").is_err());
+
+        assert_exists!(fs, "/usr");
+        Ok(())
+    }
+
+    #[test]
     fn can_delete_file() -> Result<()> {
         let (mut fs, _) = create_fs();
 
@@ -1872,6 +1888,31 @@ mod tests {
                     fs.create_file(&dir, file_name)?;
                     fs.find(path.to_str().unwrap())?;
                 }
+            }
+
+            #[test]
+            fn can_remove_file(file_names in hash_set(any_file_name(None), 10)) {
+                let (mut fs, _) = create_fs();
+
+                // Creating files in a different order than removing them
+                let mut sorted_files_names = file_names.iter().cloned().collect::<Vec<_>>();
+                sorted_files_names.sort();
+
+                let root = fs.get_root()?;
+                for (idx, file_name) in sorted_files_names.iter().enumerate() {
+                    // Creating directories and files to make sure both are removed correctly
+                    if idx % 2 == 0 {
+                        fs.create_file(&root, file_name)?;
+                    } else {
+                        fs.create_dir(&root, file_name)?;
+                    }
+                }
+
+                for file_name in &file_names {
+                    fs.delete(&root, file_name)?;
+                }
+
+                prop_assert_eq!(fs.readdir(&root).count(), 0)
             }
 
             #[test]
