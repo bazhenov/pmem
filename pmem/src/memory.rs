@@ -128,20 +128,6 @@ impl<S: TxRead> Memory<S> {
         Ok(self.lookup(ptr)?.into_inner())
     }
 
-    pub fn read_slice<T: Record>(&self, ptr: SlicePtr<T>) -> Result<Vec<T>> {
-        let addr = ptr.0.addr;
-        let items = self.read_static::<SLICE_HEADER_SIZE>(addr);
-
-        let items = u32::from_le_bytes(items) as usize;
-        let bytes = self.read_uncommitted(addr + SLICE_HEADER_SIZE as Addr, items * T::SIZE);
-        let mut result = Vec::with_capacity(items);
-        for (idx, chunk) in bytes.chunks(T::SIZE).enumerate() {
-            let ptr = Ptr::<T>::from_addr(ptr.0.addr + (idx * T::SIZE) as Addr).unwrap();
-            result.push(read_value(ptr, chunk)?.into_inner());
-        }
-        Ok(result)
-    }
-
     pub fn read_bytes(&self, ptr: SlicePtr<u8>) -> Result<Cow<[u8]>> {
         let addr = ptr.0.addr;
         let items = self.read_static::<SLICE_HEADER_SIZE>(addr);
@@ -249,33 +235,6 @@ impl<S: TxWrite> Memory<S> {
         let ptr = self.write_to_memory(&value, None)?;
         let addr = ptr.addr;
         Ok(Handle { addr, value })
-    }
-
-    pub fn write_slice<T: Record>(&mut self, values: &[T]) -> Result<SlicePtr<T>> {
-        assert!(values.len() <= u32::MAX as usize);
-
-        let size = SLICE_HEADER_SIZE + T::SIZE * values.len();
-        let ptr = SlicePtr::from_addr(self.alloc_addr(size)?).expect("Alloc failed");
-
-        let mut buffer = vec![0u8; size];
-
-        (values.len() as u32)
-            .write(&mut buffer[0..SLICE_HEADER_SIZE])
-            .unwrap();
-
-        let chunks = values
-            .iter()
-            .zip(buffer[SLICE_HEADER_SIZE..].chunks_mut(T::SIZE));
-        for (value, byte_chunk) in chunks {
-            value.write(byte_chunk).unwrap();
-        }
-
-        {
-            let this = &mut *self;
-            let addr = ptr.0.addr;
-            this.tx.write(addr, buffer)
-        };
-        Ok(ptr)
     }
 
     pub fn write_bytes(&mut self, bytes: &[u8]) -> Result<SlicePtr<u8>> {
@@ -677,17 +636,6 @@ mod tests {
         let handle = mem.write(value)?;
         let value_copy = mem.read(handle.ptr())?;
         assert_eq!(&value_copy, &*handle);
-        Ok(())
-    }
-
-    #[test]
-    fn read_write_slice() -> Result<()> {
-        let mut mem = Memory::new();
-
-        let value: &[u8] = &[0, 1, 2, 3, 4, 5];
-        let slice = mem.write_slice(value)?;
-        let value_copy = mem.read_slice(slice)?;
-        assert_eq!(value_copy, value);
         Ok(())
     }
 

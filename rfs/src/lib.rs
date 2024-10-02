@@ -160,7 +160,7 @@ impl<S: TxWrite> Filesystem<S> {
     pub fn allocate(snapshot: S) -> Self {
         let mut mem = Memory::init(snapshot);
         let super_block_ptr = mem.alloc::<VolumeInfo>().unwrap();
-        let name = mem.write_slice("/".as_bytes()).unwrap();
+        let name = mem.write_bytes("/".as_bytes()).unwrap();
         let root_entry = FNode {
             name: Str(name),
             size: 0,
@@ -340,7 +340,7 @@ impl<S: TxWrite> Filesystem<S> {
     }
 
     fn write_fsnode(&mut self, name: &str, node_type: NodeType) -> Result<Handle<FNode>> {
-        let name = self.mem.write_slice(name.as_bytes())?;
+        let name = self.mem.write_bytes(name.as_bytes())?;
         let entry = FNode {
             name: Str(name),
             node_type,
