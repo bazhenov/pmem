@@ -76,7 +76,7 @@ impl RFS {
 #[async_trait]
 #[allow(clippy::blocks_in_conditions)]
 impl NFSFileSystem for RFS {
-    #[instrument(level = "trace", skip(self), ret)]
+    #[instrument(skip(self))]
     fn root_dir(&self) -> fileid3 {
         self.root_id
     }
@@ -85,7 +85,7 @@ impl NFSFileSystem for RFS {
         VFSCapabilities::ReadWrite
     }
 
-    #[instrument(level = "trace", skip(self, data), fields(data.len = data.len()), err(Debug, level = "warn"))]
+    #[instrument( skip(self, data), fields(data.len = data.len()), err(Debug, level = "warn"))]
     async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
         let mut fs = self.state.lock().await;
 
@@ -101,7 +101,7 @@ impl NFSFileSystem for RFS {
         Ok(create_fattr(&new_meta))
     }
 
-    #[instrument(level = "trace", skip(self, _attr), ret, err(Debug, level = "warn"))]
+    #[instrument(skip(self, _attr), err(Debug, level = "warn"))]
     async fn create(
         &self,
         dirid: fileid3,
@@ -116,7 +116,7 @@ impl NFSFileSystem for RFS {
         Ok((new_file.fid, create_fattr(&new_file)))
     }
 
-    #[instrument(level = "trace", skip(self), err(Debug, level = "warn"))]
+    #[instrument(skip(self), err(Debug, level = "warn"))]
     async fn create_exclusive(
         &self,
         dirid: fileid3,
@@ -130,7 +130,7 @@ impl NFSFileSystem for RFS {
         Ok(new_file.fid)
     }
 
-    #[instrument(level = "trace", skip(self))]
+    #[instrument(skip(self), err(Debug, level = "warn"))]
     async fn lookup(&self, dirid: fileid3, filename: &filename3) -> Result<fileid3, nfsstat3> {
         let fs = self.state.lock().await;
         let filename = to_string(filename);
@@ -139,14 +139,14 @@ impl NFSFileSystem for RFS {
         Ok(result.fid)
     }
 
-    #[instrument(level = "trace", skip(self))]
+    #[instrument(skip(self), err(Debug, level = "warn"))]
     async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3> {
         let fs = self.state.lock().await;
         let entry = fs.lookup_by_id(id).map_err(io_to_nfs_error)?;
         Ok(create_fattr(&entry))
     }
 
-    #[instrument(level = "trace", skip(self), err(Debug, level = "warn"))]
+    #[instrument(skip(self), err(Debug, level = "warn"))]
     async fn setattr(&self, id: fileid3, _setattr: sattr3) -> Result<fattr3, nfsstat3> {
         let fs = self.state.lock().await;
         let file = fs.lookup_by_id(id).map_err(io_to_nfs_error)?;
@@ -154,7 +154,7 @@ impl NFSFileSystem for RFS {
         Ok(create_fattr(&file))
     }
 
-    #[instrument(level = "trace", skip(self), err(Debug, level = "warn"))]
+    #[instrument(skip(self), err(Debug, level = "warn"))]
     async fn read(
         &self,
         id: fileid3,
@@ -177,7 +177,7 @@ impl NFSFileSystem for RFS {
         Ok((buf, bytes_read < count as usize))
     }
 
-    #[instrument(level = "trace", skip(self), err(Debug, level = "warn"))]
+    #[instrument(name = "readdir", skip(self), err(Debug, level = "warn"))]
     async fn readdir(
         &self,
         dirid: fileid3,
@@ -190,6 +190,8 @@ impl NFSFileSystem for RFS {
 
         let entries = fs
             .readdir(&dir)
+            // TODO this is probably incorrect interpretation of start_after
+            // skip_after is not an offset, but rather an inode number
             .skip(start_after as usize)
             .take(max_entries)
             .map(to_dir_entry)
@@ -198,8 +200,7 @@ impl NFSFileSystem for RFS {
         Ok(ReadDirResult { entries, end })
     }
 
-    #[instrument(level = "trace", skip(self), err(Debug, level = "warn"))]
-    #[allow(unused)]
+    #[instrument(name = "remove", skip(self), err(Debug, level = "warn"))]
     async fn remove(&self, dirid: fileid3, filename: &filename3) -> Result<(), nfsstat3> {
         let mut fs = self.state.lock().await;
         let dir_meta = fs.lookup_by_id(dirid).map_err(io_to_nfs_error)?;
@@ -207,7 +208,7 @@ impl NFSFileSystem for RFS {
             .map_err(io_to_nfs_error)
     }
 
-    #[instrument(level = "trace", skip(self), err(Debug, level = "warn"))]
+    #[instrument(skip(self), err(Debug, level = "warn"))]
     #[allow(unused)]
     async fn rename(
         &self,
@@ -219,7 +220,7 @@ impl NFSFileSystem for RFS {
         return Err(nfsstat3::NFS3ERR_NOTSUPP);
     }
 
-    #[instrument(level = "trace", skip(self), ret, err(Debug, level = "warn"))]
+    #[instrument(skip(self), err(Debug, level = "warn"))]
     #[allow(unused)]
     async fn mkdir(
         &self,
@@ -236,7 +237,7 @@ impl NFSFileSystem for RFS {
         Ok((dir.fid, create_fattr(&dir)))
     }
 
-    #[instrument(level = "trace", skip(self), err(Debug, level = "warn"))]
+    #[instrument(skip(self), err(Debug, level = "warn"))]
     async fn symlink(
         &self,
         _dirid: fileid3,
@@ -247,7 +248,7 @@ impl NFSFileSystem for RFS {
         Err(nfsstat3::NFS3ERR_ROFS)
     }
 
-    #[instrument(level = "trace", skip(self), err(Debug, level = "warn"))]
+    #[instrument(skip(self), err(Debug, level = "warn"))]
     async fn readlink(&self, _id: fileid3) -> Result<nfspath3, nfsstat3> {
         return Err(nfsstat3::NFS3ERR_NOTSUPP);
     }
