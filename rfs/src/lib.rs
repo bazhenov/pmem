@@ -747,7 +747,7 @@ fn make_sure_ptr_block_exists<T: Record>(
     }
 }
 
-fn lookup_step<T>(
+fn lookup_step<T: Record>(
     mem: &Memory<impl TxRead>,
     block_ptr: NullPtr<PointersBlock<T>>,
     idx: usize,

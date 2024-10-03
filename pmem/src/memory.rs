@@ -375,8 +375,6 @@ impl<T> Record for Ptr<T> {
     }
 }
 
-impl<T> NonZeroRecord for Ptr<T> {}
-
 impl<T> Ptr<T> {
     pub fn unwrap_addr(&self) -> Addr {
         self.addr
@@ -404,8 +402,6 @@ impl<T> PartialEq for Ptr<T> {
 /// Need to implement Copy manually, because derive(Copy) is automatically
 /// adding `T: Copy` bound in auto-generated implementation
 impl<T> Copy for Ptr<T> {}
-
-impl<T> NonZeroRecord for SlicePtr<T> {}
 
 #[derive(Record)]
 pub struct SlicePtr<T>(Ptr<T>);
@@ -531,16 +527,12 @@ impl Record for bool {
     }
 }
 
-/// Indicates that all zero bytes is not valid state for a record and it is represented
-/// as an `Option<T>::None` in type system.
-trait NonZeroRecord: Record {}
-
-impl<T: NonZeroRecord> Record for Option<T> {
-    const SIZE: usize = T::SIZE;
+impl<T: Record> Record for Option<Ptr<T>> {
+    const SIZE: usize = Ptr::<T>::SIZE;
 
     fn read(data: &[u8]) -> Result<Self> {
         if data.iter().any(|v| *v != 0) {
-            T::read(data).map(Some)
+            Ptr::<T>::read(data).map(Some)
         } else {
             Ok(None)
         }
