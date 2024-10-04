@@ -1,17 +1,20 @@
-use crate::volume::{Addr, PageOffset, Transaction, TxRead, TxWrite};
+use crate::volume::{Addr, PageNo, PageOffset, Transaction, TxRead, TxWrite, PAGE_SIZE};
 use pmem_derive::Record;
 use std::{
     any::type_name,
     array::TryFromSliceError,
     borrow::Cow,
+    cell::RefCell,
     fmt::{self, Debug},
     io,
     marker::PhantomData,
     mem,
     ops::{Deref, DerefMut},
+    rc::Rc,
 };
 /// The size of any pointer in bytes
-pub const PTR_SIZE: usize = mem::size_of::<Addr>();
+pub const PTR_SIZE: usize = Ptr::<u8>::SIZE;
+pub const NULL_PTR_SIZE: usize = Option::<Ptr<u8>>::SIZE;
 const START_ADDR: Addr = 8;
 
 /// The size of a header of each entity written to storage
@@ -527,12 +530,12 @@ impl Record for bool {
     }
 }
 
-impl<T: Record> Record for Option<Ptr<T>> {
-    const SIZE: usize = Ptr::<T>::SIZE;
+impl<T: Record> Record for Option<T> {
+    const SIZE: usize = T::SIZE + 1;
 
     fn read(data: &[u8]) -> Result<Self> {
-        if data.iter().any(|v| *v != 0) {
-            Ptr::<T>::read(data).map(Some)
+        if data[0] != 0 {
+            T::read(&data[1..]).map(Some)
         } else {
             Ok(None)
         }
@@ -540,12 +543,25 @@ impl<T: Record> Record for Option<Ptr<T>> {
 
     fn write(&self, data: &mut [u8]) -> Result<()> {
         match self {
-            Some(value) => value.write(data),
+            Some(value) => {
+                data[0] = 1;
+                value.write(&mut data[1..])
+            }
             None => {
                 data.fill(0);
                 Ok(())
             }
         }
+    }
+}
+
+pub trait AsAddrAndRef<T> {
+    fn as_addr_and_ref(&self) -> (Addr, &T);
+}
+
+impl<T> AsAddrAndRef<T> for Handle<T> {
+    fn as_addr_and_ref(&self) -> (Addr, &T) {
+        (self.addr, &self.value)
     }
 }
 
@@ -593,6 +609,163 @@ pub const fn max<const N: usize>(array: [usize; N]) -> usize {
     }
     max
 }
+
+type PointersPage<T> = [Option<Ptr<T>>; PAGE_SIZE / NULL_PTR_SIZE];
+type SlotsPage = [u8; PAGE_SIZE];
+type SlotClaim = u32;
+
+#[derive(Record)]
+struct PageAllocator {
+    next_available_page: PageNo,
+}
+
+impl PageAllocator {
+    fn new() -> Self {
+        Self {
+            next_available_page: 1,
+        }
+    }
+
+    fn allocate(&mut self) -> PageNo {
+        // TODO NoSpaceLeft check
+        let page = self.next_available_page;
+        self.next_available_page += 1;
+        page
+    }
+}
+
+#[derive(Record)]
+struct SlotMemoryState {
+    table: Ptr<PointersPage<SlotsPage>>,
+    slot_watermark: SlotClaim,
+}
+
+/// A memory management system for fixed-size slots.
+///
+/// Key features:
+/// - O(1) time complexity for allocation, deallocation, and access operations.
+/// - Slots can be reused after deallocation, improving memory efficiency.
+/// - Each slot is assigned a stable identifier (claim) that remains valid for the lifetime of the allocation.
+/// - Slot occupancy is tracked, preventing use-after-free errors by returning None for deallocated slots.
+struct SlotMemory<T> {
+    page_allocator: Rc<RefCell<PageAllocator>>,
+    state: SlotMemoryState,
+    _phantom: PhantomData<T>,
+}
+
+impl<T: Record> SlotMemory<T> {
+    const SLOT_SIZE: usize = <Option<T> as Record>::SIZE;
+    const SLOTS_PER_PAGE: usize = PAGE_SIZE / Self::SLOT_SIZE;
+
+    fn init(page_allocator: Rc<RefCell<PageAllocator>>) -> Self {
+        let page_no = page_allocator.borrow_mut().allocate();
+        Self {
+            page_allocator,
+            state: SlotMemoryState {
+                table: Ptr::from_addr(PAGE_SIZE as Addr * page_no as Addr).unwrap(),
+                slot_watermark: 0,
+            },
+            _phantom: PhantomData,
+        }
+    }
+
+    pub fn allocate_and_write(&mut self, tx: &mut impl TxWrite, value: T) -> Result<SlotClaim> {
+        let slot_idx = self.state.slot_watermark;
+        let (page_offset, slot_offset) = Self::split_idx(slot_idx);
+
+        let mut root_table = tx.lookup(self.state.table)?;
+        if (slot_idx as usize) % Self::SLOTS_PER_PAGE == 0 {
+            // We're on a boundary of a page, need to allocate a new one
+            if root_table[page_offset].is_none() {
+                let ptr = self.allocate_page(tx)?;
+                root_table[page_offset] = Some(ptr);
+                tx.update(&root_table)?;
+            }
+        }
+
+        let table2 = tx.lookup(root_table[page_offset].unwrap())?;
+        let handle = Handle {
+            addr: table2.addr + (slot_offset * Self::SLOT_SIZE) as Addr,
+            value: Some(value),
+        };
+        tx.update(&handle)?;
+        self.state.slot_watermark += 1;
+        Ok(slot_idx)
+    }
+
+    pub fn read(&self, tx: &impl TxRead, slot: u32) -> Result<Option<Handle<T>>> {
+        let value = if slot < self.state.slot_watermark {
+            let (page_offset, slot_offset) = Self::split_idx(slot);
+            let root_table = tx.lookup(self.state.table)?;
+            let table_ptr = root_table[page_offset].unwrap();
+            let table = tx.lookup(table_ptr)?;
+
+            let offset = slot_offset * Self::SLOT_SIZE;
+            let ptr = Ptr::<Option<T>>::from_addr(table.addr + offset as Addr).unwrap();
+
+            let slot = tx.lookup(ptr)?.into_inner();
+
+            // correct addr to skip optional part,
+            // TODO: handling optional out-of-band
+            slot.map(|value| Handle {
+                addr: ptr.addr + 1,
+                value,
+            })
+        } else {
+            None
+        };
+        Ok(value)
+    }
+
+    fn write<S: TxWrite>(&mut self, tx: &mut S, slot: u32, value: T) -> Result<()> {
+        Ok(())
+    }
+
+    fn allocate_page<R: Record>(&mut self, tx: &mut impl TxWrite) -> Result<Ptr<R>> {
+        debug_assert!(
+            R::SIZE == PAGE_SIZE,
+            "Record size must be equal to PAGE_SIZE"
+        );
+        assert!(
+            (self.state.slot_watermark as usize) % Self::SLOTS_PER_PAGE == 0,
+            "Allocation page should only be called at page boundaries"
+        );
+        let (page_offset, slot_offset) = Self::split_idx(self.state.slot_watermark);
+        assert!(slot_offset == 0);
+        let mut root_table = tx.lookup(self.state.table)?;
+        let page_no = self.page_allocator.borrow_mut().allocate();
+        root_table[page_offset] = Ptr::from_addr(PAGE_SIZE as Addr * page_no as Addr);
+
+        self.state.slot_watermark = 0;
+        Ok(Ptr::from_addr(page_no as Addr * PAGE_SIZE as Addr).unwrap())
+    }
+
+    fn split_idx(slot_idx: u32) -> (usize, usize) {
+        let slot_offset = slot_idx as usize % Self::SLOTS_PER_PAGE;
+        let page_offset = slot_idx as usize / Self::SLOTS_PER_PAGE;
+        (page_offset, slot_offset)
+    }
+}
+
+pub trait TxReadExt: TxRead {
+    fn lookup<T: Record>(&self, ptr: Ptr<T>) -> Result<Handle<T>> {
+        read_value(ptr, &self.read(ptr.addr, T::SIZE))
+    }
+}
+
+impl<S: TxRead> TxReadExt for S {}
+
+pub trait TxWriteExt: TxWrite {
+    fn update<T: Record>(&mut self, r: &impl AsAddrAndRef<T>) -> Result<()> {
+        let (addr, value) = r.as_addr_and_ref();
+        let mut buffer = vec![0u8; T::SIZE];
+        value.write(&mut buffer)?;
+        self.write(addr, buffer);
+        Ok(())
+    }
+}
+
+impl<S: TxWrite> TxWriteExt for S {}
 
 #[cfg(test)]
 mod tests {
@@ -736,5 +909,27 @@ mod tests {
         // should be zero, because we use zero-fill semantics
         assert_eq!(result, Value(0));
         Ok(())
+    }
+
+    #[test]
+    fn slot_allocator_simple_allocate() -> Result<()> {
+        let (mut tx, mut slots) = crate_slot_memory();
+
+        let slot = slots.read(&tx, 13)?;
+        assert!(slot.is_none());
+
+        let slot = slots.allocate_and_write(&mut tx, 42)?;
+
+        let slot = slots.read(&tx, slot)?;
+        assert_eq!(slot.as_deref(), Some(&42));
+        Ok(())
+    }
+
+    fn crate_slot_memory<T: Record>() -> (Transaction, SlotMemory<T>) {
+        let volume = Volume::new_in_memory(10);
+        let tx = volume.start();
+        let page_allocator = Rc::new(RefCell::new(PageAllocator::new()));
+
+        (tx, SlotMemory::init(page_allocator))
     }
 }

@@ -1,5 +1,5 @@
 use pmem::{
-    memory::{self, SlicePtr, PTR_SIZE},
+    memory::{self, SlicePtr, NULL_PTR_SIZE, PTR_SIZE},
     volume::{Addr, TxRead, TxWrite},
     Handle, Memory, Ptr, Record,
 };
@@ -741,7 +741,7 @@ fn make_sure_ptr_block_exists<T: Record>(
         Ok(mem.lookup(*ptr)?)
     } else {
         trace!("Allocating double indirect pointers block");
-        let indirect_block = mem.write::<PointersBlock<T>>([None; BLOCK_SIZE / PTR_SIZE])?;
+        let indirect_block = mem.write::<PointersBlock<T>>([None; POINTERS_PER_BLOCK])?;
         *ptr = Some(indirect_block.ptr());
         Ok(indirect_block)
     }
@@ -927,10 +927,10 @@ const BLOCK_SIZE: usize = 4096;
 const BLOCK_SIZE: usize = 64;
 
 /// The number of pointers that fit into a block
-const POINTERS_PER_BLOCK: usize = BLOCK_SIZE / PTR_SIZE;
+const POINTERS_PER_BLOCK: usize = BLOCK_SIZE / NULL_PTR_SIZE;
 
 const DIRECT_BLOCKS: usize = 10;
-const INDIRECT_BLOCKS: usize = BLOCK_SIZE / PTR_SIZE;
+const INDIRECT_BLOCKS: usize = POINTERS_PER_BLOCK;
 const DOUBLE_INDIRECT_BLOCKS: usize = INDIRECT_BLOCKS * INDIRECT_BLOCKS;
 
 const LAST_DIRECT_BLOCK: usize = DIRECT_BLOCKS - 1;
@@ -943,7 +943,7 @@ const LAST_DOUBLE_INDIRECT_BLOCK: usize = FIRST_DOUBLE_INDIRECT_BLOCK + DOUBLE_I
 
 /// Simple type alias to minimize the amount of angle brackets in the code
 type NullPtr<T> = Option<Ptr<T>>;
-type PointersBlock<T> = [NullPtr<T>; BLOCK_SIZE / PTR_SIZE];
+type PointersBlock<T> = [NullPtr<T>; POINTERS_PER_BLOCK];
 
 struct DataBlockPtrIterator {
     block: Vec<NullPtr<DataBlock>>,
@@ -1147,6 +1147,7 @@ mod tests {
     use super::*;
     use fmt::Debug;
     use pmem::volume::{Transaction, Volume, PAGE_SIZE};
+    use rand::{rngs::SmallRng, RngCore, SeedableRng};
     use std::{cmp::max, collections::HashSet, fs};
 
     // Maximum file size is 5184 bytes in test environment. So in order to trigger NoSpaceLeft
@@ -1589,6 +1590,28 @@ mod tests {
         let expected_blocks = file_size / BLOCK_SIZE;
         assert_eq!(block_count, expected_blocks);
 
+        Ok(())
+    }
+
+    #[test]
+    fn check_large_write() -> Result<()> {
+        let (mut fs, _) = create_fs();
+        let root = fs.get_root()?;
+        let mut rng = SmallRng::from_entropy();
+
+        let file_meta = fs.create_file(&root, "test_file.txt")?;
+        let file_size = MAX_FILE_SIZE;
+        let mut data = vec![0u8; file_size];
+        rng.fill_bytes(&mut data[..]);
+
+        let mut file = fs.open_file(&file_meta)?;
+        for chunk in data.chunks(512) {
+            file.write_all(chunk)?;
+        }
+        file.flush()?;
+
+        let content = read_file(&mut fs, &file_meta, file_size, None)?;
+        assert_eq!(content, data);
         Ok(())
     }
 
