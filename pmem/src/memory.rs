@@ -717,8 +717,8 @@ impl<T: Record> SlotMemory<T> {
         Ok(value)
     }
 
-    fn write<S: TxWrite>(&mut self, tx: &mut S, slot: u32, value: T) -> Result<()> {
-        Ok(())
+    pub fn free(&self, tx: &mut impl TxWrite, slot: SlotClaim) -> Result<()> {
+        todo!()
     }
 
     fn allocate_page<R: Record>(&mut self, tx: &mut impl TxWrite) -> Result<Ptr<R>> {
@@ -922,6 +922,21 @@ mod tests {
 
         let slot = slots.read(&tx, slot)?;
         assert_eq!(slot.as_deref(), Some(&42));
+        Ok(())
+    }
+
+    #[test]
+    fn slot_reallocation() -> Result<()> {
+        let (mut tx, mut slots) = crate_slot_memory();
+
+        let slot = slots.allocate_and_write(&mut tx, 42)?;
+        slots.free(&mut tx, slot)?;
+
+        let new_slot = slots.allocate_and_write(&mut tx, 42)?;
+        assert_eq!(new_slot, slot);
+
+        let value = slots.read(&tx, new_slot)?;
+        assert_eq!(value.as_deref(), Some(&42));
         Ok(())
     }
 
