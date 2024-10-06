@@ -232,7 +232,7 @@ mod enum_record {
         &variant
             .discriminant
             .as_ref()
-            .expect("Enum discriminant should be goven")
+            .expect("Enum discriminant should be given")
             .1
     }
 

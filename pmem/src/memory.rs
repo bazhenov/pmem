@@ -36,6 +36,9 @@ pub enum Error {
     #[error("Unexpected variant code: {0}")]
     UnexpectedVariantCode(u64),
 
+    #[error("Slot #{0} is not free")]
+    SlotIsNotFree(SlotClaim),
+
     #[error("Unable to read record {addr}/{type_name}: {err:?}")]
     RecordReadError {
         addr: Addr,
@@ -53,6 +56,7 @@ impl From<Error> for io::Error {
             Error::DataIntegrity(..) => io::ErrorKind::InvalidData,
             Error::NoSpaceLeft => io::ErrorKind::OutOfMemory,
             Error::NullPointer => io::ErrorKind::InvalidInput,
+            Error::SlotIsNotFree(_) => io::ErrorKind::InvalidData,
             Error::UnexpectedVariantCode(..) => io::ErrorKind::InvalidInput,
             Error::RecordReadError { .. } => io::ErrorKind::InvalidData,
             Error::Page(..) => io::ErrorKind::Other,
@@ -555,6 +559,23 @@ impl<T: Record> Record for Option<T> {
     }
 }
 
+struct Table<const N: usize, T> {
+    base: Ptr<[T; N]>,
+}
+
+impl<const N: usize, T: Record> Table<N, T> {
+    fn open(base: Ptr<[T; N]>) -> Self {
+        Table { base }
+    }
+
+    fn nth(&self, idx: usize) -> Ptr<T> {
+        if idx >= N {
+            panic!("Out-of-bound error");
+        }
+        Ptr::<T>::from_addr(self.base.addr + (T::SIZE * idx) as Addr).unwrap()
+    }
+}
+
 pub trait AsAddrAndRef<T> {
     fn as_addr_and_ref(&self) -> (Addr, &T);
 }
@@ -637,7 +658,18 @@ impl PageAllocator {
 #[derive(Record)]
 struct SlotMemoryState {
     table: Ptr<PointersPage<SlotsPage>>,
+
+    /// Index of the next available slot for allocation.
+    ///
+    /// This value represents the highest slot number that has been allocated + 1.
+    /// When allocating new slots, this value is incremented.
     slot_watermark: SlotClaim,
+
+    /// Head of a free list
+    ///
+    /// Index of a first slot in a free list. It points to the [`Slot::Free`]
+    /// structure.
+    free_slot: SlotClaim,
 }
 
 /// A memory management system for fixed-size slots.
@@ -653,8 +685,25 @@ struct SlotMemory<T> {
     _phantom: PhantomData<T>,
 }
 
+#[derive(Record)]
+#[repr(u8)]
+enum Slot<T: Record> {
+    /// Contains slot claim of the next free slot
+    Free(SlotClaim) = 0,
+    Occupied(T) = 1,
+}
+
+impl<T: Record> Slot<T> {
+    fn occupied(self) -> Option<T> {
+        match self {
+            Slot::Occupied(value) => Some(value),
+            Slot::Free(_) => None,
+        }
+    }
+}
+
 impl<T: Record> SlotMemory<T> {
-    const SLOT_SIZE: usize = <Option<T> as Record>::SIZE;
+    const SLOT_SIZE: usize = Slot::<T>::SIZE;
     const SLOTS_PER_PAGE: usize = PAGE_SIZE / Self::SLOT_SIZE;
 
     fn init(page_allocator: Rc<RefCell<PageAllocator>>) -> Self {
@@ -663,6 +712,7 @@ impl<T: Record> SlotMemory<T> {
             page_allocator,
             state: SlotMemoryState {
                 table: Ptr::from_addr(PAGE_SIZE as Addr * page_no as Addr).unwrap(),
+                free_slot: 0,
                 slot_watermark: 0,
             },
             _phantom: PhantomData,
@@ -670,27 +720,48 @@ impl<T: Record> SlotMemory<T> {
     }
 
     pub fn allocate_and_write(&mut self, tx: &mut impl TxWrite, value: T) -> Result<SlotClaim> {
-        let slot_idx = self.state.slot_watermark;
-        let (page_offset, slot_offset) = Self::split_idx(slot_idx);
+        // Determining free slot
+        let free_slot = self.state.free_slot;
+        let (page_idx, slot_idx) = Self::split_idx(free_slot);
 
-        let mut root_table = tx.lookup(self.state.table)?;
-        if (slot_idx as usize) % Self::SLOTS_PER_PAGE == 0 {
-            // We're on a boundary of a page, need to allocate a new one
-            if root_table[page_offset].is_none() {
-                let ptr = self.allocate_page(tx)?;
-                root_table[page_offset] = Some(ptr);
-                tx.update(&root_table)?;
+        let root_table = Table::open(self.state.table);
+        let mut page_ptr = tx.lookup(root_table.nth(page_idx))?;
+        if self.state.free_slot > 0 {
+            //Reusing slot from a free list
+            let table2 = tx.lookup(page_ptr.unwrap())?;
+            let addr = table2.addr + (slot_idx * Self::SLOT_SIZE) as Addr;
+
+            // Reading the content of free slot and making sure it is indeed free.
+            // Saving the next one
+            let ptr = Ptr::<Slot<T>>::from_addr(addr).unwrap();
+            let Slot::Free(next_free_slot) = tx.lookup(ptr)?.into_inner() else {
+                return Err(Error::SlotIsNotFree(free_slot));
+            };
+            self.state.free_slot = next_free_slot;
+
+            // Occupying the slot
+            let value = Slot::Occupied(value);
+            tx.update(&Handle { addr, value })?;
+            Ok(free_slot)
+        } else {
+            if (free_slot as usize) % Self::SLOTS_PER_PAGE == 0 {
+                // We're on a boundary of a page, need to allocate a new one
+                if page_ptr.is_none() {
+                    let ptr = self.allocate_page(tx)?;
+                    *page_ptr = Some(ptr);
+                    tx.update(&page_ptr)?;
+                }
             }
-        }
 
-        let table2 = tx.lookup(root_table[page_offset].unwrap())?;
-        let handle = Handle {
-            addr: table2.addr + (slot_offset * Self::SLOT_SIZE) as Addr,
-            value: Some(value),
-        };
-        tx.update(&handle)?;
-        self.state.slot_watermark += 1;
-        Ok(slot_idx)
+            let table2 = tx.lookup(page_ptr.unwrap())?;
+            let handle = Handle {
+                addr: table2.addr + (slot_idx * Self::SLOT_SIZE) as Addr,
+                value: Slot::Occupied(value),
+            };
+            tx.update(&handle)?;
+            self.state.slot_watermark += 1;
+            Ok(free_slot)
+        }
     }
 
     pub fn read(&self, tx: &impl TxRead, slot: u32) -> Result<Option<Handle<T>>> {
@@ -701,13 +772,13 @@ impl<T: Record> SlotMemory<T> {
             let table = tx.lookup(table_ptr)?;
 
             let offset = slot_offset * Self::SLOT_SIZE;
-            let ptr = Ptr::<Option<T>>::from_addr(table.addr + offset as Addr).unwrap();
+            let ptr = Ptr::<Slot<T>>::from_addr(table.addr + offset as Addr).unwrap();
 
             let slot = tx.lookup(ptr)?.into_inner();
 
             // correct addr to skip optional part,
             // TODO: handling optional out-of-band
-            slot.map(|value| Handle {
+            slot.occupied().map(|value| Handle {
                 addr: ptr.addr + 1,
                 value,
             })
@@ -717,15 +788,23 @@ impl<T: Record> SlotMemory<T> {
         Ok(value)
     }
 
-    pub fn free(&self, tx: &mut impl TxWrite, slot: SlotClaim) -> Result<()> {
-        todo!()
+    pub fn free(&mut self, tx: &mut impl TxWrite, claim: SlotClaim) -> Result<()> {
+        let slot = self.read(tx, claim)?;
+        if let Some(slot) = slot {
+            let addr = slot.ptr().addr - 1;
+            let ptr = Ptr::<Slot<T>>::from_addr(addr).unwrap();
+
+            let handle = Handle {
+                addr: ptr.addr,
+                value: Slot::<T>::Free(self.state.free_slot),
+            };
+            tx.update(&handle)?;
+            self.state.free_slot = claim;
+        }
+        Ok(())
     }
 
-    fn allocate_page<R: Record>(&mut self, tx: &mut impl TxWrite) -> Result<Ptr<R>> {
-        debug_assert!(
-            R::SIZE == PAGE_SIZE,
-            "Record size must be equal to PAGE_SIZE"
-        );
+    fn allocate_page(&mut self, tx: &mut impl TxWrite) -> Result<Ptr<[u8; PAGE_SIZE]>> {
         assert!(
             (self.state.slot_watermark as usize) % Self::SLOTS_PER_PAGE == 0,
             "Allocation page should only be called at page boundaries"
@@ -734,10 +813,11 @@ impl<T: Record> SlotMemory<T> {
         assert!(slot_offset == 0);
         let mut root_table = tx.lookup(self.state.table)?;
         let page_no = self.page_allocator.borrow_mut().allocate();
-        root_table[page_offset] = Ptr::from_addr(PAGE_SIZE as Addr * page_no as Addr);
+        let page_ptr = Ptr::from_addr(PAGE_SIZE as Addr * page_no as Addr);
+        root_table[page_offset] = page_ptr;
 
         self.state.slot_watermark = 0;
-        Ok(Ptr::from_addr(page_no as Addr * PAGE_SIZE as Addr).unwrap())
+        Ok(page_ptr.unwrap())
     }
 
     fn split_idx(slot_idx: u32) -> (usize, usize) {
@@ -929,14 +1009,19 @@ mod tests {
     fn slot_reallocation() -> Result<()> {
         let (mut tx, mut slots) = crate_slot_memory();
 
-        let slot = slots.allocate_and_write(&mut tx, 42)?;
+        // TODO at the moment we can not relocate slot=0, only >=1
+        // therefore need to fill slot=0
+        slots.allocate_and_write(&mut tx, 0)?;
+
+        let slot = slots.allocate_and_write(&mut tx, 1)?;
+        slots.allocate_and_write(&mut tx, 2)?;
         slots.free(&mut tx, slot)?;
 
-        let new_slot = slots.allocate_and_write(&mut tx, 42)?;
+        let new_slot = slots.allocate_and_write(&mut tx, 10)?;
         assert_eq!(new_slot, slot);
 
         let value = slots.read(&tx, new_slot)?;
-        assert_eq!(value.as_deref(), Some(&42));
+        assert_eq!(value.as_deref(), Some(&10));
         Ok(())
     }
 
