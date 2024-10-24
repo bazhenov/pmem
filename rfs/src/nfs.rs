@@ -173,8 +173,10 @@ impl NFSFileSystem for RFS {
                 .map_err(io_to_nfs_error)?;
         }
         let mut buf = Vec::with_capacity(count as usize);
-        let bytes_read = file.read_to_end(&mut buf).map_err(io_to_nfs_error)?;
-        Ok((buf, bytes_read < count as usize))
+        file.take(count as u64)
+            .read_to_end(&mut buf)
+            .map_err(io_to_nfs_error)?;
+        Ok((buf, entry.size > offset + count as u64))
     }
 
     #[instrument(name = "readdir", skip(self), err(Debug, level = "warn"))]
