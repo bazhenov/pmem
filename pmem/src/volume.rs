@@ -60,6 +60,7 @@
 use crate::driver::{NoDriver, PageDriver};
 use arc_swap::ArcSwap;
 use std::{
+    backtrace::{self, Backtrace},
     borrow::Cow,
     collections::{BTreeMap, HashSet},
     fmt::{self, Display, Formatter},
@@ -1199,6 +1200,18 @@ impl TxRead for Transaction {
 impl TxWrite for Transaction {
     fn write(&mut self, addr: Addr, bytes: impl Into<Vec<u8>>) {
         let bytes = bytes.into();
+
+        let start = 65537;
+        let end = start + 143;
+        if !(end <= addr || addr + bytes.len() as Addr <= start) {
+            println!("Writing to tx {} bytes to {}", bytes.len(), addr);
+            // // print stacktrace
+            // let backtrace = Backtrace::capture();
+            // println!("{}", backtrace);
+            // println!("bytes: {:?}", &bytes);
+            // println!()
+        }
+
         split_ptr_checked(addr, bytes.len(), self.base.pages_count);
 
         if !bytes.is_empty() {
@@ -1404,7 +1417,7 @@ fn is_valid_ptr(addr: Addr, len: usize, pages: u32) -> bool {
     page_no < pages && end_page_no < pages
 }
 
-fn split_ptr(addr: Addr) -> (PageNo, PageOffset) {
+pub fn split_ptr(addr: Addr) -> (PageNo, PageOffset) {
     let page_no = (addr >> PAGE_SIZE_BITS) & 0xFFFF_FFFF;
     let offset = addr & (PAGE_SIZE - 1) as u64;
     (page_no.try_into().unwrap(), offset.try_into().unwrap())

@@ -1,16 +1,16 @@
-use crate::volume::{Addr, PageNo, PageOffset, Transaction, TxRead, TxWrite, PAGE_SIZE};
+use crate::volume::{split_ptr, Addr, PageNo, PageOffset, TxRead, TxWrite, PAGE_SIZE};
 use pmem_derive::Record;
 use std::{
-    any::type_name,
+    any::{type_name, Any},
     array::TryFromSliceError,
+    backtrace::Backtrace,
     borrow::Cow,
-    cell::RefCell,
+    collections::HashMap,
     fmt::{self, Debug},
     io,
     marker::PhantomData,
     mem,
     ops::{Deref, DerefMut},
-    rc::Rc,
 };
 /// The size of any pointer in bytes
 pub const PTR_SIZE: usize = Ptr::<u8>::SIZE;
@@ -37,7 +37,7 @@ pub enum Error {
     UnexpectedVariantCode(u64),
 
     #[error("Slot #{0} is not free")]
-    SlotIsNotFree(SlotClaim),
+    SlotIsNotFree(Addr),
 
     #[error("Unable to read record {addr}/{type_name}: {err:?}")]
     RecordReadError {
@@ -45,6 +45,9 @@ pub enum Error {
         type_name: &'static str,
         err: Box<Error>,
     },
+
+    #[error("Global of type {1} already registered at address {0}")]
+    GlobalAlreadyRegistered(Addr, &'static str),
 
     #[error("Page error: {0}")]
     Page(#[from] crate::volume::Error),
@@ -56,6 +59,7 @@ impl From<Error> for io::Error {
             Error::DataIntegrity(..) => io::ErrorKind::InvalidData,
             Error::NoSpaceLeft => io::ErrorKind::OutOfMemory,
             Error::NullPointer => io::ErrorKind::InvalidInput,
+            Error::GlobalAlreadyRegistered(_, _) => io::ErrorKind::InvalidInput,
             Error::SlotIsNotFree(_) => io::ErrorKind::InvalidData,
             Error::UnexpectedVariantCode(..) => io::ErrorKind::InvalidInput,
             Error::RecordReadError { .. } => io::ErrorKind::InvalidData,
@@ -68,12 +72,35 @@ impl From<Error> for io::Error {
 pub struct Memory<T> {
     tx: T,
     mem_info: MemoryInfo,
+    loaded: HashMap<Addr, Box<dyn ErasedRecord + Send>>,
+}
+
+impl<T: TxRead> TxRead for Memory<T> {
+    fn read_to_buf(&self, addr: Addr, buf: &mut [u8]) {
+        self.tx.read_to_buf(addr, buf)
+    }
+
+    fn valid_range(&self, addr: Addr, len: usize) -> bool {
+        self.tx.valid_range(addr, len)
+    }
+}
+
+impl<T: TxWrite> TxWrite for Memory<T> {
+    fn write(&mut self, addr: Addr, bytes: impl Into<Vec<u8>>) {
+        self.tx.write(addr, bytes)
+    }
+
+    fn reclaim(&mut self, addr: Addr, len: usize) {
+        self.tx.reclaim(addr, len)
+    }
 }
 
 #[derive(Record, Clone)]
-struct MemoryInfo {
+pub struct MemoryInfo {
     /// Next address to allocate objects
     next_addr: Addr,
+
+    next_page: PageNo,
 
     /// Pointer to the first block in the memory that can be reused
     free_list: Option<Ptr<FreeBlock>>,
@@ -81,7 +108,7 @@ struct MemoryInfo {
 
 /// Each allocation block has a header with the size of the block
 #[derive(Record)]
-struct AllocatedBlock {
+pub struct AllocatedBlock {
     // Size of of the memory block excluding header size (this structure)
     size: u32,
 }
@@ -103,8 +130,8 @@ impl MemoryInfo {
     }
 }
 
-impl Memory<Transaction> {
-    #[cfg(test)]
+#[cfg(test)]
+impl Memory<crate::volume::Transaction> {
     fn new() -> Self {
         let volume = crate::volume::Volume::default();
         Self::init(volume.start())
@@ -119,20 +146,45 @@ impl<S: TxRead> Memory<S> {
             mem_info.next_addr > 0,
             "Invalid memory info block. Maybe you forgot to call Memory::init()?"
         );
-        Self { tx, mem_info }
+        Self {
+            tx,
+            mem_info,
+            loaded: HashMap::new(),
+        }
     }
 
-    pub fn read_super_block<T: Record>(&self) -> Result<Handle<T>> {
-        let addr = START_ADDR + (MemoryInfo::SIZE + AllocatedBlock::SIZE) as Addr;
-        self.lookup(Ptr::from_addr(addr).unwrap())
+    fn allocate_pages(&mut self, count: usize) -> Result<PageNo> {
+        // TODO NoSpaceLeft check
+        if !self.valid_range(
+            PAGE_SIZE as Addr * self.mem_info.next_page as Addr,
+            PAGE_SIZE,
+        ) {
+            return Err(Error::NoSpaceLeft);
+        }
+        let page_no = self.mem_info.next_page;
+        println!("Allocating page: {}", page_no);
+        println!("- {}", Backtrace::capture());
+        self.mem_info.next_page += count as u32;
+        Ok(page_no)
     }
 
     pub fn lookup<T: Record>(&self, ptr: Ptr<T>) -> Result<Handle<T>> {
-        read_value(ptr, &self.read_uncommitted(ptr.addr, T::SIZE))
-    }
-
-    pub fn read<T: Record>(&self, ptr: Ptr<T>) -> Result<T> {
-        Ok(self.lookup(ptr)?.into_inner())
+        let buf = self.tx.read(ptr.addr, T::SIZE);
+        // let addr = ptr.addr;
+        // let addr_to_check = 65537;
+        // if addr <= addr_to_check && addr_to_check < addr + buf.len() as Addr {
+        //     println!(
+        //         "Reading {} from {}\n  bytes: {:?}",
+        //         type_name::<T>(),
+        //         addr,
+        //         buf
+        //     );
+        //     // print stacktrace
+        //     // let backtrace = Backtrace::capture();
+        //     // println!("{}", backtrace);
+        //     println!("{:?}", &buf);
+        // }
+        read_value(ptr, &buf)
     }
 
     pub fn read_bytes(&self, ptr: SlicePtr<u8>) -> Result<Cow<[u8]>> {
@@ -140,20 +192,30 @@ impl<S: TxRead> Memory<S> {
         let items = self.read_static::<SLICE_HEADER_SIZE>(addr);
 
         let bytes = u32::from_le_bytes(items) as usize;
-        Ok(self.read_uncommitted(addr + SLICE_HEADER_SIZE as Addr, bytes))
+        Ok(self.tx.read(addr + SLICE_HEADER_SIZE as Addr, bytes))
+    }
+
+    pub fn as_ref<R: 'static>(&self, claim: Claim<R>) -> &R {
+        self.loaded
+            .get(&claim.addr)
+            .unwrap()
+            .as_any()
+            .downcast_ref()
+            .unwrap()
     }
 
     fn read_static<const N: usize>(&self, addr: Addr) -> [u8; N] {
         let mut ret = [0; N];
-        let bytes = self.read_uncommitted(addr, N);
+        let bytes = self.tx.read(addr, N);
         for (to, from) in ret.iter_mut().zip(bytes.iter()) {
             *to = *from;
         }
         ret
     }
 
-    fn read_uncommitted(&self, addr: Addr, len: usize) -> Cow<[u8]> {
-        self.tx.read(addr, len)
+    #[cfg(test)]
+    pub fn read<T: Record>(&self, ptr: Ptr<T>) -> Result<T> {
+        Ok(self.lookup(ptr)?.into_inner())
     }
 }
 
@@ -177,6 +239,7 @@ impl<S: TxWrite> Memory<S> {
 
         let mem_info = MemoryInfo {
             next_addr,
+            next_page: 1,
             free_list: None,
         };
 
@@ -184,7 +247,11 @@ impl<S: TxWrite> Memory<S> {
         mem_info.write(&mut bytes).unwrap();
         tx.write(START_ADDR, bytes);
 
-        Self { tx, mem_info }
+        Self {
+            tx,
+            mem_info,
+            loaded: HashMap::new(),
+        }
     }
 
     pub fn alloc_addr(&mut self, size: usize) -> Result<Addr> {
@@ -222,8 +289,33 @@ impl<S: TxWrite> Memory<S> {
         if !self.tx.valid_range(addr, size) {
             return Err(Error::NoSpaceLeft);
         }
-        self.write_at(Ptr::from_addr(addr).unwrap(), size as u32)?;
-        self.mem_info.next_addr += size as Addr;
+        let (start_page, _) = split_ptr(addr);
+        let (end_page, end_page_offset) = split_ptr(addr + size as Addr - 1);
+
+        assert!(size <= PAGE_SIZE, "Object size is too big");
+
+        let addr = if addr == 0 || start_page != end_page {
+            // object doesn't fit in a page. Allocating a new page
+            // TODO: we probably need to update last allocated object info, so that it can possibly be reused
+            let new_page = self.allocate_pages(required_pages_cnt(size))?;
+            println!("Allocate page for alloc_addr(): = {}", new_page);
+            new_page as Addr * PAGE_SIZE as Addr
+        } else {
+            addr
+        };
+        self.mem_info.next_addr = if end_page_offset as usize == PAGE_SIZE - 1 {
+            // we're on the end of the page, zeroing next_addr, so a new page will be allocated next time
+            0
+        } else {
+            addr + size as Addr
+        };
+
+        self.write_at(
+            Ptr::from_addr(addr).unwrap(),
+            AllocatedBlock { size: size as u32 },
+        )?;
+
+        println!("Alloc return = {}", addr + AllocatedBlock::SIZE as Addr);
         Ok(addr + AllocatedBlock::SIZE as Addr)
     }
 
@@ -278,6 +370,20 @@ impl<S: TxWrite> Memory<S> {
             Ptr::from_addr(self.alloc_addr(size)?).expect("Alloc failed")
         };
 
+        let addr = 65537;
+        if ptr.addr <= addr && addr < ptr.addr + T::SIZE as Addr {
+            println!(
+                "Writing {} bytes to {} (type: {})",
+                T::SIZE,
+                ptr.addr,
+                type_name::<T>()
+            );
+            //     // print stacktrace
+            //     let backtrace = Backtrace::capture();
+            //     println!("  bytes: {}", backtrace);
+            // println!()
+        }
+
         value.write(&mut buffer)?;
         {
             let this = &mut *self;
@@ -315,14 +421,49 @@ impl<S: TxWrite> Memory<S> {
         Ok(())
     }
 
-    pub fn finish(self) -> S {
-        let Memory {
-            tx: mut snapshot,
-            mem_info,
-        } = self;
-        mem_info.update(&mut snapshot);
-        snapshot
+    pub fn register_global<R: Record + Send>(&mut self, addr: Addr) -> Result<Claim<R>> {
+        // TODO test register in system area
+        if let Some(global) = self.loaded.get(&addr) {
+            Err(Error::GlobalAlreadyRegistered(addr, global.type_name()))
+        } else {
+            let ptr = Ptr::<R>::from_addr(addr).unwrap();
+            let record = self.tx.lookup(ptr)?.into_inner();
+            let global = Claim {
+                addr,
+                phantom: PhantomData,
+            };
+            self.loaded.insert(ptr.addr, Box::new(record));
+            Ok(global)
+        }
     }
+
+    pub fn as_mut<R: 'static>(&mut self, claim: Claim<R>) -> &mut R {
+        self.loaded
+            .get_mut(&claim.addr)
+            .unwrap()
+            .as_any_mut()
+            .downcast_mut()
+            .unwrap()
+    }
+
+    pub fn finish(self) -> Result<S> {
+        let Memory {
+            mut tx,
+            mem_info,
+            loaded,
+        } = self;
+        for (addr, value) in loaded.into_iter() {
+            tx.write(addr, value.to_vec()?);
+        }
+        mem_info.update(&mut tx);
+        Ok(tx)
+    }
+}
+
+/// The number of pages required to fit an object of a given size
+fn required_pages_cnt(size: usize) -> usize {
+    // TODO tests
+    (size + PAGE_SIZE - 1) / PAGE_SIZE
 }
 
 #[derive(Record)]
@@ -367,7 +508,7 @@ impl<T> Ptr<T> {
     }
 }
 
-impl<T> Record for Ptr<T> {
+impl<T: 'static> Record for Ptr<T> {
     const SIZE: usize = mem::size_of::<Addr>();
 
     fn read(data: &[u8]) -> Result<Self> {
@@ -411,7 +552,7 @@ impl<T> PartialEq for Ptr<T> {
 impl<T> Copy for Ptr<T> {}
 
 #[derive(Record)]
-pub struct SlicePtr<T>(Ptr<T>);
+pub struct SlicePtr<T: 'static>(Ptr<T>);
 
 impl<T> Clone for SlicePtr<T> {
     fn clone(&self) -> Self {
@@ -490,11 +631,38 @@ impl<const N: usize, T: Record + Default + Copy> Record for [T; N] {
 ///     my_record.write(output).unwrap();
 /// }
 /// ```
-pub trait Record: Sized {
+pub trait Record: Sized + 'static {
     const SIZE: usize;
 
     fn read(data: &[u8]) -> Result<Self>;
     fn write(&self, data: &mut [u8]) -> Result<()>;
+}
+
+pub trait ErasedRecord {
+    fn to_vec(&self) -> Result<Vec<u8>>;
+    fn as_any(&self) -> &dyn Any;
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+    fn type_name(&self) -> &'static str;
+}
+
+impl<T: Record + 'static> ErasedRecord for T {
+    fn to_vec(&self) -> Result<Vec<u8>> {
+        let mut data = vec![0; T::SIZE];
+        self.write(&mut data)?;
+        Ok(data)
+    }
+
+    fn type_name(&self) -> &'static str {
+        type_name::<T>()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
 }
 
 macro_rules! impl_record_for_primitive {
@@ -535,6 +703,7 @@ impl Record for bool {
 }
 
 impl<T: Record> Record for Option<T> {
+    // TODO write tests. It is oncorrect if T alignment is more than 1 byte
     const SIZE: usize = T::SIZE + 1;
 
     fn read(data: &[u8]) -> Result<Self> {
@@ -559,23 +728,6 @@ impl<T: Record> Record for Option<T> {
     }
 }
 
-struct Table<const N: usize, T> {
-    base: Ptr<[T; N]>,
-}
-
-impl<const N: usize, T: Record> Table<N, T> {
-    fn open(base: Ptr<[T; N]>) -> Self {
-        Table { base }
-    }
-
-    fn nth(&self, idx: usize) -> Ptr<T> {
-        if idx >= N {
-            panic!("Out-of-bound error");
-        }
-        Ptr::<T>::from_addr(self.base.addr + (T::SIZE * idx) as Addr).unwrap()
-    }
-}
-
 pub trait AsAddrAndRef<T> {
     fn as_addr_and_ref(&self) -> (Addr, &T);
 }
@@ -592,6 +744,11 @@ pub struct Handle<T> {
 }
 
 impl<T> Handle<T> {
+    // TODO remove
+    pub fn new(addr: Addr, value: T) -> Self {
+        Handle { addr, value }
+    }
+
     pub fn ptr(&self) -> Ptr<T> {
         Ptr {
             addr: self.addr,
@@ -618,6 +775,15 @@ impl<T> DerefMut for Handle<T> {
     }
 }
 
+impl<T: Debug> Debug for Handle<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Handle")
+            .field("addr", &self.addr)
+            .field("value", &self.value)
+            .finish()
+    }
+}
+
 /// Stable Rust at the moment doesn't support compile time max(). Used by proc_macro
 pub const fn max<const N: usize>(array: [usize; N]) -> usize {
     let mut max = 0;
@@ -631,45 +797,76 @@ pub const fn max<const N: usize>(array: [usize; N]) -> usize {
     max
 }
 
-type PointersPage<T> = [Option<Ptr<T>>; PAGE_SIZE / NULL_PTR_SIZE];
-type SlotsPage = [u8; PAGE_SIZE];
-type SlotClaim = u32;
+pub type SlotClaim = u32;
 
-#[derive(Record)]
-struct PageAllocator {
-    next_available_page: PageNo,
-}
+/// This wrapper exists primarily to opt out of default implementation of `Record` trait
+/// for arrays. We want to have a custom implementation that will write the array directly as slice.
+pub struct Blob<const N: usize>([u8; N]);
 
-impl PageAllocator {
-    fn new() -> Self {
-        Self {
-            next_available_page: 1,
-        }
+impl<const N: usize> Record for Blob<N> {
+    const SIZE: usize = N;
+
+    fn read(data: &[u8]) -> Result<Self> {
+        assert!(data.len() == N);
+
+        let mut result = [0; N];
+        result.copy_from_slice(data);
+        Ok(Self(result))
     }
 
-    fn allocate(&mut self) -> PageNo {
-        // TODO NoSpaceLeft check
-        let page = self.next_available_page;
-        self.next_available_page += 1;
-        page
+    fn write(&self, data: &mut [u8]) -> Result<()> {
+        assert!(data.len() == N);
+
+        data.copy_from_slice(&self.0);
+        Ok(())
+    }
+}
+
+impl<const N: usize> Default for Blob<N> {
+    fn default() -> Self {
+        Self([0; N])
+    }
+}
+
+impl<const N: usize> Deref for Blob<N> {
+    type Target = [u8; N];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<const N: usize> DerefMut for Blob<N> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
     }
 }
 
 #[derive(Record)]
-struct SlotMemoryState {
-    table: Ptr<PointersPage<SlotsPage>>,
-
+pub struct SlotMemoryState<T: Record> {
     /// Index of the next available slot for allocation.
     ///
     /// This value represents the highest slot number that has been allocated + 1.
     /// When allocating new slots, this value is incremented.
-    slot_watermark: SlotClaim,
+    next_slot: Ptr<Slot<T>>,
 
     /// Head of a free list
     ///
     /// Index of a first slot in a free list. It points to the [`Slot::Free`]
     /// structure.
-    free_slot: SlotClaim,
+    free_slot: Option<Ptr<Slot<T>>>,
+}
+
+pub struct Claim<T> {
+    addr: Addr,
+    phantom: PhantomData<T>,
+}
+
+impl<T> Copy for Claim<T> {}
+impl<T> Clone for Claim<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
 }
 
 /// A memory management system for fixed-size slots.
@@ -679,9 +876,8 @@ struct SlotMemoryState {
 /// - Slots can be reused after deallocation, improving memory efficiency.
 /// - Each slot is assigned a stable identifier (claim) that remains valid for the lifetime of the allocation.
 /// - Slot occupancy is tracked, preventing use-after-free errors by returning None for deallocated slots.
-struct SlotMemory<T> {
-    page_allocator: Rc<RefCell<PageAllocator>>,
-    state: SlotMemoryState,
+pub struct SlotMemory<T: Record> {
+    state: SlotMemoryState<T>,
     _phantom: PhantomData<T>,
 }
 
@@ -689,7 +885,7 @@ struct SlotMemory<T> {
 #[repr(u8)]
 enum Slot<T: Record> {
     /// Contains slot claim of the next free slot
-    Free(SlotClaim) = 0,
+    Free(Option<Ptr<Slot<T>>>) = 0,
     Occupied(T) = 1,
 }
 
@@ -702,134 +898,153 @@ impl<T: Record> Slot<T> {
     }
 }
 
+// TODO SlotMemory should contains its address like PageAllocator
 impl<T: Record> SlotMemory<T> {
     const SLOT_SIZE: usize = Slot::<T>::SIZE;
-    const SLOTS_PER_PAGE: usize = PAGE_SIZE / Self::SLOT_SIZE;
+    const VALUE_OFFSET: usize = 1;
 
-    fn init(page_allocator: Rc<RefCell<PageAllocator>>) -> Self {
-        let page_no = page_allocator.borrow_mut().allocate();
+    pub fn open(state: SlotMemoryState<T>) -> Self {
         Self {
-            page_allocator,
-            state: SlotMemoryState {
-                table: Ptr::from_addr(PAGE_SIZE as Addr * page_no as Addr).unwrap(),
-                free_slot: 0,
-                slot_watermark: 0,
-            },
+            state,
             _phantom: PhantomData,
         }
     }
 
-    pub fn allocate_and_write(&mut self, tx: &mut impl TxWrite, value: T) -> Result<SlotClaim> {
-        // Determining free slot
-        let free_slot = self.state.free_slot;
-        let (page_idx, slot_idx) = Self::split_idx(free_slot);
+    pub fn init(mem: &mut Memory<impl TxWrite>) -> Result<Self> {
+        let page_no = mem.allocate_pages(1)?;
+        println!("SlotMemory::init, page_no = {}", page_no);
+        let state = SlotMemoryState {
+            free_slot: None,
+            next_slot: Ptr::from_addr(PAGE_SIZE as Addr * page_no as Addr).unwrap(),
+        };
+        Ok(Self {
+            state,
+            _phantom: PhantomData,
+        })
+    }
 
-        let root_table = Table::open(self.state.table);
-        let mut page_ptr = tx.lookup(root_table.nth(page_idx))?;
-        if self.state.free_slot > 0 {
-            //Reusing slot from a free list
-            let table2 = tx.lookup(page_ptr.unwrap())?;
-            let addr = table2.addr + (slot_idx * Self::SLOT_SIZE) as Addr;
-
-            // Reading the content of free slot and making sure it is indeed free.
-            // Saving the next one
-            let ptr = Ptr::<Slot<T>>::from_addr(addr).unwrap();
-            let Slot::Free(next_free_slot) = tx.lookup(ptr)?.into_inner() else {
-                return Err(Error::SlotIsNotFree(free_slot));
+    pub fn allocate_and_write(
+        &mut self,
+        mem: &mut Memory<impl TxWrite>,
+        value: T,
+    ) -> Result<Handle<T>> {
+        if let Some(free_slot) = self.state.free_slot {
+            // Reusing slot from a free list
+            let mut slot_handle = mem.lookup(free_slot)?;
+            let Slot::Free(next_free_slot) = *slot_handle else {
+                panic!("Slot is not free {:x}", free_slot.addr);
             };
             self.state.free_slot = next_free_slot;
 
             // Occupying the slot
-            let value = Slot::Occupied(value);
-            tx.update(&Handle { addr, value })?;
-            Ok(free_slot)
-        } else {
-            if (free_slot as usize) % Self::SLOTS_PER_PAGE == 0 {
-                // We're on a boundary of a page, need to allocate a new one
-                if page_ptr.is_none() {
-                    let ptr = self.allocate_page(tx)?;
-                    *page_ptr = Some(ptr);
-                    tx.update(&page_ptr)?;
-                }
-            }
+            *slot_handle = Slot::Occupied(value);
+            mem.update(&slot_handle)?;
+            let addr = slot_handle.addr + Self::VALUE_OFFSET as Addr;
+            let value = slot_handle.into_inner().occupied().unwrap();
+            let handle = Handle { addr, value };
 
-            let table2 = tx.lookup(page_ptr.unwrap())?;
+            Ok(handle)
+        } else {
+            let addr = self.state.next_slot.addr;
+            let (start_page, _) = split_ptr(addr);
+            let (end_page, end_offset) = split_ptr(addr + Self::SLOT_SIZE as Addr - 1);
+
+            // If we're on a page boundary page is not allocated yet
+            if start_page != end_page {
+                self.state.next_slot = self.allocate_page(mem)?;
+            }
+            let addr = self.state.next_slot.addr;
+
+            // println!("Next addr: {}", addr);
+
             let handle = Handle {
-                addr: table2.addr + (slot_idx * Self::SLOT_SIZE) as Addr,
+                addr: self.state.next_slot.addr,
                 value: Slot::Occupied(value),
             };
-            tx.update(&handle)?;
-            self.state.slot_watermark += 1;
-            Ok(free_slot)
-        }
-    }
-
-    pub fn read(&self, tx: &impl TxRead, slot: u32) -> Result<Option<Handle<T>>> {
-        let value = if slot < self.state.slot_watermark {
-            let (page_offset, slot_offset) = Self::split_idx(slot);
-            let root_table = tx.lookup(self.state.table)?;
-            let table_ptr = root_table[page_offset].unwrap();
-            let table = tx.lookup(table_ptr)?;
-
-            let offset = slot_offset * Self::SLOT_SIZE;
-            let ptr = Ptr::<Slot<T>>::from_addr(table.addr + offset as Addr).unwrap();
-
-            let slot = tx.lookup(ptr)?.into_inner();
-
-            // correct addr to skip optional part,
-            // TODO: handling optional out-of-band
-            slot.occupied().map(|value| Handle {
-                addr: ptr.addr + 1,
-                value,
-            })
-        } else {
-            None
-        };
-        Ok(value)
-    }
-
-    pub fn free(&mut self, tx: &mut impl TxWrite, claim: SlotClaim) -> Result<()> {
-        let slot = self.read(tx, claim)?;
-        if let Some(slot) = slot {
-            let addr = slot.ptr().addr - 1;
-            let ptr = Ptr::<Slot<T>>::from_addr(addr).unwrap();
+            mem.update(&handle)?;
+            self.state.next_slot = Ptr::from_addr(addr + Self::SLOT_SIZE as Addr).unwrap();
 
             let handle = Handle {
-                addr: ptr.addr,
-                value: Slot::<T>::Free(self.state.free_slot),
+                addr: handle.ptr().addr + Self::VALUE_OFFSET as Addr,
+                value: handle.into_inner().occupied().unwrap(),
             };
-            tx.update(&handle)?;
-            self.state.free_slot = claim;
+            if end_offset as Addr == PAGE_SIZE as Addr - 1 {
+                self.state.next_slot = self.allocate_page(mem)?;
+            }
+
+            Ok(handle)
         }
+    }
+
+    pub fn read(&self, tx: &impl TxRead, slot: Ptr<T>) -> Result<Option<Handle<T>>> {
+        let slot_addr = slot.addr - Self::VALUE_OFFSET as Addr;
+        let ptr = Ptr::<Slot<T>>::from_addr(slot_addr).unwrap();
+        let slot = tx.lookup(ptr)?;
+        if let Slot::Occupied(value) = slot.into_inner() {
+            Ok(Some(Handle {
+                addr: slot_addr + Self::VALUE_OFFSET as Addr,
+                value,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn free(&mut self, tx: &mut impl TxWrite, handle: Handle<T>) -> Result<()> {
+        // Creating ptr to an outer Slot structure
+        let addr = handle.ptr().addr - Self::VALUE_OFFSET as Addr;
+        let ptr = Ptr::<Slot<T>>::from_addr(addr).unwrap();
+
+        let mut slot_handle = tx.lookup(ptr)?;
+        assert!(
+            matches!(*slot_handle, Slot::Occupied(_)),
+            "Double free at ptr 0x{:x}",
+            ptr.addr
+        );
+        *slot_handle = Slot::Free(self.state.free_slot);
+        tx.update(&slot_handle)?;
+        self.state.free_slot = Some(slot_handle.ptr());
         Ok(())
     }
 
-    fn allocate_page(&mut self, tx: &mut impl TxWrite) -> Result<Ptr<[u8; PAGE_SIZE]>> {
+    fn allocate_page(&mut self, mem: &mut Memory<impl TxWrite>) -> Result<Ptr<Slot<T>>> {
         assert!(
-            (self.state.slot_watermark as usize) % Self::SLOTS_PER_PAGE == 0,
-            "Allocation page should only be called at page boundaries"
+            Self::SLOT_SIZE <= PAGE_SIZE,
+            "Object type it larger that page size",
         );
-        let (page_offset, slot_offset) = Self::split_idx(self.state.slot_watermark);
-        assert!(slot_offset == 0);
-        let mut root_table = tx.lookup(self.state.table)?;
-        let page_no = self.page_allocator.borrow_mut().allocate();
-        let page_ptr = Ptr::from_addr(PAGE_SIZE as Addr * page_no as Addr);
-        root_table[page_offset] = page_ptr;
-
-        self.state.slot_watermark = 0;
-        Ok(page_ptr.unwrap())
+        let page_no = mem.allocate_pages(1)?;
+        let page_addr = page_no as Addr * PAGE_SIZE as Addr;
+        println!("Allocated page for slots: {}", page_addr);
+        Ok(Ptr::from_addr(page_addr).unwrap())
     }
 
-    fn split_idx(slot_idx: u32) -> (usize, usize) {
-        let slot_offset = slot_idx as usize % Self::SLOTS_PER_PAGE;
-        let page_offset = slot_idx as usize / Self::SLOTS_PER_PAGE;
-        (page_offset, slot_offset)
+    pub fn finish(self) -> SlotMemoryState<T> {
+        self.state
     }
 }
 
 pub trait TxReadExt: TxRead {
+    // TODO probably should be moved to Layout?
     fn lookup<T: Record>(&self, ptr: Ptr<T>) -> Result<Handle<T>> {
-        read_value(ptr, &self.read(ptr.addr, T::SIZE))
+        let buf = self.read(ptr.addr, T::SIZE);
+        read_value(ptr, &buf)
+    }
+
+    fn read_bytes(&self, ptr: SlicePtr<u8>) -> Result<Cow<[u8]>> {
+        let addr = ptr.0.addr;
+        let items = self.read_static::<SLICE_HEADER_SIZE>(addr);
+
+        let bytes = u32::from_le_bytes(items) as usize;
+        Ok(self.read(addr + SLICE_HEADER_SIZE as Addr, bytes))
+    }
+
+    fn read_static<const N: usize>(&self, addr: Addr) -> [u8; N] {
+        let mut ret = [0; N];
+        let bytes = self.read(addr, N);
+        for (to, from) in ret.iter_mut().zip(bytes.iter()) {
+            *to = *from;
+        }
+        ret
     }
 }
 
@@ -850,7 +1065,7 @@ impl<S: TxWrite> TxWriteExt for S {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::volume::{Volume, PAGE_SIZE};
+    use crate::volume::{Transaction, Volume, PAGE_SIZE};
     use pmem_derive::Record;
     use rand::{rngs::SmallRng, Rng, SeedableRng};
     use std::mem;
@@ -885,6 +1100,57 @@ mod tests {
     }
 
     #[test]
+    fn check_memory() -> Result<()> {
+        let vol = Volume::default();
+        let mut tx = vol.start();
+        tx.write(800, [42u8; 1]);
+        tx.write(1000, [100u8; 1]);
+        let mut layout = Memory::init(tx);
+
+        let claim = layout.register_global::<u8>(800)?;
+        assert_eq!(layout.as_ref(claim), &42);
+
+        let claim = layout.register_global::<u8>(1000)?;
+        assert_eq!(layout.as_ref(claim), &100);
+        Ok(())
+    }
+
+    #[test]
+    fn check_memory_will_finish_globals() -> Result<()> {
+        let vol = Volume::default();
+        let mut layout = Memory::init(vol.start());
+        let addr = 800;
+        let expected_value = 42;
+
+        let claim = layout.register_global::<u8>(addr)?;
+        *layout.as_mut(claim) = expected_value;
+
+        let tx = layout.finish()?;
+
+        let mut buf = [0u8];
+        tx.read_to_buf(addr, &mut buf[..]);
+        assert_eq!(buf[0], expected_value);
+        Ok(())
+    }
+
+    #[test]
+    fn check_memory_shoud_return_error_on_type_conflict() {
+        let vol = Volume::default();
+        let mut layout = Memory::init(vol.start());
+
+        let expected_addr = 800;
+        layout.register_global::<u8>(expected_addr).unwrap();
+        match layout.register_global::<u16>(expected_addr) {
+            Err(Error::GlobalAlreadyRegistered(addr, type_name)) => {
+                assert_eq!(addr, expected_addr);
+                assert_eq!(type_name, "u8");
+            }
+            Err(_) => panic!("GlobalAlreadyRegistered expected"),
+            Ok(_) => panic!("Error expected"),
+        }
+    }
+
+    #[test]
     fn memory_can_persist_over_commits() -> Result<()> {
         let mut volume = Volume::default();
         let mut mem = Memory::init(volume.start());
@@ -894,7 +1160,7 @@ mod tests {
         for i in 0..10 {
             let handle = mem.write(Value(i))?;
             ptrs.push(handle.ptr());
-            volume.commit(mem.finish()).unwrap();
+            volume.commit(mem.finish()?).unwrap();
             mem = Memory::open(volume.start());
         }
 
@@ -942,8 +1208,8 @@ mod tests {
         let mut volume = Volume::with_capacity(PAGE_SIZE * 3);
         let mut mem = Memory::init(volume.start());
 
-        let ptr_a = mem.alloc::<[u8; PAGE_SIZE]>()?;
-        let ptr_b = mem.alloc::<[u8; PAGE_SIZE]>()?;
+        let ptr_a = mem.alloc::<[u8; PAGE_SIZE - 4]>()?;
+        let ptr_b = mem.alloc::<[u8; PAGE_SIZE - 4]>()?;
         mem.reclaim(ptr_a)?;
         mem.reclaim(ptr_b)?;
         assert!(
@@ -951,15 +1217,15 @@ mod tests {
             "Free list should not be empty"
         );
 
-        volume.commit(mem.finish()).unwrap();
+        volume.commit(mem.finish()?).unwrap();
 
         let mut mem = Memory::open(volume.start());
         assert!(
             mem.mem_info.free_list.is_some(),
             "Free list should not be empty"
         );
-        mem.alloc::<[u8; PAGE_SIZE]>()?;
-        mem.alloc::<[u8; PAGE_SIZE]>()?;
+        mem.alloc::<[u8; PAGE_SIZE - 4]>()?;
+        mem.alloc::<[u8; PAGE_SIZE - 4]>()?;
 
         Ok(())
     }
@@ -993,43 +1259,179 @@ mod tests {
 
     #[test]
     fn slot_allocator_simple_allocate() -> Result<()> {
-        let (mut tx, mut slots) = crate_slot_memory();
+        let (mut tx, mut slots) = create_slot_memory();
 
-        let slot = slots.read(&tx, 13)?;
+        let slot = slots.read(&tx, Ptr::from_addr(13).unwrap())?;
         assert!(slot.is_none());
 
-        let slot = slots.allocate_and_write(&mut tx, 42)?;
+        let handle_42 = slots.allocate_and_write(&mut tx, 42)?;
+        let handle_43 = slots.allocate_and_write(&mut tx, 43)?;
 
-        let slot = slots.read(&tx, slot)?;
+        let slot = slots.read(&tx, handle_42.ptr())?;
         assert_eq!(slot.as_deref(), Some(&42));
+
+        let slot = slots.read(&tx, handle_43.ptr())?;
+        assert_eq!(slot.as_deref(), Some(&43));
+        Ok(())
+    }
+
+    #[test]
+    fn slot_page_boundary_allocate() -> Result<()> {
+        check_type_correctness::<[u8; 31]>(&[0; 31], &[1; 31])
+    }
+
+    fn check_type_correctness<T: Record + Clone + Debug + PartialEq>(
+        a_value: &T,
+        b_value: &T,
+    ) -> Result<()> {
+        assert!(
+            PAGE_SIZE % Slot::<T>::SIZE == 0,
+            "For test to work correctly page size {} should be divisible by the type <{}> size: {}",
+            PAGE_SIZE,
+            type_name::<T>(),
+            Slot::<T>::SIZE
+        );
+        let (mut tx, mut slots) = create_slot_memory();
+
+        let count = PAGE_SIZE / Slot::<T>::SIZE * 2;
+
+        let expected_values = [a_value.clone(), b_value.clone()]
+            .iter()
+            .cycle()
+            .take(count)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let handles = expected_values
+            .iter()
+            .cloned()
+            .map(|val| slots.allocate_and_write(&mut tx, val))
+            .collect::<Result<Vec<_>>>()?;
+
+        for (handle, expected) in handles.iter().zip(expected_values.iter()) {
+            let value = slots.read(&tx, handle.ptr())?.unwrap();
+            assert_eq!(expected, &*value);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn check_slot_sizes() {
+        assert_eq!(Option::<Ptr<Slot<[u8; 1]>>>::SIZE, 9);
+        assert_eq!(Slot::<[u8; 1]>::SIZE, 10);
+    }
+
+    #[test]
+    fn slot_can_be_updated() -> Result<()> {
+        let (mut tx, mut slots) = create_slot_memory();
+
+        let mut handle = slots.allocate_and_write(&mut tx, 13)?;
+        *handle = 42;
+        tx.update(&handle)?;
+
+        let value = slots.read(&tx, handle.ptr())?.unwrap();
+        assert_eq!(*value, 42);
+        Ok(())
+    }
+
+    #[test]
+    fn slot_memory_can_be_reopen() -> Result<()> {
+        let (mut tx, mut slots) = create_slot_memory::<u64>();
+
+        let handle = slots.allocate_and_write(&mut tx, 42)?;
+
+        let slots = SlotMemory::<u64>::open(slots.finish());
+        let value = slots.read(&tx, handle.ptr())?.unwrap();
+        assert_eq!(*value, 42);
         Ok(())
     }
 
     #[test]
     fn slot_reallocation() -> Result<()> {
-        let (mut tx, mut slots) = crate_slot_memory();
+        let (mut tx, mut slots) = create_slot_memory();
 
         // TODO at the moment we can not relocate slot=0, only >=1
         // therefore need to fill slot=0
         slots.allocate_and_write(&mut tx, 0)?;
 
-        let slot = slots.allocate_and_write(&mut tx, 1)?;
+        let handle = slots.allocate_and_write(&mut tx, 1)?;
         slots.allocate_and_write(&mut tx, 2)?;
-        slots.free(&mut tx, slot)?;
+        let handle_ptr = handle.ptr();
+        slots.free(&mut tx, handle)?;
 
-        let new_slot = slots.allocate_and_write(&mut tx, 10)?;
-        assert_eq!(new_slot, slot);
+        let new_handle = slots.allocate_and_write(&mut tx, 10)?;
+        assert_eq!(new_handle.ptr(), handle_ptr);
 
-        let value = slots.read(&tx, new_slot)?;
+        let value = slots.read(&tx, new_handle.ptr())?;
         assert_eq!(value.as_deref(), Some(&10));
         Ok(())
     }
 
-    fn crate_slot_memory<T: Record>() -> (Transaction, SlotMemory<T>) {
+    fn create_slot_memory<T: Record>() -> (Memory<Transaction>, SlotMemory<T>) {
         let volume = Volume::new_in_memory(10);
         let tx = volume.start();
-        let page_allocator = Rc::new(RefCell::new(PageAllocator::new()));
+        let mut mem = Memory::init(tx);
+        let slots = SlotMemory::init(&mut mem).unwrap();
 
-        (tx, SlotMemory::init(page_allocator))
+        (mem, slots)
+    }
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn slot_can_be_reclaimed((items, target_idx) in any_items_and_target()) {
+                let (mut tx, mut slots) = create_slot_memory();
+
+                let allocated = items
+                    .iter()
+                    .copied()
+                    .map(|value| slots.allocate_and_write(&mut tx, value))
+                    .collect::<Result<Vec<_>>>()?;
+
+                // Reclaiming target
+                let target_handle = slots.read(&tx, allocated[target_idx].ptr())?.unwrap();
+                slots.free(&mut tx, target_handle)?;
+
+                for (idx, (slot, item)) in allocated.into_iter().zip(items).enumerate() {
+                    let slot = slots.read(&tx, slot.ptr())?;
+                    if idx == target_idx {
+                        prop_assert_eq!(slot.as_deref(), None);
+                    } else {
+                        prop_assert_eq!(slot.as_deref(), Some(&item));
+                    }
+                }
+            }
+
+            #[test]
+            fn slot_will_not_be_removed_untill_free((items, target_idx) in any_items_and_target()) {
+                let (mut tx, mut slots) = create_slot_memory();
+
+                let target = items[target_idx];
+                let mut allocated = items
+                    .into_iter()
+                    .map(|value| slots.allocate_and_write(&mut tx, value))
+                    .collect::<Result<Vec<_>>>()?;
+
+                // Reclaiming all but target
+                let target_slot = allocated.remove(target_idx);
+                for item in allocated {
+                    slots.free(&mut tx, item)?;
+                }
+
+                let target_slot = slots.read(&tx, target_slot.ptr())?;
+                prop_assert_eq!(target_slot.as_deref(), Some(&target));
+            }
+        }
+
+        /// Returns a vectors of random ites to allocate and random index of one (target) element
+        fn any_items_and_target() -> impl Strategy<Value = (Vec<u64>, usize)> {
+            (1usize..10).prop_flat_map(|size| {
+                let allocations = (1u64..=size as u64).collect::<Vec<_>>();
+                (Just(allocations), 0..size)
+            })
+        }
     }
 }

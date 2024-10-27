@@ -35,11 +35,11 @@ pub struct RfsState {
 
 impl RfsState {
     pub async fn commit(&mut self, volume: &mut Volume) {
-        let mut sw_fs = Filesystem::open(volume.start());
+        let mut sw_fs = Filesystem::open(volume.start()).unwrap();
         mem::swap(&mut self.fs, &mut sw_fs);
-        volume.commit(sw_fs.finish()).unwrap();
+        volume.commit(sw_fs.finish().unwrap()).unwrap();
         let new_tx = volume.start();
-        self.fs = Filesystem::open(new_tx);
+        self.fs = Filesystem::open(new_tx).unwrap();
     }
 }
 
@@ -59,7 +59,7 @@ impl DerefMut for RfsState {
 
 impl RFS {
     pub fn new(snapshot: Transaction) -> RFS {
-        let fs = Filesystem::open(snapshot);
+        let fs = Filesystem::open(snapshot).unwrap();
         let root = fs.get_root().unwrap();
         let state = RfsState { fs };
         RFS {

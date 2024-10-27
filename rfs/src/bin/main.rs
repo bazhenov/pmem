@@ -27,7 +27,7 @@ async fn main() {
         .expect("Volume creation failed");
     if db_exists {
         warn!(path = file_path, "Allocating FS");
-        let tx = Filesystem::allocate(volume.start()).finish();
+        let tx = Filesystem::allocate(volume.start()).finish().unwrap();
         volume.commit(tx).unwrap();
     } else {
         info!(path = file_path, "Opening FS");

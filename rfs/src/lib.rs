@@ -1,5 +1,8 @@
 use pmem::{
-    memory::{self, SlicePtr, NULL_PTR_SIZE, PTR_SIZE},
+    memory::{
+        AllocatedBlock, Blob, MemoryInfo, SlicePtr, SlotMemory, SlotMemoryState, TxReadExt,
+        TxWriteExt, NULL_PTR_SIZE,
+    },
     volume::{Addr, TxRead, TxWrite},
     Handle, Memory, Ptr, Record,
 };
@@ -10,7 +13,6 @@ use std::{
     fmt,
     io::{self, Error, ErrorKind, Read, Seek, SeekFrom, Write},
     iter::Peekable,
-    ops::{Deref, DerefMut},
     path::{self, Component, Path, PathBuf},
     rc::Rc,
 };
@@ -21,8 +23,11 @@ type CreateResult = std::result::Result<Handle<FNode>, Handle<FNode>>;
 
 pub mod nfs;
 
+const SLOTS_ADDR: Addr = 0x100;
+
 pub struct Filesystem<S> {
     volume: Handle<VolumeInfo>,
+    fnode_slots: SlotMemory<FNode>,
     mem: Memory<S>,
 }
 
@@ -32,10 +37,20 @@ pub struct VolumeInfo {
 }
 
 impl<S: TxRead> Filesystem<S> {
-    pub fn open(snapshot: S) -> Self {
+    pub fn open(snapshot: S) -> Result<Self> {
+        let addr = 8 + (MemoryInfo::SIZE + AllocatedBlock::SIZE) as Addr;
+        let volume = snapshot
+            .lookup(Ptr::<VolumeInfo>::from_addr(addr).unwrap())
+            .unwrap();
+        let slot_state =
+            snapshot.lookup(Ptr::<SlotMemoryState<_>>::from_addr(SLOTS_ADDR).unwrap())?;
         let mem = Memory::open(snapshot);
-        let volume = mem.read_super_block().unwrap();
-        Self { volume, mem }
+        let fnode_slots = SlotMemory::open(slot_state.into_inner());
+        Ok(Self {
+            volume,
+            mem,
+            fnode_slots,
+        })
     }
 
     pub fn get_root(&self) -> Result<FileMeta> {
@@ -131,11 +146,11 @@ impl<S: TxRead> Filesystem<S> {
     }
 
     fn find_child(&self, start_node: Ptr<FNode>, name: &str) -> Result<FileInfoReferent> {
-        let mut cur_node = Some(start_node);
         let mut referent = None;
+        let mut cur_node = Some(start_node);
 
-        while let Some(node) = cur_node {
-            let node = self.mem.lookup(node)?;
+        while let Some(claim) = cur_node {
+            let node = self.mem.lookup(claim)?;
             let child_name = node.name(&self.mem)?;
             if name == child_name.as_str() {
                 return Ok(FileInfoReferent { referent, node });
@@ -159,6 +174,7 @@ impl<S: TxRead> Filesystem<S> {
 impl<S: TxWrite> Filesystem<S> {
     pub fn allocate(snapshot: S) -> Self {
         let mut mem = Memory::init(snapshot);
+        let fnode_slots = SlotMemory::init(&mut mem).unwrap();
         let super_block_ptr = mem.alloc::<VolumeInfo>().unwrap();
         let name = mem.write_bytes("/".as_bytes()).unwrap();
         let root_entry = FNode {
@@ -171,7 +187,11 @@ impl<S: TxWrite> Filesystem<S> {
         };
         let root = mem.write(root_entry).unwrap().ptr();
         let volume = mem.write_at(super_block_ptr, VolumeInfo { root }).unwrap();
-        Self { volume, mem }
+        Self {
+            volume,
+            mem,
+            fnode_slots,
+        }
     }
 
     pub fn delete(&mut self, dir: &FileMeta, name: impl AsRef<str>) -> Result<()> {
@@ -203,7 +223,7 @@ impl<S: TxWrite> Filesystem<S> {
             self.mem.reclaim(double_indirect_ptr)?;
         }
 
-        self.mem.reclaim(file.node.ptr())?;
+        self.fnode_slots.free(&mut self.mem, file.node)?;
 
         if let Some(mut referent) = file.referent {
             // Child is not first in a list
@@ -232,10 +252,10 @@ impl<S: TxWrite> Filesystem<S> {
             }
             child
         } else {
-            let new_node = self.write_fsnode(file_name, NodeType::File)?;
-            dir.children = Some(new_node.ptr());
+            let node = self.write_fsnode(file_name, NodeType::File)?;
+            dir.children = Some(node.ptr());
             self.mem.update(&dir)?;
-            new_node
+            node
         };
 
         FileMeta::from(file_info, &self.mem)
@@ -251,19 +271,28 @@ impl<S: TxWrite> Filesystem<S> {
 
         let directory_inode = if let Some(first_child) = parent.children {
             let new_child = self
-                .create_child(first_child, name.as_ref(), NodeType::Directory)?
+                .create_child(first_child, name.as_ref(), NodeType::Directory)
+                .expect("Unable to create dir")
                 .ok()
                 .ok_or(ErrorKind::AlreadyExists)?;
             // Update the parent directory if the new child is the first in the list
             if new_child.next == Some(first_child) {
                 parent.children = Some(new_child.ptr());
                 self.mem.update(&parent)?;
+                if parent.ptr().unwrap_addr() == 65537 {
+                    println!("Ptr: {:?}", parent.ptr());
+                    println!("next: {:?}", parent.children);
+                }
+                let _ = self.mem.lookup(parent.ptr()).expect("Unable to read back");
             }
             new_child
         } else {
-            let dir_inode = self.write_fsnode(name.as_ref(), NodeType::Directory)?;
+            let dir_inode = self
+                .write_fsnode(name.as_ref(), NodeType::Directory)
+                .expect("Unable to create dir");
             parent.children = Some(dir_inode.ptr());
             self.mem.update(&parent)?;
+            let _ = self.mem.lookup(parent.ptr()).expect("Unable to read back");
             dir_inode
         };
 
@@ -300,8 +329,17 @@ impl<S: TxWrite> Filesystem<S> {
         FileMeta::from(node, &self.mem)
     }
 
-    pub fn finish(self) -> S {
-        self.mem.finish()
+    pub fn finish(self) -> Result<S> {
+        let Self {
+            mem,
+            fnode_slots,
+            volume,
+        } = self;
+        let mut snapshot = mem.finish()?;
+        let fnode_slots = fnode_slots.finish();
+        snapshot.update(&Handle::new(SLOTS_ADDR, fnode_slots))?;
+        snapshot.update(&volume)?;
+        Ok(snapshot)
     }
 
     /// Returns `Ok(child)` if it was created successfully otherwise returns existing child: `Err(child)`
@@ -314,7 +352,8 @@ impl<S: TxWrite> Filesystem<S> {
         let mut prev_node = None;
         let mut cur_node = Some(start_node);
         while let Some(node) = cur_node {
-            let node = self.mem.lookup(node)?;
+            // println!("Lookup address: {:?} given by node: {:?}", node, prev_node);
+            let node = self.mem.lookup(node).expect("Unable to read dir");
             let child_name = node.name(&self.mem)?;
             match child_name.as_str().cmp(name) {
                 Ordering::Equal => return Ok(CreateResult::Err(node)),
@@ -329,11 +368,19 @@ impl<S: TxWrite> Filesystem<S> {
         let mut new_node = self.write_fsnode(name, node_type)?;
         new_node.next = cur_node;
         self.mem.update(&new_node)?;
+        let _ = self
+            .mem
+            .lookup(new_node.ptr())
+            .expect("Unable to read back");
 
         if let Some(prev_node) = prev_node {
             let mut prev_node = self.mem.lookup(prev_node)?;
             prev_node.next = Some(new_node.ptr());
             self.mem.update(&prev_node)?;
+            let _ = self
+                .mem
+                .lookup(prev_node.ptr())
+                .expect("Unable to read back");
         }
 
         Ok(CreateResult::Ok(new_node))
@@ -350,7 +397,9 @@ impl<S: TxWrite> Filesystem<S> {
             next: None,
         };
         self.mem.update(&self.volume)?;
-        Ok(self.mem.write(entry)?)
+        let handle = self.fnode_slots.allocate_and_write(&mut self.mem, entry)?;
+        let _ = self.mem.lookup(handle.ptr()).expect("Unable to read back");
+        Ok(handle)
     }
 
     /// Returns iterator over pointers to all [`DataBlock`]: direct, indirect and double indirect
@@ -521,10 +570,13 @@ impl<S: TxRead> Iterator for ReadDir<'_, S> {
     type Item = FileMeta;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let node = self.next.take()?;
-        let child = self.fs.mem.lookup(node).unwrap();
-        self.next = child.next;
-        Some(FileMeta::from(child, &self.fs.mem).unwrap())
+        if let Some(next) = self.next.take() {
+            let next_child = self.fs.mem.lookup(next).unwrap();
+            self.next = next_child.next;
+            Some(FileMeta::from(next_child, &self.fs.mem).unwrap())
+        } else {
+            None
+        }
     }
 
     // TODO implement `nth()` method so skip() can be implemented in efficient way
@@ -914,6 +966,15 @@ struct FNode {
     next: Option<Ptr<FNode>>,
 }
 
+impl FNode {
+    fn name(&self, mem: &Memory<impl TxRead>) -> Result<String> {
+        let bytes = mem.read_bytes(self.name.0)?;
+        String::from_utf8(bytes.to_vec())
+            .map_err(|e| e.utf8_error())
+            .map_err(Error::other)
+    }
+}
+
 /// The size of a data block containing file data in bytes
 ///
 /// It is analogous to the block size (cluster) of a file system. File size in the storage
@@ -964,48 +1025,7 @@ impl Iterator for DataBlockPtrIterator {
     }
 }
 
-/// This wrapper exists primarily to opt out of default implementation of `Record` trait
-/// for arrays. We want to have a custom implementation that will write the array directly as slice.
-struct DataBlock([u8; BLOCK_SIZE]);
-
-impl Record for DataBlock {
-    const SIZE: usize = BLOCK_SIZE;
-
-    fn read(data: &[u8]) -> std::result::Result<Self, memory::Error> {
-        assert!(data.len() == Self::SIZE);
-
-        let mut result = [0; Self::SIZE];
-        result.copy_from_slice(data);
-        Ok(Self(result))
-    }
-
-    fn write(&self, data: &mut [u8]) -> std::result::Result<(), memory::Error> {
-        assert!(data.len() == Self::SIZE);
-
-        data.copy_from_slice(&self.0);
-        Ok(())
-    }
-}
-
-impl Default for DataBlock {
-    fn default() -> Self {
-        DataBlock([0; BLOCK_SIZE])
-    }
-}
-
-impl Deref for DataBlock {
-    type Target = [u8; BLOCK_SIZE];
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl DerefMut for DataBlock {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
+type DataBlock = Blob<BLOCK_SIZE>;
 
 /// Pointers addressing blocks of file data.
 ///
@@ -1031,15 +1051,6 @@ struct BlockPointers {
     direct: [NullPtr<DataBlock>; DIRECT_BLOCKS],
     indirect: NullPtr<PointersBlock<DataBlock>>,
     double_indirect: NullPtr<PointersBlock<PointersBlock<DataBlock>>>,
-}
-
-impl FNode {
-    fn name(&self, mem: &Memory<impl TxRead>) -> Result<String> {
-        let bytes = mem.read_bytes(self.name.0)?;
-        String::from_utf8(bytes.to_vec())
-            .map_err(|e| e.utf8_error())
-            .map_err(Error::other)
-    }
 }
 
 #[derive(PartialEq, Clone, Debug, Copy, Record)]
@@ -1150,8 +1161,7 @@ mod tests {
     use rand::{rngs::SmallRng, RngCore, SeedableRng};
     use std::{cmp::max, collections::HashSet, fs};
 
-    // Maximum file size is 5184 bytes in test environment. So in order to trigger NoSpaceLeft
-    // we need to write 64Kib (1 page in Volume) / 5184 = 13 files.
+    // Maximum file size is 5184 bytes in test environment.
     const MAX_FILE_SIZE: usize = BLOCK_SIZE * LAST_DOUBLE_INDIRECT_BLOCK;
 
     macro_rules! assert_not_exists {
@@ -1417,17 +1427,17 @@ mod tests {
     fn detect_changes() -> Result<()> {
         let (mut fs_a, mut mem) = create_fs();
         mkdirs(&mut fs_a, &["/etc"]);
-        mem.commit(fs_a.finish()).unwrap();
+        mem.commit(fs_a.finish()?).unwrap();
         let tx_a = mem.start();
 
-        let mut fs_b = Filesystem::open(mem.start());
+        let mut fs_b = Filesystem::open(mem.start())?;
         fs_b.delete(&fs_b.get_root()?, "etc")?;
         mkdirs(&mut fs_b, &["/bin"]);
-        mem.commit(fs_b.finish()).unwrap();
+        mem.commit(fs_b.finish()?).unwrap();
         let tx_b = mem.start();
 
-        let fs_a = Filesystem::open(tx_a);
-        let fs_b = Filesystem::open(tx_b);
+        let fs_a = Filesystem::open(tx_a)?;
+        let fs_b = Filesystem::open(tx_b)?;
 
         let (added, deleted) = fs_changes(&fs_a, &fs_b);
 
@@ -1522,10 +1532,11 @@ mod tests {
     #[test]
     #[should_panic(expected = "NoSpaceLeft")]
     fn no_space_left() {
-        let (mut fs, _) = create_fs();
+        let (mut fs, _) = create_fs_with_size(PAGE_SIZE);
         let root = fs.get_root().unwrap();
 
         let pos = Some(SeekFrom::Start((MAX_FILE_SIZE - 1) as u64));
+        // In order to trigger NoSpaceLeft we need to write 64Kib (1 page in Volume) / MAX_FILE_SIZE (5184) = 13 files.
         for idx in 0..13 {
             let f = fs.create_file(&root, format!("swap{}", idx)).unwrap();
             write_file(&mut fs, &f, &[1], pos).unwrap();
@@ -1617,7 +1628,7 @@ mod tests {
 
     #[test]
     fn check_fs_reuses_freed_space() -> Result<()> {
-        let (mut fs, _) = create_fs_with_size(PAGE_SIZE);
+        let (mut fs, _) = create_fs_with_size(3 * PAGE_SIZE);
         let root = fs.get_root()?;
 
         // Calculate the number of times we need to write to fill the volume
@@ -1725,7 +1736,7 @@ mod tests {
     }
 
     fn create_fs() -> (Filesystem<Transaction>, Volume) {
-        let volume = Volume::new_in_memory(1);
+        let volume = Volume::new_in_memory(3);
         (Filesystem::allocate(volume.start()), volume)
     }
 

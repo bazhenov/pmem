@@ -26,8 +26,8 @@ async fn main() {
         let a = snapshot.clone();
         let b = next_snapshot.clone();
         spawn_blocking(move || {
-            let fs_a = Filesystem::open(a);
-            let fs_b = Filesystem::open(b);
+            let fs_a = Filesystem::open(a).unwrap();
+            let fs_b = Filesystem::open(b).unwrap();
             let changes = fs_b.changes_from(&fs_a);
             println!("{:?}", FsTree(&fs_a));
             for change in changes {

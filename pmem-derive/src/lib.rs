@@ -34,7 +34,7 @@ mod struct_record {
         // Generate the sum of the sizes of all fields
         let fields_size = data.fields.iter().map(|field| {
             let ty = &field.ty;
-            quote! { std::mem::size_of::<#ty>() }
+            quote! { <#ty>::SIZE }
         });
 
         let write_method = write_method(pmem, &data.fields);
@@ -128,7 +128,7 @@ mod enum_record {
 
         let expanded = quote! {
             impl #impl_generics #pmem::memory::Record for #enum_name #ty_generics #where_clause {
-                const SIZE: usize = std::mem::size_of::<#discriminant_ty>() + #pmem::memory::max([#(#variants_sizes),*]);
+                const SIZE: usize = <#discriminant_ty>::SIZE + #pmem::memory::max([#(#variants_sizes),*]);
 
                 fn read(input: &[u8]) -> std::result::Result<Self, #pmem::memory::Error> {
                     use #pmem::memory::Record;
@@ -243,7 +243,7 @@ mod enum_record {
             .iter()
             .map(|field| {
                 let ty = &field.ty;
-                quote! { std::mem::size_of::<#ty>() }
+                quote! { <#ty>::SIZE }
             })
             .collect::<Vec<_>>();
         if field_sizes.is_empty() {
