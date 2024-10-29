@@ -279,11 +279,6 @@ impl<S: TxWrite> Filesystem<S> {
             if new_child.next == Some(first_child) {
                 parent.children = Some(new_child.ptr());
                 self.mem.update(&parent)?;
-                if parent.ptr().unwrap_addr() == 65537 {
-                    println!("Ptr: {:?}", parent.ptr());
-                    println!("next: {:?}", parent.children);
-                }
-                let _ = self.mem.lookup(parent.ptr()).expect("Unable to read back");
             }
             new_child
         } else {
@@ -292,7 +287,6 @@ impl<S: TxWrite> Filesystem<S> {
                 .expect("Unable to create dir");
             parent.children = Some(dir_inode.ptr());
             self.mem.update(&parent)?;
-            let _ = self.mem.lookup(parent.ptr()).expect("Unable to read back");
             dir_inode
         };
 
@@ -352,7 +346,6 @@ impl<S: TxWrite> Filesystem<S> {
         let mut prev_node = None;
         let mut cur_node = Some(start_node);
         while let Some(node) = cur_node {
-            // println!("Lookup address: {:?} given by node: {:?}", node, prev_node);
             let node = self.mem.lookup(node).expect("Unable to read dir");
             let child_name = node.name(&self.mem)?;
             match child_name.as_str().cmp(name) {
@@ -368,19 +361,11 @@ impl<S: TxWrite> Filesystem<S> {
         let mut new_node = self.write_fsnode(name, node_type)?;
         new_node.next = cur_node;
         self.mem.update(&new_node)?;
-        let _ = self
-            .mem
-            .lookup(new_node.ptr())
-            .expect("Unable to read back");
 
         if let Some(prev_node) = prev_node {
             let mut prev_node = self.mem.lookup(prev_node)?;
             prev_node.next = Some(new_node.ptr());
             self.mem.update(&prev_node)?;
-            let _ = self
-                .mem
-                .lookup(prev_node.ptr())
-                .expect("Unable to read back");
         }
 
         Ok(CreateResult::Ok(new_node))

@@ -3,7 +3,6 @@ use pmem_derive::Record;
 use std::{
     any::{type_name, Any},
     array::TryFromSliceError,
-    backtrace::Backtrace,
     borrow::Cow,
     collections::HashMap,
     fmt::{self, Debug},
@@ -130,22 +129,10 @@ impl MemoryInfo {
     }
 }
 
-#[cfg(test)]
-impl Memory<crate::volume::Transaction> {
-    fn new() -> Self {
-        let volume = crate::volume::Volume::default();
-        Self::init(volume.start())
-    }
-}
-
 impl<S: TxRead> Memory<S> {
     pub fn open(tx: S) -> Self {
         let bytes = tx.read(START_ADDR, MemoryInfo::SIZE);
         let mem_info = MemoryInfo::read(&bytes).unwrap();
-        assert!(
-            mem_info.next_addr > 0,
-            "Invalid memory info block. Maybe you forgot to call Memory::init()?"
-        );
         Self {
             tx,
             mem_info,
@@ -162,29 +149,12 @@ impl<S: TxRead> Memory<S> {
             return Err(Error::NoSpaceLeft);
         }
         let page_no = self.mem_info.next_page;
-        println!("Allocating page: {}", page_no);
-        println!("- {}", Backtrace::capture());
         self.mem_info.next_page += count as u32;
         Ok(page_no)
     }
 
     pub fn lookup<T: Record>(&self, ptr: Ptr<T>) -> Result<Handle<T>> {
-        let buf = self.tx.read(ptr.addr, T::SIZE);
-        // let addr = ptr.addr;
-        // let addr_to_check = 65537;
-        // if addr <= addr_to_check && addr_to_check < addr + buf.len() as Addr {
-        //     println!(
-        //         "Reading {} from {}\n  bytes: {:?}",
-        //         type_name::<T>(),
-        //         addr,
-        //         buf
-        //     );
-        //     // print stacktrace
-        //     // let backtrace = Backtrace::capture();
-        //     // println!("{}", backtrace);
-        //     println!("{:?}", &buf);
-        // }
-        read_value(ptr, &buf)
+        read_value(ptr, &self.tx.read(ptr.addr, T::SIZE))
     }
 
     pub fn read_bytes(&self, ptr: SlicePtr<u8>) -> Result<Cow<[u8]>> {
@@ -235,10 +205,8 @@ fn read_value<T: Record>(ptr: Ptr<T>, bytes: &[u8]) -> Result<Handle<T>> {
 
 impl<S: TxWrite> Memory<S> {
     pub fn init(mut tx: S) -> Self {
-        let next_addr = START_ADDR + MemoryInfo::SIZE as Addr;
-
         let mem_info = MemoryInfo {
-            next_addr,
+            next_addr: 0,
             next_page: 1,
             free_list: None,
         };
@@ -298,7 +266,6 @@ impl<S: TxWrite> Memory<S> {
             // object doesn't fit in a page. Allocating a new page
             // TODO: we probably need to update last allocated object info, so that it can possibly be reused
             let new_page = self.allocate_pages(required_pages_cnt(size))?;
-            println!("Allocate page for alloc_addr(): = {}", new_page);
             new_page as Addr * PAGE_SIZE as Addr
         } else {
             addr
@@ -315,7 +282,6 @@ impl<S: TxWrite> Memory<S> {
             AllocatedBlock { size: size as u32 },
         )?;
 
-        println!("Alloc return = {}", addr + AllocatedBlock::SIZE as Addr);
         Ok(addr + AllocatedBlock::SIZE as Addr)
     }
 
@@ -369,20 +335,6 @@ impl<S: TxWrite> Memory<S> {
         } else {
             Ptr::from_addr(self.alloc_addr(size)?).expect("Alloc failed")
         };
-
-        let addr = 65537;
-        if ptr.addr <= addr && addr < ptr.addr + T::SIZE as Addr {
-            println!(
-                "Writing {} bytes to {} (type: {})",
-                T::SIZE,
-                ptr.addr,
-                type_name::<T>()
-            );
-            //     // print stacktrace
-            //     let backtrace = Backtrace::capture();
-            //     println!("  bytes: {}", backtrace);
-            // println!()
-        }
 
         value.write(&mut buffer)?;
         {
@@ -912,7 +864,6 @@ impl<T: Record> SlotMemory<T> {
 
     pub fn init(mem: &mut Memory<impl TxWrite>) -> Result<Self> {
         let page_no = mem.allocate_pages(1)?;
-        println!("SlotMemory::init, page_no = {}", page_no);
         let state = SlotMemoryState {
             free_slot: None,
             next_slot: Ptr::from_addr(PAGE_SIZE as Addr * page_no as Addr).unwrap(),
@@ -954,8 +905,6 @@ impl<T: Record> SlotMemory<T> {
                 self.state.next_slot = self.allocate_page(mem)?;
             }
             let addr = self.state.next_slot.addr;
-
-            // println!("Next addr: {}", addr);
 
             let handle = Handle {
                 addr: self.state.next_slot.addr,
@@ -1014,7 +963,6 @@ impl<T: Record> SlotMemory<T> {
         );
         let page_no = mem.allocate_pages(1)?;
         let page_addr = page_no as Addr * PAGE_SIZE as Addr;
-        println!("Allocated page for slots: {}", page_addr);
         Ok(Ptr::from_addr(page_addr).unwrap())
     }
 
@@ -1134,7 +1082,7 @@ mod tests {
     }
 
     #[test]
-    fn check_memory_shoud_return_error_on_type_conflict() {
+    fn check_memory_should_return_error_on_type_conflict() {
         let vol = Volume::default();
         let mut layout = Memory::init(vol.start());
 
@@ -1173,7 +1121,7 @@ mod tests {
 
     #[test]
     fn memory_can_reuse_memory() -> Result<()> {
-        let volume = Volume::with_capacity(PAGE_SIZE);
+        let volume = Volume::with_capacity(2 * PAGE_SIZE);
         let mut mem = Memory::init(volume.start());
         let mut rng = SmallRng::from_entropy();
 
@@ -1406,7 +1354,7 @@ mod tests {
             }
 
             #[test]
-            fn slot_will_not_be_removed_untill_free((items, target_idx) in any_items_and_target()) {
+            fn slot_will_not_be_removed_until_free((items, target_idx) in any_items_and_target()) {
                 let (mut tx, mut slots) = create_slot_memory();
 
                 let target = items[target_idx];
@@ -1432,6 +1380,13 @@ mod tests {
                 let allocations = (1u64..=size as u64).collect::<Vec<_>>();
                 (Just(allocations), 0..size)
             })
+        }
+    }
+
+    impl Memory<crate::volume::Transaction> {
+        fn new() -> Self {
+            let volume = crate::volume::Volume::default();
+            Self::init(volume.start())
         }
     }
 }

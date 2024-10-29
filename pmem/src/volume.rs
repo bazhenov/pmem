@@ -60,7 +60,6 @@
 use crate::driver::{NoDriver, PageDriver};
 use arc_swap::ArcSwap;
 use std::{
-    backtrace::{self, Backtrace},
     borrow::Cow,
     collections::{BTreeMap, HashSet},
     fmt::{self, Display, Formatter},
@@ -680,7 +679,7 @@ fn assert_patches_consistent(changes: &[Patch], undo: &[Patch]) {
 #[cfg(test)]
 impl Default for Volume {
     fn default() -> Self {
-        Self::new_in_memory(1)
+        Self::new_in_memory(10)
     }
 }
 
@@ -1201,17 +1200,6 @@ impl TxWrite for Transaction {
     fn write(&mut self, addr: Addr, bytes: impl Into<Vec<u8>>) {
         let bytes = bytes.into();
 
-        let start = 65537;
-        let end = start + 143;
-        if !(end <= addr || addr + bytes.len() as Addr <= start) {
-            println!("Writing to tx {} bytes to {}", bytes.len(), addr);
-            // // print stacktrace
-            // let backtrace = Backtrace::capture();
-            // println!("{}", backtrace);
-            // println!("bytes: {:?}", &bytes);
-            // println!()
-        }
-
         split_ptr_checked(addr, bytes.len(), self.base.pages_count);
 
         if !bytes.is_empty() {
@@ -1698,7 +1686,9 @@ mod tests {
     #[should_panic(expected = "Address range is out of bounds")]
     fn must_panic_on_oob_read() {
         // reading in a such a way that start address is still valid, but end address is not
-        Volume::default().start().read(PAGE_SIZE as Addr - 10, 20);
+        Volume::default()
+            .start()
+            .read(100 * PAGE_SIZE as Addr - 10, 20);
     }
 
     #[test]
@@ -1706,7 +1696,7 @@ mod tests {
     fn must_panic_on_oob_write() {
         Volume::default()
             .start()
-            .write(PAGE_SIZE as Addr - 10, [0; 20]);
+            .write(100 * PAGE_SIZE as Addr - 10, [0; 20]);
     }
 
     #[test]
@@ -1714,7 +1704,7 @@ mod tests {
     fn must_panic_on_oob_reclaim() {
         Volume::default()
             .start()
-            .reclaim(PAGE_SIZE as Addr - 10, 20);
+            .reclaim(100 * PAGE_SIZE as Addr - 10, 20);
     }
 
     /// When dropping transaction with a long commit log stackoverflow may happened if removed recursively.
