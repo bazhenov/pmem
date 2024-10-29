@@ -130,13 +130,17 @@ impl NFSFileSystem for RFS {
         Ok(new_file.fid)
     }
 
-    #[instrument(skip(self), err(Debug, level = "warn"))]
     async fn lookup(&self, dirid: fileid3, filename: &filename3) -> Result<fileid3, nfsstat3> {
         let fs = self.state.lock().await;
         let filename = to_string(filename);
         let dir = fs.lookup_by_id(dirid).map_err(io_to_nfs_error)?;
-        let result = fs.lookup(&dir, filename).map_err(io_to_nfs_error)?;
-        Ok(result.fid)
+        let file = fs.lookup(&dir, &filename);
+        if let Err(io_err) = &file {
+            if io_err.kind() != io::ErrorKind::NotFound {
+                warn!(error = ?io_err, dirid = dirid, filename = filename)
+            }
+        }
+        Ok(file.map_err(io_to_nfs_error)?.fid)
     }
 
     #[instrument(skip(self), err(Debug, level = "warn"))]
