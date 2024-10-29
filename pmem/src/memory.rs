@@ -356,8 +356,9 @@ impl<S: TxWrite> Memory<S> {
         Ok(())
     }
 
-    pub fn reclaim<T>(&mut self, ptr: Ptr<T>) -> Result<()> {
-        self.reclaim_addr(ptr.addr)
+    #[allow(private_bounds)]
+    pub fn reclaim(&mut self, ptr: impl AsAddr) -> Result<()> {
+        self.reclaim_addr(ptr.addr())
     }
 
     pub fn reclaim_addr(&mut self, addr: Addr) -> Result<()> {
@@ -511,6 +512,22 @@ impl<T> Debug for Ptr<T> {
 impl<T> PartialEq for Ptr<T> {
     fn eq(&self, other: &Self) -> bool {
         self.addr == other.addr
+    }
+}
+
+trait AsAddr {
+    fn addr(&self) -> Addr;
+}
+
+impl<T> AsAddr for Ptr<T> {
+    fn addr(&self) -> Addr {
+        self.addr
+    }
+}
+
+impl<T> AsAddr for SlicePtr<T> {
+    fn addr(&self) -> Addr {
+        self.0.addr
     }
 }
 

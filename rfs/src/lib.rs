@@ -222,6 +222,7 @@ impl<S: TxWrite> Filesystem<S> {
             self.mem.reclaim(double_indirect_ptr)?;
         }
 
+        self.mem.reclaim(file.node.name.0)?;
         self.fnode_slots.free(&mut self.mem, file.node)?;
 
         if let Some(mut referent) = file.referent {
@@ -1638,6 +1639,25 @@ mod tests {
             content2.as_bytes(),
             "file2.txt content is incorrect"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn check_fs_reuses_space_from_fnodes() -> Result<()> {
+        let (mut fs, _) = create_fs_with_size(3 * PAGE_SIZE);
+        let root = fs.get_root()?;
+
+        let very_long_name = "a".repeat(128);
+
+        // If some space from file nodes is not reused, this test will fail
+        for _ in 0..10000 {
+            fs.create_file(&root, &very_long_name)?;
+            fs.delete(&root, &very_long_name)?;
+
+            fs.create_dir(&root, &very_long_name)?;
+            fs.delete(&root, &very_long_name)?;
+        }
 
         Ok(())
     }
