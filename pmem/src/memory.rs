@@ -1358,6 +1358,7 @@ mod tests {
 
     mod proptests {
         use super::*;
+        use prop::collection::vec;
         use proptest::prelude::*;
 
         proptest! {
@@ -1404,6 +1405,55 @@ mod tests {
                 let target_slot = slots.read(&tx, target_slot.ptr())?;
                 prop_assert_eq!(target_slot.as_deref(), Some(&target));
             }
+
+            #[test]
+            fn memory_allocate_free(ops in vec(any_allocate_or_free(), 255)) {
+                let volume = Volume::with_capacity(PAGE_SIZE * 10);
+                let mut mem = Memory::init(volume.start());
+                let mut allocations = vec![];
+
+                for (id, op) in ops.into_iter().enumerate() {
+                    let id = (id % 256) as u8;
+                    match op {
+                        AllocateOrFree::Allocate(size) => {
+                            let addr = mem.alloc_addr(size)?;
+                            allocations.push((id, addr, size));
+                            TxWrite::write(&mut mem, addr, vec![id; size]);
+                        }
+                        AllocateOrFree::Free(idx) => {
+                            if !allocations.is_empty() {
+                                let (id, addr, size) = allocations.remove(idx % allocations.len());
+                                let data = TxRead::read(&mem, addr, size);
+                                let expected = vec![id; size];
+                                prop_assert_eq!(data, expected);
+                            }
+                        }
+                    }
+                }
+
+                // Checking that all leftover alocations are still there and have correct data
+                for (id, addr, size) in allocations {
+                    let data = TxRead::read(&mem, addr, size);
+                    let expected = vec![id; size];
+                    prop_assert_eq!(data, expected);
+                }
+            }
+        }
+
+        fn any_allocate_or_free() -> impl Strategy<Value = AllocateOrFree> {
+            prop_oneof![
+                (1usize..15).prop_map(AllocateOrFree::Allocate),
+                // The concrete index is not important, because it will be taken modulo items.len()
+                (0usize..100).prop_map(AllocateOrFree::Free)
+            ]
+        }
+
+        #[derive(Debug, Clone, Copy)]
+        enum AllocateOrFree {
+            /// The size of bytes
+            Allocate(usize),
+            /// the index of the element to free (% items.len())
+            Free(usize),
         }
 
         /// Returns a vectors of random ites to allocate and random index of one (target) element
@@ -1415,9 +1465,9 @@ mod tests {
         }
     }
 
-    impl Memory<crate::volume::Transaction> {
+    impl Memory<Transaction> {
         fn new() -> Self {
-            let volume = crate::volume::Volume::default();
+            let volume = Volume::default();
             Self::init(volume.start())
         }
     }
