@@ -149,6 +149,11 @@ impl<S: TxRead> Memory<S> {
             return Err(Error::NoSpaceLeft);
         }
         let page_no = self.mem_info.next_page;
+        tracing::trace!(
+            "Allocating {} pages at addr: {}",
+            count,
+            page_no * PAGE_SIZE as PageNo
+        );
         self.mem_info.next_page += count as u32;
         Ok(page_no)
     }
@@ -316,11 +321,11 @@ impl<S: TxWrite> Memory<S> {
 
         buffer[SLICE_HEADER_SIZE..].copy_from_slice(bytes);
 
-        {
-            let this = &mut *self;
-            let addr = ptr.0.addr;
-            this.tx.write(addr, buffer)
-        };
+        let addr = ptr.0.addr;
+        let len = buffer.len();
+        self.tx.write(addr, buffer);
+        trace_debug_memory_written::<&[u8]>(addr, len);
+
         Ok(ptr)
     }
 
@@ -342,6 +347,7 @@ impl<S: TxWrite> Memory<S> {
             let addr = ptr.addr;
             this.tx.write(addr, buffer)
         };
+        trace_debug_memory_written::<T>(ptr.addr, size);
         Ok(ptr)
     }
 
@@ -410,6 +416,15 @@ impl<S: TxWrite> Memory<S> {
         mem_info.update(&mut tx);
         Ok(tx)
     }
+}
+
+fn trace_debug_memory_written<T>(addr: Addr, size: usize) {
+    tracing::trace!(
+        "Writing to addr: {:8} - {:8} type: {}",
+        addr,
+        addr + size as Addr,
+        type_name::<T>(),
+    );
 }
 
 /// The number of pages required to fit an object of a given size

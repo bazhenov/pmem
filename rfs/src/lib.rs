@@ -1,8 +1,5 @@
 use pmem::{
-    memory::{
-        AllocatedBlock, Blob, MemoryInfo, SlicePtr, SlotMemory, SlotMemoryState, TxReadExt,
-        TxWriteExt, NULL_PTR_SIZE,
-    },
+    memory::{Blob, SlicePtr, SlotMemory, SlotMemoryState, TxReadExt, TxWriteExt, NULL_PTR_SIZE},
     volume::{Addr, TxRead, TxWrite},
     Handle, Memory, Ptr, Record,
 };
@@ -23,6 +20,7 @@ type CreateResult = std::result::Result<Handle<FNode>, Handle<FNode>>;
 
 pub mod nfs;
 
+const VOLUME_INFO_ADDR: Addr = 0x50;
 const SLOTS_ADDR: Addr = 0x100;
 
 pub struct Filesystem<S> {
@@ -38,10 +36,7 @@ pub struct VolumeInfo {
 
 impl<S: TxRead> Filesystem<S> {
     pub fn open(snapshot: S) -> Result<Self> {
-        let addr = 8 + (MemoryInfo::SIZE + AllocatedBlock::SIZE) as Addr;
-        let volume = snapshot
-            .lookup(Ptr::<VolumeInfo>::from_addr(addr).unwrap())
-            .unwrap();
+        let volume = snapshot.lookup(Ptr::<VolumeInfo>::from_addr(VOLUME_INFO_ADDR).unwrap())?;
         let slot_state =
             snapshot.lookup(Ptr::<SlotMemoryState<_>>::from_addr(SLOTS_ADDR).unwrap())?;
         let mem = Memory::open(snapshot);
@@ -174,8 +169,7 @@ impl<S: TxRead> Filesystem<S> {
 impl<S: TxWrite> Filesystem<S> {
     pub fn allocate(snapshot: S) -> Self {
         let mut mem = Memory::init(snapshot);
-        let fnode_slots = SlotMemory::init(&mut mem).unwrap();
-        let super_block_ptr = mem.alloc::<VolumeInfo>().unwrap();
+        let mut fnode_slots = SlotMemory::init(&mut mem).unwrap();
         let name = mem.write_bytes("/".as_bytes()).unwrap();
         let root_entry = FNode {
             name: Str(name),
@@ -185,7 +179,12 @@ impl<S: TxWrite> Filesystem<S> {
             content: BlockPointers::default(),
             next: None,
         };
-        let root = mem.write(root_entry).unwrap().ptr();
+        let root = fnode_slots
+            .allocate_and_write(&mut mem, root_entry)
+            .unwrap()
+            .ptr();
+        // let root = mem.write(root_entry).unwrap().ptr();
+        let super_block_ptr = Ptr::<VolumeInfo>::from_addr(VOLUME_INFO_ADDR).unwrap();
         let volume = mem.write_at(super_block_ptr, VolumeInfo { root }).unwrap();
         Self {
             volume,
@@ -383,7 +382,6 @@ impl<S: TxWrite> Filesystem<S> {
         };
         self.mem.update(&self.volume)?;
         let handle = self.fnode_slots.allocate_and_write(&mut self.mem, entry)?;
-        let _ = self.mem.lookup(handle.ptr()).expect("Unable to read back");
         Ok(handle)
     }
 
