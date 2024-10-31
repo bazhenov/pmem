@@ -73,9 +73,11 @@ impl<S: TxRead> Filesystem<S> {
 
     /// Returns the file/directory with a given inode ([FileMeta::fid])
     pub fn lookup_by_id(&self, id: u64) -> Result<FileMeta> {
-        assert!(id <= u32::MAX as u64);
         let ptr = Ptr::<FNode>::from_addr(id as Addr).ok_or(ErrorKind::NotFound)?;
-        let handle = self.mem.lookup(ptr)?;
+        let handle = self
+            .fnode_slots
+            .read(&self.mem, ptr)?
+            .ok_or(ErrorKind::NotFound)?;
         FileMeta::from(handle, &self.mem)
     }
 
@@ -117,9 +119,7 @@ impl<S: TxRead> Filesystem<S> {
     }
 
     fn lookup_inode(&self, meta: &FileMeta) -> Result<Handle<FNode>> {
-        assert!(meta.fid <= u32::MAX as u64);
-
-        let ptr = Ptr::from_addr(meta.fid as Addr).ok_or(ErrorKind::NotFound)?;
+        let ptr = Ptr::from_addr(meta.fid as Addr).ok_or(ErrorKind::InvalidInput)?;
         self.mem.lookup(ptr).map_err(|e| e.into())
     }
 
@@ -952,7 +952,7 @@ struct FNode {
 
 impl FNode {
     fn name(&self, mem: &Memory<impl TxRead>) -> Result<String> {
-        let bytes = mem.read_bytes(self.name.0)?;
+        let bytes = mem.read_bytes(self.name.0).unwrap();
         String::from_utf8(bytes.to_vec())
             .map_err(|e| e.utf8_error())
             .map_err(Error::other)
@@ -1381,6 +1381,38 @@ mod tests {
         assert!(children[2] == swap);
 
         Ok(())
+    }
+
+    #[test]
+    fn read_removed_directory() -> Result<()> {
+        let (mut fs, _) = create_fs();
+        let root = fs.get_root()?;
+
+        let etc = fs.create_dir(&root, "etc")?;
+        fs.delete(&root, "etc")?;
+
+        let removed_etc = fs.lookup_by_id(etc.fid);
+        match removed_etc {
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+            Err(e) => panic!("Expected NotFound error: found {}", e),
+            _ => panic!("Expected NotFound error"),
+        }
+    }
+
+    #[test]
+    fn removing_removed_directory() -> Result<()> {
+        let (mut fs, _) = create_fs();
+        let root = fs.get_root()?;
+
+        fs.create_dir(&root, "etc")?;
+        fs.delete(&root, "etc")?;
+
+        let removed_etc = fs.delete(&root, "etc");
+        match removed_etc {
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+            Err(e) => panic!("Expected NotFound error: found {}", e),
+            _ => panic!("Expected NotFound error"),
+        }
     }
 
     #[test]
