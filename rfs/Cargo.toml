@@ -11,8 +11,8 @@ thiserror = { workspace = true }
 replication = { workspace = true }
 tokio = { version = "1.38.1", features = ["macros", "rt-multi-thread"] }
 nfsserve = "0.10.2"
-tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
-tracing = "0.1.40"
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
 [dev-dependencies]
 proptest = { workspace = true }

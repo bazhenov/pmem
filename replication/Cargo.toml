@@ -15,4 +15,4 @@ tokio = { workspace = true, features = [
 tracing = { workspace = true }
 
 [dev-dependencies]
-tracing-subscriber = { workspace = true, features = ["env-filter"] }
+test-utils.workspace = true

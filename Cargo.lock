@@ -633,6 +633,7 @@ dependencies = [
  "rand",
  "tango-bench",
  "tempfile",
+ "test-utils",
  "thiserror",
  "tracing",
 ]
@@ -803,9 +804,9 @@ name = "replication"
 version = "0.1.0"
 dependencies = [
  "pmem",
+ "test-utils",
  "tokio",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -981,6 +982,14 @@ dependencies = [
  "fastrand",
  "rustix",
  "windows-sys",
+]
+
+[[package]]
+name = "test-utils"
+version = "0.1.0"
+dependencies = [
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

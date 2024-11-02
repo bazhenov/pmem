@@ -1,12 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["pmem", "pmem-derive", "replication", "rfs"]
+members = ["pmem", "pmem-derive", "replication", "rfs", "test-utils"]
 
 [workspace.dependencies]
 pmem-derive = { path = "pmem-derive" }
 pmem = { path = "pmem" }
 rfs = { path = "rfs" }
 replication = { path = "replication" }
+test-utils = { path = "test-utils" }
 
 thiserror = "1.0.61"
 proptest = "1.0.0"

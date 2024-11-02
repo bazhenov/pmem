@@ -1431,7 +1431,7 @@ mod tests {
                     }
                 }
 
-                // Checking that all leftover alocations are still there and have correct data
+                // Checking that all leftover allocations are still there and have correct data
                 for (id, addr, size) in allocations {
                     let data = TxRead::read(&mem, addr, size);
                     let expected = vec![id; size];
