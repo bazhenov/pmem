@@ -16,6 +16,9 @@ pub const PTR_SIZE: usize = Ptr::<u8>::SIZE;
 pub const NULL_PTR_SIZE: usize = Option::<Ptr<u8>>::SIZE;
 const START_ADDR: Addr = 8;
 
+/// Minimum allocation size for the [`Memory::alloc`] method
+const MIN_ALLOC_SIZE: usize = 16;
+
 /// The size of a header of each entity written to storage
 const SLICE_HEADER_SIZE: usize = mem::size_of::<u32>();
 
@@ -113,6 +116,9 @@ pub struct AllocatedBlock {
 }
 
 /// Header of a block of memory that was freed using [`Memory::reclaim()`] call.
+///
+/// [FreeBlock] and [AllocatedBlock] should have the same prefix with the size
+/// of an allocated block.
 #[derive(Record)]
 struct FreeBlock {
     // Size of of the memory block excluding the [`AllocatedBlock`] header
@@ -257,20 +263,22 @@ impl<S: TxWrite> Memory<S> {
         }
 
         // Creating new allocation
-        let size = size + AllocatedBlock::SIZE;
+        let block_size = (size + AllocatedBlock::SIZE)
+            .max(FreeBlock::SIZE)
+            .max(MIN_ALLOC_SIZE);
         let addr = self.mem_info.next_addr;
-        if !self.tx.valid_range(addr, size) {
+        if !self.tx.valid_range(addr, block_size) {
             return Err(Error::NoSpaceLeft);
         }
         let (start_page, _) = split_ptr(addr);
-        let (end_page, end_page_offset) = split_ptr(addr + size as Addr - 1);
+        let (end_page, end_page_offset) = split_ptr(addr + block_size as Addr - 1);
 
-        assert!(size <= PAGE_SIZE, "Object size is too big");
+        assert!(block_size <= PAGE_SIZE, "Object size is too big");
 
         let addr = if addr == 0 || start_page != end_page {
             // object doesn't fit in a page. Allocating a new page
             // TODO: we probably need to update last allocated object info, so that it can possibly be reused
-            let new_page = self.allocate_pages(required_pages_cnt(size))?;
+            let new_page = self.allocate_pages(required_pages_cnt(block_size))?;
             new_page as Addr * PAGE_SIZE as Addr
         } else {
             addr
@@ -279,7 +287,7 @@ impl<S: TxWrite> Memory<S> {
             // we're on the end of the page, zeroing next_addr, so a new page will be allocated next time
             0
         } else {
-            addr + size as Addr
+            addr + block_size as Addr
         };
 
         self.write_at(
@@ -1179,6 +1187,55 @@ mod tests {
             let ptr = mem.alloc_addr(size)?;
             mem.reclaim_addr(ptr)?;
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn check_memory_will_not_be_rewritten_when_reuse() -> Result<()> {
+        let volume = Volume::with_capacity(PAGE_SIZE * 3);
+        let mut mem = Memory::init(volume.start());
+
+        let a = mem.write(1u32)?;
+        let b = mem.write(42u32)?;
+
+        let a_addr = a.ptr().addr();
+        // Two allocations must be adjacent in memory. Otherwise test is invalid.
+        assert_eq!(a_addr + MIN_ALLOC_SIZE as Addr, b.ptr().addr());
+
+        mem.reclaim(a.ptr())?;
+        let a = mem.write(3u32)?;
+
+        // Realocating memory for the same type should return the same address.
+        assert_eq!(a.ptr().addr(), a_addr);
+
+        // b should not be overwritten.
+        let b = mem.read(b.ptr())?;
+        assert_eq!(b, 42);
+
+        Ok(())
+    }
+
+    #[test]
+    fn check_memory_will_not_be_rewritten_when_reuse_with_larger_size() -> Result<()> {
+        let volume = Volume::with_capacity(PAGE_SIZE * 3);
+        let mut mem = Memory::init(volume.start());
+
+        let a = mem.write(1u32)?;
+        let b = mem.write(42u32)?;
+
+        let a_addr = a.ptr().addr();
+        // Two allocations must be adjacent in memory. Otherwise test is invalid.
+        assert_eq!(a_addr + MIN_ALLOC_SIZE as Addr, b.ptr().addr());
+
+        mem.reclaim(a.ptr())?;
+
+        // Writing twice as large value. It should not overwrite b.
+        let a = mem.write(3u64)?;
+        assert_ne!(a.ptr().addr(), a_addr);
+
+        let b = mem.read(b.ptr())?;
+        assert_eq!(b, 42);
 
         Ok(())
     }
