@@ -1,5 +1,5 @@
 use pmem::{
-    memory::{Blob, SlicePtr, SlotMemory, SlotMemoryState, TxReadExt, TxWriteExt, NULL_PTR_SIZE},
+    memory::{Blob, SlicePtr, Slots, SlotsState, TxReadExt, TxWriteExt, NULL_PTR_SIZE},
     volume::{Addr, TxRead, TxWrite},
     Handle, Memory, Ptr, Record,
 };
@@ -25,7 +25,7 @@ const SLOTS_ADDR: Addr = 0x100;
 
 pub struct Filesystem<S> {
     volume: Handle<VolumeInfo>,
-    fnode_slots: SlotMemory<FNode>,
+    fnode_slots: Slots<FNode>,
     mem: Memory<S>,
 }
 
@@ -37,10 +37,9 @@ pub struct VolumeInfo {
 impl<S: TxRead> Filesystem<S> {
     pub fn open(snapshot: S) -> Result<Self> {
         let volume = snapshot.lookup(Ptr::<VolumeInfo>::from_addr(VOLUME_INFO_ADDR).unwrap())?;
-        let slot_state =
-            snapshot.lookup(Ptr::<SlotMemoryState<_>>::from_addr(SLOTS_ADDR).unwrap())?;
+        let slot_state = snapshot.lookup(Ptr::<SlotsState<_>>::from_addr(SLOTS_ADDR).unwrap())?;
         let mem = Memory::open(snapshot);
-        let fnode_slots = SlotMemory::open(slot_state.into_inner());
+        let fnode_slots = Slots::open(slot_state.into_inner());
         Ok(Self {
             volume,
             mem,
@@ -169,7 +168,7 @@ impl<S: TxRead> Filesystem<S> {
 impl<S: TxWrite> Filesystem<S> {
     pub fn allocate(snapshot: S) -> Self {
         let mut mem = Memory::init(snapshot);
-        let mut fnode_slots = SlotMemory::init(&mut mem).unwrap();
+        let mut fnode_slots = Slots::init(&mut mem).unwrap();
         let name = mem.write_bytes("/".as_bytes()).unwrap();
         let root_entry = FNode {
             name: Str(name),

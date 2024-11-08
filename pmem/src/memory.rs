@@ -835,7 +835,7 @@ impl<const N: usize> DerefMut for Blob<N> {
 }
 
 #[derive(Record)]
-pub struct SlotMemoryState<T: Record> {
+pub struct SlotsState<T: Record> {
     /// Index of the next available slot for allocation.
     ///
     /// This value represents the highest slot number that has been allocated + 1.
@@ -868,8 +868,8 @@ impl<T> Clone for Claim<T> {
 /// - Slots can be reused after deallocation, improving memory efficiency.
 /// - Each slot is assigned a stable identifier (claim) that remains valid for the lifetime of the allocation.
 /// - Slot occupancy is tracked, preventing use-after-free errors by returning None for deallocated slots.
-pub struct SlotMemory<T: Record> {
-    state: SlotMemoryState<T>,
+pub struct Slots<T: Record> {
+    state: SlotsState<T>,
     _phantom: PhantomData<T>,
 }
 
@@ -891,11 +891,11 @@ impl<T: Record> Slot<T> {
 }
 
 // TODO SlotMemory should contains its address like PageAllocator
-impl<T: Record> SlotMemory<T> {
+impl<T: Record> Slots<T> {
     const SLOT_SIZE: usize = Slot::<T>::SIZE;
     const VALUE_OFFSET: usize = 1;
 
-    pub fn open(state: SlotMemoryState<T>) -> Self {
+    pub fn open(state: SlotsState<T>) -> Self {
         Self {
             state,
             _phantom: PhantomData,
@@ -904,7 +904,7 @@ impl<T: Record> SlotMemory<T> {
 
     pub fn init(mem: &mut Memory<impl TxWrite>) -> Result<Self> {
         let page_no = mem.allocate_pages(1)?;
-        let state = SlotMemoryState {
+        let state = SlotsState {
             free_slot: None,
             next_slot: Ptr::from_addr(PAGE_SIZE as Addr * page_no as Addr).unwrap(),
         };
@@ -1006,7 +1006,7 @@ impl<T: Record> SlotMemory<T> {
         Ok(Ptr::from_addr(page_addr).unwrap())
     }
 
-    pub fn finish(self) -> SlotMemoryState<T> {
+    pub fn finish(self) -> SlotsState<T> {
         self.state
     }
 }
@@ -1377,7 +1377,7 @@ mod tests {
 
         let handle = slots.allocate_and_write(&mut tx, 42)?;
 
-        let slots = SlotMemory::<u64>::open(slots.finish());
+        let slots = Slots::<u64>::open(slots.finish());
         let value = slots.read(&tx, handle.ptr())?.unwrap();
         assert_eq!(*value, 42);
         Ok(())
@@ -1404,11 +1404,11 @@ mod tests {
         Ok(())
     }
 
-    fn create_slot_memory<T: Record>() -> (Memory<Transaction>, SlotMemory<T>) {
+    fn create_slot_memory<T: Record>() -> (Memory<Transaction>, Slots<T>) {
         let volume = Volume::new_in_memory(10);
         let tx = volume.start();
         let mut mem = Memory::init(tx);
-        let slots = SlotMemory::init(&mut mem).unwrap();
+        let slots = Slots::init(&mut mem).unwrap();
 
         (mem, slots)
     }
