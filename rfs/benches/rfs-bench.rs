@@ -1,5 +1,5 @@
 use pmem::volume::{TxWrite, Volume};
-use rand::{rngs::SmallRng, seq::SliceRandom, Rng, SeedableRng};
+use rand::{rngs::SmallRng, Rng, SeedableRng};
 use rfs::{FileMeta, Filesystem};
 use std::io::{Read, Seek, SeekFrom, Write};
 use tango_bench::{
@@ -111,36 +111,16 @@ fn navigate_directories(b: Bencher) -> Box<dyn ErasedSampler> {
     let mut rnd = SmallRng::seed_from_u64(b.seed);
     let mut fs = create_fs();
 
-    let tree_height = 5;
-    let child_names = [
-        "dir1", "dir2", "dir3", "dir4", "dir5", "dir6", "dir7", "dir8", "dir9", "dir10",
-    ];
-
     let root = fs.get_root().unwrap();
-    create_deep_tree(&mut fs, &root, tree_height, &child_names);
+    const DIRECTORIES: usize = 100;
+    for idx in 0..DIRECTORIES {
+        fs.create_dir(&root, format!("dir{}", idx)).unwrap();
+    }
 
     b.iter(move || {
-        let mut dir = fs.get_root().unwrap();
-        for _ in 0..tree_height {
-            let name = child_names.choose(&mut rnd).unwrap();
-            dir = fs.lookup(&dir, name).unwrap();
-        }
+        let name = format!("dir{}", rnd.gen_range(0..DIRECTORIES));
+        fs.lookup(&root, name).unwrap()
     })
-}
-
-fn create_deep_tree(
-    fs: &mut Filesystem<impl TxWrite>,
-    parent: &FileMeta,
-    level: u64,
-    names: &[&str],
-) {
-    if level == 0 {
-        return;
-    }
-    for name in names {
-        let dir = fs.create_dir(parent, name).unwrap();
-        create_deep_tree(fs, &dir, level - 1, names);
-    }
 }
 
 fn create_fs() -> Filesystem<impl TxWrite> {
