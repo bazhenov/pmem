@@ -33,6 +33,13 @@ pub struct RfsState {
     fs: Filesystem<Transaction>,
 }
 
+/// Safety hazard: Rc<RefCell<_>> in Filesystem prevents us from using Filesystem instances in async runtime
+/// This is temporary solution and should be replaced with some kind of synchronization mechanis. This is only works
+/// until following invariants holds:
+/// - there is no concurrent usages of a [`Filesystem`] (which is guarateed by Mutex in [`RFS`])
+/// - inside [`Rc`] there is no thread local state.
+unsafe impl Send for RfsState {}
+
 impl RfsState {
     pub async fn commit(&mut self, volume: &mut Volume) {
         let mut sw_fs = Filesystem::open(volume.start()).unwrap();
@@ -85,9 +92,9 @@ impl NFSFileSystem for RFS {
         VFSCapabilities::ReadWrite
     }
 
-    #[instrument( skip(self, data), fields(data.len = data.len()), err(Debug, level = "warn"))]
+    #[instrument(skip(self, data), fields(data.len = data.len()), err(Debug, level = "warn"))]
     async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
-        let mut fs = self.state.lock().await;
+        let fs = self.state.lock().await;
 
         let meta = fs.lookup_by_id(id).map_err(io_to_nfs_error)?;
         let mut file = fs.open_file(&meta).map_err(io_to_nfs_error)?;
@@ -165,7 +172,7 @@ impl NFSFileSystem for RFS {
         offset: u64,
         count: u32,
     ) -> Result<(Vec<u8>, bool), nfsstat3> {
-        let mut fs = self.state.lock().await;
+        let fs = self.state.lock().await;
 
         let entry = fs.lookup_by_id(id).map_err(io_to_nfs_error)?;
         if entry.node_type != NodeType::File {
