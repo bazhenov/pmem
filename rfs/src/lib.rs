@@ -20,6 +20,7 @@ type Result<T> = std::io::Result<T>;
 type CreateResult = std::result::Result<Handle<FNode>, Handle<FNode>>;
 
 pub mod nfs;
+pub mod sync;
 
 const VOLUME_INFO_ADDR: Addr = 0x50;
 const SLOTS_ADDR: Addr = 0x100;
@@ -71,7 +72,6 @@ impl<S: TxRead> Filesystem<S> {
             .children
             .ok_or(ErrorKind::NotFound)?;
         let child = Self::find_child(&mem, children, name.as_ref())?;
-        let mem = self.mem.borrow();
         FileMeta::from(child.node, &mem)
     }
 
@@ -131,7 +131,7 @@ impl<S: TxRead> Filesystem<S> {
     fn do_lookup_file(&self, mem: &Memory<S>, path: impl AsRef<str>) -> Result<Handle<FNode>> {
         let path = PathBuf::from(path.as_ref());
         let components = components(&path)?;
-        let mut cur_node = self.get_root_handle(&mem);
+        let mut cur_node = self.get_root_handle(mem);
         for component in components {
             let Component::Normal(name) = component else {
                 return Err(ErrorKind::InvalidInput.into());
@@ -139,7 +139,7 @@ impl<S: TxRead> Filesystem<S> {
             let name = name.to_str().unwrap();
 
             let children = cur_node.children.ok_or(ErrorKind::NotFound)?;
-            let child = Self::find_child(&mem, children, name)?;
+            let child = Self::find_child(mem, children, name)?;
             cur_node = child.node;
         }
         Ok(cur_node)
@@ -303,7 +303,7 @@ impl<S: TxWrite> Filesystem<S> {
     /// Creates a directory and all its parents
     pub fn create_dirs(&mut self, name: impl AsRef<str>) -> Result<FileMeta> {
         let path = PathBuf::from(name.as_ref());
-        let mut node = self.get_root_handle(&self.mem.borrow_mut());
+        let mut node = self.get_root_handle(&self.mem.borrow());
         for component in components(&path)? {
             let Component::Normal(name) = component else {
                 return Err(ErrorKind::InvalidInput.into());
@@ -395,7 +395,6 @@ impl<S: TxWrite> Filesystem<S> {
             next: None,
         };
 
-        mem.update(&self.volume)?;
         let handle = self.fnode_slots.allocate_and_write(&mut mem, entry)?;
         Ok(handle)
     }
@@ -453,31 +452,31 @@ pub struct File<S> {
 impl<S: TxRead> File<S> {
     fn get_current_block(&self) -> Result<Handle<DataBlock>> {
         let block_no = block_idx(self.pos) as usize;
-        let tx = &self.mem.borrow();
+        let mem = &self.mem.borrow();
 
         match block_no {
             0..=LAST_DIRECT_BLOCK => {
                 trace!("Current block: Direct({})", block_no);
                 let block_ptr = self.meta.content.direct[block_no].expect("Direct block missing");
-                Ok(tx.lookup(block_ptr)?)
+                Ok(mem.lookup(block_ptr)?)
             }
             FIRST_INDIRECT_BLOCK..=LAST_INDIRECT_BLOCK => {
                 let relative_block_no = block_no - FIRST_INDIRECT_BLOCK;
-                let block_ptr = lookup_step(tx, self.meta.content.indirect, relative_block_no)
+                let block_ptr = lookup_step(mem, self.meta.content.indirect, relative_block_no)
                     .expect("Indirect data block missing");
                 trace!("Current block: Indirect({})", relative_block_no);
-                Ok(tx.lookup(block_ptr)?)
+                Ok(mem.lookup(block_ptr)?)
             }
             FIRST_DOUBLE_INDIRECT_BLOCK..=LAST_DOUBLE_INDIRECT_BLOCK => {
                 let relative_block_no = block_no - FIRST_DOUBLE_INDIRECT_BLOCK;
                 let a_idx = relative_block_no / POINTERS_PER_BLOCK;
                 let b_idx = relative_block_no % POINTERS_PER_BLOCK;
 
-                let a_ptr = lookup_step(tx, self.meta.content.double_indirect, a_idx);
-                let b_ptr = lookup_step(tx, a_ptr, b_idx).expect("Data block missing");
+                let a_ptr = lookup_step(mem, self.meta.content.double_indirect, a_idx);
+                let b_ptr = lookup_step(mem, a_ptr, b_idx).expect("Data block missing");
 
                 trace!("Current block: Double indirect({})", relative_block_no);
-                Ok(tx.lookup(b_ptr)?)
+                Ok(mem.lookup(b_ptr)?)
             }
             _ => unimplemented!("File too large"),
         }
@@ -492,12 +491,12 @@ impl<S: TxWrite> File<S> {
         let mut blocks = blocks_required(self.meta.size);
         let blocks_required = blocks + blocks_to_allocate;
 
-        let tx = &mut self.mem.borrow_mut();
+        let mem = &mut self.mem.borrow_mut();
 
         // Allocating direct data blocks if needed
         let blocks_before = blocks;
         while blocks < blocks_required && blocks <= LAST_DIRECT_BLOCK as u64 {
-            make_sure_data_block_exists(tx, &mut self.meta.content.direct[blocks as usize])?;
+            make_sure_data_block_exists(mem, &mut self.meta.content.direct[blocks as usize])?;
             blocks += 1;
         }
         if blocks > blocks_before {
@@ -507,15 +506,15 @@ impl<S: TxWrite> File<S> {
         // Allocating indirect data block if needed
         if blocks < blocks_required {
             let mut indirect_block =
-                make_sure_ptr_block_exists(tx, &mut self.meta.content.indirect)?;
+                make_sure_ptr_block_exists(mem, &mut self.meta.content.indirect)?;
 
             let blocks_before = blocks;
             while blocks < blocks_required && blocks <= LAST_INDIRECT_BLOCK as u64 {
                 let idx = blocks as usize - FIRST_INDIRECT_BLOCK;
-                make_sure_data_block_exists(tx, &mut indirect_block[idx])?;
+                make_sure_data_block_exists(mem, &mut indirect_block[idx])?;
                 blocks += 1;
             }
-            tx.update(&indirect_block)?;
+            mem.update(&indirect_block)?;
             if blocks > blocks_before {
                 trace!(cnt = blocks - blocks_before, "Allocated indirect blocks");
             }
@@ -524,7 +523,7 @@ impl<S: TxWrite> File<S> {
         // Allocating double indirect data block if needed
         if blocks < blocks_required {
             let mut double_indirect_block =
-                make_sure_ptr_block_exists(tx, &mut self.meta.content.double_indirect)?;
+                make_sure_ptr_block_exists(mem, &mut self.meta.content.double_indirect)?;
 
             let blocks_before = blocks;
             while blocks < blocks_required && blocks <= LAST_DOUBLE_INDIRECT_BLOCK as u64 {
@@ -535,14 +534,14 @@ impl<S: TxWrite> File<S> {
                 let a_idx = idx / POINTERS_PER_BLOCK;
                 let b_idx = idx % POINTERS_PER_BLOCK;
                 let mut a_block =
-                    make_sure_ptr_block_exists(tx, &mut double_indirect_block[a_idx])?;
-                make_sure_data_block_exists(tx, &mut a_block[b_idx])?;
+                    make_sure_ptr_block_exists(mem, &mut double_indirect_block[a_idx])?;
+                make_sure_data_block_exists(mem, &mut a_block[b_idx])?;
                 // Here is possible performance improvement, technically we don't need to update
                 // the indirect block every time, but we can do it in the end
-                tx.update(&a_block)?;
+                mem.update(&a_block)?;
                 blocks += 1;
             }
-            tx.update(&double_indirect_block)?;
+            mem.update(&double_indirect_block)?;
 
             if blocks > blocks_before {
                 trace!(
@@ -551,7 +550,7 @@ impl<S: TxWrite> File<S> {
                 );
             }
         }
-        tx.update(&self.meta)?;
+        mem.update(&self.meta)?;
         Ok(())
     }
 }
@@ -573,9 +572,10 @@ impl<S: TxRead> Iterator for ReadDir<'_, S> {
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(next) = self.next.take() {
-            let next_child = self.fs.mem.borrow_mut().lookup(next).unwrap();
+            let mem = self.fs.mem.borrow_mut();
+            let next_child = mem.lookup(next).unwrap();
             self.next = next_child.next;
-            Some(FileMeta::from(next_child, &self.fs.mem.borrow_mut()).unwrap())
+            Some(FileMeta::from(next_child, &mem).unwrap())
         } else {
             None
         }

@@ -29,10 +29,10 @@ async fn main() {
             let fs_a = Filesystem::open(a).unwrap();
             let fs_b = Filesystem::open(b).unwrap();
             let changes = fs_b.changes_from(&fs_a);
-            println!("{:?}", FsTree(&fs_a));
             for change in changes {
-                println!("{:?} {}", change.kind(), change.into_path().display());
+                println!("  {:?} {}", change.kind(), change.into_path().display());
             }
+            println!("{:?}", FsTree(&fs_b));
         });
         snapshot = next_snapshot;
     }

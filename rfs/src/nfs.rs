@@ -5,7 +5,10 @@
 //! $ mkdir mnt
 //! $ mount -t nfs -o nolocks,vers=3,tcp,port=11111,mountport=11111,soft 127.0.0.1:/ mnt/
 //! ```
-use crate::{FileMeta, Filesystem, NodeType};
+use crate::{
+    sync::{write_sha256, FsSync},
+    FileMeta, Filesystem, NodeType,
+};
 use async_trait::async_trait;
 use nfsserve::{
     nfs::{
@@ -18,65 +21,52 @@ use pmem::volume::{Transaction, Volume};
 use std::{
     io::{self, Read, Seek, SeekFrom, Write},
     mem,
-    ops::{Deref, DerefMut},
     sync::Arc,
 };
 use tokio::sync::Mutex;
 use tracing::{instrument, warn};
 
+#[derive(Clone)]
 pub struct RFS {
-    state: Arc<Mutex<RfsState>>,
+    state: Arc<Mutex<Filesystem<Transaction>>>,
     root_id: fileid3,
 }
 
-pub struct RfsState {
-    fs: Filesystem<Transaction>,
+impl RFS {
+    pub fn new(fs: Filesystem<Transaction>) -> io::Result<RFS> {
+        let root = fs.get_root()?;
+        Ok(RFS {
+            state: Arc::new(Mutex::new(fs)),
+            root_id: root.fid,
+        })
+    }
 }
 
-/// Safety hazard: Rc<RefCell<_>> in Filesystem prevents us from using Filesystem instances in async runtime
-/// This is temporary solution and should be replaced with some kind of synchronization mechanis. This is only works
+/// Safety hazard: `Rc<RefCell<_>>` in Filesystem prevents us from using Filesystem instances in async runtime
+/// This is temporary solution and should be replaced with some kind of synchronization mechanics. This is only works
 /// until following invariants holds:
-/// - there is no concurrent usages of a [`Filesystem`] (which is guarateed by Mutex in [`RFS`])
-/// - inside [`Rc`] there is no thread local state.
-unsafe impl Send for RfsState {}
-
-impl RfsState {
-    pub async fn commit(&mut self, volume: &mut Volume) {
-        let mut sw_fs = Filesystem::open(volume.start()).unwrap();
-        mem::swap(&mut self.fs, &mut sw_fs);
-        volume.commit(sw_fs.finish().unwrap()).unwrap();
-        let new_tx = volume.start();
-        self.fs = Filesystem::open(new_tx).unwrap();
-    }
-}
-
-impl Deref for RfsState {
-    type Target = Filesystem<Transaction>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.fs
-    }
-}
-
-impl DerefMut for RfsState {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.fs
-    }
-}
+/// - there is no concurrent usages of a [`Filesystem`] (which is guaranteed by Mutex in [`RFS`])
+/// - inside [`Rc`](std::rc::Rc) there is no thread local state.
+unsafe impl<S> Send for Filesystem<S> {}
 
 impl RFS {
-    pub fn new(snapshot: Transaction) -> RFS {
-        let fs = Filesystem::open(snapshot).unwrap();
-        let root = fs.get_root().unwrap();
-        let state = RfsState { fs };
-        RFS {
-            state: Arc::new(Mutex::new(state)),
-            root_id: root.fid,
-        }
-    }
+    pub async fn update_hashes(&mut self, volume: &mut Volume) {
+        let mut fs = self.state.lock().await;
+        let base_fs = Filesystem::open(volume.start()).unwrap();
 
-    pub fn state_handle(&self) -> Arc<Mutex<RfsState>> {
-        self.state.clone()
+        let sync = FsSync(write_sha256);
+        sync.update_fs(&mut fs, &base_fs).unwrap();
+    }
+    pub async fn commit(&mut self, volume: &mut Volume) {
+        let mut fs = self.state.lock().await;
+
+        // We need some Filesystem state to be able to move from self.state
+        let mut sw_fs = Filesystem::open(volume.start()).unwrap();
+
+        mem::swap(&mut *fs, &mut sw_fs);
+        volume.commit(sw_fs.finish().unwrap()).unwrap();
+        let new_tx = volume.start();
+        *fs = Filesystem::open(new_tx).unwrap();
     }
 }
 

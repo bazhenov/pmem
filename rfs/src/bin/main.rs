@@ -23,7 +23,7 @@ async fn main() {
     let file_path = "./target/test.db";
     let db_exists = fs::metadata(file_path).is_err();
     let driver = FileDriver::from_file(file_path).unwrap();
-    let mut volume = Volume::with_capacity_and_driver(100 * 1024 * 1024, driver)
+    let mut volume = Volume::with_capacity_and_driver(2 * 1024 * 1024 * 1024, driver)
         .expect("Volume creation failed");
     if db_exists {
         warn!(path = file_path, "Allocating FS");
@@ -33,9 +33,9 @@ async fn main() {
         info!(path = file_path, "Opening FS");
     }
 
-    let rfs = RFS::new(volume.start());
-    let state = rfs.state_handle();
-    let listener = NFSTcpListener::bind(&format!("127.0.0.1:{HOSTPORT}"), rfs)
+    let fs = Filesystem::open(volume.start()).unwrap();
+    let mut rfs = RFS::new(fs).unwrap();
+    let listener = NFSTcpListener::bind(&format!("127.0.0.1:{HOSTPORT}"), rfs.clone())
         .await
         .unwrap();
 
@@ -49,14 +49,16 @@ async fn main() {
         let mut cmd = String::new();
         io::stdin().read_line(&mut cmd).unwrap();
 
-        if cmd.trim() == "exit" {
+        // empty string is CTRL+D
+        if cmd.trim() == "exit" || cmd.is_empty() {
             break;
         } else if cmd.trim() == "commit" {
-            let mut s = state.lock().await;
-            s.commit(&mut volume).await;
+            rfs.update_hashes(&mut volume).await;
+            rfs.commit(&mut volume).await;
+
             println!("Committed")
         } else {
-            println!("Unknown command: {}", cmd)
+            println!("Unknown command: {:?}", cmd)
         }
     }
 }
