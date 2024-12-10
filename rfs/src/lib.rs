@@ -660,7 +660,7 @@ pub struct Changes<'a, A: TxRead, B: TxRead> {
     path: Rc<PathBuf>,
 }
 
-impl<'a, S: TxRead, O: TxRead> Changes<'a, S, O> {
+impl<S: TxRead, O: TxRead> Changes<'_, S, O> {
     /// Adds two directories to the stack
     ///
     /// If one of the directories is None, it means that the directory does not exist in the
@@ -693,7 +693,7 @@ impl<'a, S: TxRead, O: TxRead> Changes<'a, S, O> {
     }
 }
 
-impl<'a, A: TxRead, B: TxRead> Iterator for Changes<'a, A, B> {
+impl<A: TxRead, B: TxRead> Iterator for Changes<'_, A, B> {
     type Item = Change;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -892,7 +892,7 @@ impl<S: TxRead> Seek for File<S> {
 
 /// Returns the number of blocks required to store `n` bytes
 fn blocks_required(n: u64) -> u64 {
-    (n + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64
+    n.div_ceil(BLOCK_SIZE as u64)
 }
 
 /// Returns the index of the block that contains the byte at position `n`
@@ -1115,7 +1115,7 @@ enum Joined<T: PartialEq> {
 /// (eg. `{:?}` in print! macro will print the tree structure of the filesystem)
 pub struct FsTree<'a, S>(pub &'a Filesystem<S>);
 
-impl<'a, S: TxRead> fmt::Debug for FsTree<'a, S> {
+impl<S: TxRead> fmt::Debug for FsTree<'_, S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fn do_print(
             f: &mut fmt::Formatter<'_>,

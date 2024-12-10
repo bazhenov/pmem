@@ -468,7 +468,7 @@ impl Volume {
     }
 
     pub fn with_capacity(bytes: usize) -> Self {
-        let pages = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+        let pages = bytes.div_ceil(PAGE_SIZE);
         let pages = u32::try_from(pages).expect("Too large capacity for the volume");
         Self::new_in_memory(pages)
     }
@@ -477,7 +477,7 @@ impl Volume {
         bytes: usize,
         driver: impl PageDriver + 'static,
     ) -> io::Result<Self> {
-        let pages = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+        let pages = bytes.div_ceil(PAGE_SIZE);
         let pages = u32::try_from(pages).expect("Too large capacity for the volume");
         Self::new_with_driver(pages, driver)
     }

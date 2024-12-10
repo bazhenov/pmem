@@ -439,7 +439,7 @@ fn trace_debug_memory_written<T>(addr: Addr, size: usize) {
 /// The number of pages required to fit an object of a given size
 fn required_pages_cnt(size: usize) -> usize {
     // TODO tests
-    (size + PAGE_SIZE - 1) / PAGE_SIZE
+    size.div_ceil(PAGE_SIZE)
 }
 
 #[derive(Record)]
