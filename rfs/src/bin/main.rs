@@ -1,6 +1,13 @@
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
-use pmem::{driver::FileDriver, volume::Volume};
-use rfs::{nfs::RFS, Filesystem};
+use pmem::{
+    driver::FileDriver,
+    volume::{TxRead, TxWrite, Volume},
+};
+use rfs::{
+    nfs::RFS,
+    sync::{write_sha256, FsSync},
+    Filesystem, FsTree,
+};
 use std::{
     fs,
     io::{self, Write},
@@ -33,6 +40,8 @@ async fn main() {
         info!(path = file_path, "Opening FS");
     }
 
+    let mut base = Filesystem::open(volume.start()).unwrap();
+
     let fs = Filesystem::open(volume.start()).unwrap();
     let mut rfs = RFS::new(fs).unwrap();
     let listener = NFSTcpListener::bind(&format!("127.0.0.1:{HOSTPORT}"), rfs.clone())
@@ -53,12 +62,25 @@ async fn main() {
         if cmd.trim() == "exit" || cmd.is_empty() {
             break;
         } else if cmd.trim() == "commit" {
-            rfs.update_hashes(&mut volume).await;
+            update_hashes(&mut *rfs.lock().await, &base);
             rfs.commit(&mut volume).await;
+
+            let fs = Filesystem::open(volume.start()).unwrap();
+            let changes = fs.changes_from(&base);
+            for change in changes {
+                println!("  {:?} {}", change.kind(), change.into_path().display());
+            }
+            println!("{:?}", FsTree(&fs));
+            base = fs;
 
             println!("Committed")
         } else {
             println!("Unknown command: {:?}", cmd)
         }
     }
+}
+
+pub fn update_hashes(fs: &mut Filesystem<impl TxWrite>, base: &Filesystem<impl TxRead>) {
+    let sync = FsSync(write_sha256);
+    sync.update_fs(fs, base).unwrap();
 }

@@ -17,13 +17,13 @@ use nfsserve::{
     },
     vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities},
 };
-use pmem::volume::{Transaction, Volume};
+use pmem::volume::{Transaction, TxWrite, Volume};
 use std::{
     io::{self, Read, Seek, SeekFrom, Write},
     mem,
     sync::Arc,
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard};
 use tracing::{instrument, warn};
 
 #[derive(Clone)]
@@ -50,13 +50,10 @@ impl RFS {
 unsafe impl<S> Send for Filesystem<S> {}
 
 impl RFS {
-    pub async fn update_hashes(&mut self, volume: &mut Volume) {
-        let mut fs = self.state.lock().await;
-        let base_fs = Filesystem::open(volume.start()).unwrap();
-
-        let sync = FsSync(write_sha256);
-        sync.update_fs(&mut fs, &base_fs).unwrap();
+    pub async fn lock(&mut self) -> MutexGuard<'_, Filesystem<impl TxWrite>> {
+        self.state.lock().await
     }
+
     pub async fn commit(&mut self, volume: &mut Volume) {
         let mut fs = self.state.lock().await;
 

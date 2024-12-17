@@ -613,6 +613,15 @@ impl Change {
         }
     }
 
+    fn updated(path: &Rc<PathBuf>, entry: FileMeta) -> Self {
+        let path = Rc::clone(path);
+        Self {
+            path,
+            entry,
+            kind: ChangeKind::Update,
+        }
+    }
+
     pub fn into_path(self) -> PathBuf {
         let mut path = Rc::unwrap_or_clone(self.path);
         path.push(self.entry.name());
@@ -640,7 +649,7 @@ impl Change {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ChangeKind {
     Add,
     Delete,
@@ -702,7 +711,7 @@ impl<A: TxRead, B: TxRead> Iterator for Changes<'_, A, B> {
 
             let next_changed_item = match join.next() {
                 Some(Joined::Left(a)) => {
-                    // All items in B have been exhausted, all remaining items in A are deleted
+                    // Path is present in A, but not in B. Hence it was deleted
                     let path = Rc::clone(&self.path);
                     if a.is_directory() {
                         self.push_to_stack(Some(&a), None);
@@ -712,7 +721,7 @@ impl<A: TxRead, B: TxRead> Iterator for Changes<'_, A, B> {
                 }
 
                 Some(Joined::Right(b)) => {
-                    // All items in A have been exhausted, all remaining items in B are added
+                    // Path is present in B, but not in A. Hence it was created
                     let path = Rc::clone(&self.path);
                     if b.is_directory() {
                         self.push_to_stack(None, Some(&b));
@@ -721,45 +730,33 @@ impl<A: TxRead, B: TxRead> Iterator for Changes<'_, A, B> {
                     Change::added(&path, b)
                 }
 
-                Some(Joined::Both(a, b)) => match a.name().cmp(b.name()) {
-                    Ordering::Less => {
-                        // A has an item that B does not have, it means it was deleted in B
-                        let path = Rc::clone(&self.path);
-                        if a.is_directory() {
-                            self.push_to_stack(Some(&a), None);
-                            Rc::make_mut(&mut self.path).push(a.name());
+                Some(Joined::Both(a, b)) => {
+                    if a.node_type == b.node_type {
+                        // Both A and B have the same path, inspecting children if it's a directory
+                        match a.node_type {
+                            NodeType::File => {
+                                // TODO checking if file was updated without changing the size
+                                if a.size != b.size {
+                                    Change::updated(&self.path, a)
+                                } else {
+                                    continue;
+                                }
+                            }
+                            NodeType::Directory => {
+                                self.push_to_stack(Some(&a), Some(&b));
+                                Rc::make_mut(&mut self.path).push(a.name());
+                                continue;
+                            }
                         }
-                        Change::deleted(&path, a)
-                    }
-
-                    Ordering::Greater => {
-                        // B has an item that A does not have, it means it was added in B
-                        let path = Rc::clone(&self.path);
-                        if b.is_directory() {
-                            self.push_to_stack(None, Some(&b));
-                            Rc::make_mut(&mut self.path).push(b.name());
-                        }
-                        Change::added(&path, b)
-                    }
-
-                    Ordering::Equal if a.node_type == b.node_type => {
-                        // Both A and B have the same item, inspecting children if it's a directory
-                        if a.node_type == NodeType::Directory {
-                            self.push_to_stack(Some(&a), Some(&b));
-                            Rc::make_mut(&mut self.path).push(a.name());
-                        }
-                        continue;
-                    }
-
-                    Ordering::Equal => {
-                        // here we have a situation when both A and B has changed. A has been
-                        // removed and B with the same name has been added.
+                    } else {
+                        // here we have a situation when both A and B has path, but type is different (dir/file).
+                        // Logically, A has been removed and B with the same name has been created.
                         // We can't return two changes at once here, so we returning only one change
                         // and we rely on the fact that the next call to next() will return another change
                         // because it was not removed from peekable iterator.
                         Change::deleted(&self.path, a)
                     }
-                },
+                }
 
                 None => {
                     // Both directories are exhausted, popping the stack
@@ -1518,6 +1515,30 @@ mod tests {
         assert_eq!(deleted.len(), 1);
         assert_eq!(deleted[0].entry.name(), "etc");
         assert!(deleted[0].entry.is_directory());
+
+        Ok(())
+    }
+
+    #[test]
+    fn detect_modification_in_file_size() -> Result<()> {
+        let (mut fs, mut mem) = create_fs();
+
+        let changed_file = fs.create_file(&fs.get_root()?, "changed.txt")?;
+        write_file(&mut fs, &changed_file, b"Hello", None)?;
+        let not_changed_file = fs.create_file(&fs.get_root()?, "not_changed.txt")?;
+        write_file(&mut fs, &not_changed_file, b"Hello", None)?;
+
+        mem.commit(fs.finish()?)?;
+
+        let base = Filesystem::open(mem.snapshot())?;
+        let mut fs = Filesystem::open(mem.start())?;
+        let changed_file = fs.find("/changed.txt")?;
+        write_file(&mut fs, &changed_file, b"Hello 2", None)?;
+
+        let changes = fs.changes_from(&base).collect::<Vec<_>>();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].kind(), ChangeKind::Update);
+        assert_eq!(changes[0].entry.name, "changed.txt");
 
         Ok(())
     }
