@@ -9,8 +9,9 @@ use rfs::{
     Filesystem, FsTree,
 };
 use std::{
-    fs,
+    env, fs,
     io::{self, Write},
+    process::Command,
 };
 use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -21,6 +22,8 @@ const HOSTPORT: u32 = 11111;
 async fn main() {
     let fmt_layer = tracing_subscriber::fmt::layer().with_writer(io::stderr);
     let filter_layer = EnvFilter::from_default_env();
+
+    let update_sha = env::var("UPDATE_SHA").ok().is_some();
 
     tracing_subscriber::registry()
         .with(fmt_layer)
@@ -52,6 +55,8 @@ async fn main() {
 
     tokio::spawn(async move { listener.handle_forever().await });
 
+    mount_nfs_share();
+
     loop {
         print!("> ");
         io::stdout().flush().unwrap();
@@ -62,7 +67,9 @@ async fn main() {
         if cmd.trim() == "exit" || cmd.is_empty() {
             break;
         } else if cmd.trim() == "commit" {
-            update_hashes(&mut *rfs.lock().await, &base);
+            if update_sha {
+                update_hashes(&mut *rfs.lock().await, &base);
+            }
             rfs.commit(&mut volume).await;
 
             let fs = Filesystem::open(volume.start()).unwrap();
@@ -77,6 +84,35 @@ async fn main() {
         } else {
             println!("Unknown command: {:?}", cmd)
         }
+    }
+    unmount_nfs_share();
+}
+
+fn mount_nfs_share() {
+    println!("Mounting NFS share...");
+    let child = Command::new("sh")
+        .arg("-c")
+        .arg("mount -t nfs -o nolocks,vers=3,tcp,port=11111,mountport=11111,soft 127.0.0.1:/ mnt/")
+        .output();
+    match child {
+        Ok(output) if output.status.success() => println!("NFS share mounted successfully."),
+        Ok(output) => eprintln!(
+            "Failed to mount NFS share. Error: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ),
+        Err(e) => eprintln!("Failed to execute mount command: {}", e),
+    }
+}
+
+fn unmount_nfs_share() {
+    let child = Command::new("sh").arg("-c").arg("umount mnt/").output();
+    match child {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => eprintln!(
+            "Failed to unmount NFS share. Error: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ),
+        Err(e) => eprintln!("Failed to execute mount command: {}", e),
     }
 }
 

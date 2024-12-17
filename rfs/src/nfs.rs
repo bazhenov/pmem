@@ -5,15 +5,12 @@
 //! $ mkdir mnt
 //! $ mount -t nfs -o nolocks,vers=3,tcp,port=11111,mountport=11111,soft 127.0.0.1:/ mnt/
 //! ```
-use crate::{
-    sync::{write_sha256, FsSync},
-    FileMeta, Filesystem, NodeType,
-};
+use crate::{FileMeta, Filesystem, NodeType};
 use async_trait::async_trait;
 use nfsserve::{
     nfs::{
         fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfsstring, nfstime3, sattr3,
-        specdata3,
+        set_size3, specdata3,
     },
     vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities},
 };
@@ -147,9 +144,16 @@ impl NFSFileSystem for RFS {
     #[instrument(skip(self), err(Debug, level = "warn"))]
     async fn setattr(&self, id: fileid3, _setattr: sattr3) -> Result<fattr3, nfsstat3> {
         let fs = self.state.lock().await;
-        let file = fs.lookup_by_id(id).map_err(io_to_nfs_error)?;
+        if let set_size3::size(s) = _setattr.size {
+            let file_meta = fs.lookup_by_id(id).map_err(io_to_nfs_error)?;
+            let mut file = fs.open_file(&file_meta).map_err(io_to_nfs_error)?;
+            file.set_len(s).map_err(io_to_nfs_error)?;
+            file.flush().map_err(io_to_nfs_error)?;
+        }
+        // We intentionally asking FS about metainformation again to reflect new state after changes
+        let file_meta = fs.lookup_by_id(id).map_err(io_to_nfs_error)?;
 
-        Ok(create_fattr(&file))
+        Ok(create_fattr(&file_meta))
     }
 
     #[instrument(skip(self), err(Debug, level = "warn"))]

@@ -484,6 +484,16 @@ impl<S: TxRead> File<S> {
 }
 
 impl<S: TxWrite> File<S> {
+    /// Changes the length of a file
+    pub fn set_len(&mut self, size: u64) -> Result<()> {
+        // TODO removing old blocks if size shrunk
+        // TODO allocating new blocks if size is greater
+        // TODO adjusting cursor position
+        self.meta.size = size;
+        self.mem.borrow_mut().update(&self.meta)?;
+        Ok(())
+    }
+
     /// Allocates given number of blocks and adds them to the file content
     #[instrument(skip(self))]
     fn allocate(&mut self, blocks: u64) -> Result<()> {
@@ -754,6 +764,8 @@ impl<A: TxRead, B: TxRead> Iterator for Changes<'_, A, B> {
                         // We can't return two changes at once here, so we returning only one change
                         // and we rely on the fact that the next call to next() will return another change
                         // because it was not removed from peekable iterator.
+
+                        // TODO write test on this scenario
                         Change::deleted(&self.path, a)
                     }
                 }
@@ -1376,6 +1388,29 @@ mod tests {
     }
 
     #[test]
+    fn overwrite_file_with_smaller_size() -> Result<()> {
+        let (mut fs, _) = create_fs();
+
+        let root = fs.get_root()?;
+        let file = fs.create_file(&root, "file.txt")?;
+
+        write_file(&mut fs, &file, b"Hello world", None)?;
+        {
+            // Truncating file
+            let mut file = fs.open_file(&file)?;
+            file.set_len(0)?;
+        }
+        write_file(&mut fs, &file, b"Rust!", None)?;
+
+        let mut file = fs.open_file(&file)?;
+        let mut content = String::new();
+        file.read_to_string(&mut content)?;
+        assert_eq!(content, "Rust!");
+
+        Ok(())
+    }
+
+    #[test]
     fn readdir_directories() -> Result<()> {
         let (mut fs, _) = create_fs();
         let root = fs.get_root()?;
@@ -1551,7 +1586,7 @@ mod tests {
 
         let data = [1u8; BLOCK_SIZE * 2];
         write_file(&mut fs, &file_meta, &data, None)?;
-        let read_data = read_file(&mut fs, &file_meta, BLOCK_SIZE * 2, None)?;
+        let read_data = read_file(&fs, &file_meta, BLOCK_SIZE * 2, None)?;
 
         assert_eq!(&read_data, &data);
 
@@ -1568,7 +1603,7 @@ mod tests {
 
         let data = [1u8; 2 * BLOCK_SIZE];
         write_file(&mut fs, &meta, &data, Some(pos))?;
-        let read_data = read_file(&mut fs, &meta, 2 * BLOCK_SIZE, Some(pos))?;
+        let read_data = read_file(&fs, &meta, 2 * BLOCK_SIZE, Some(pos))?;
 
         assert_eq!(&read_data, &data);
         Ok(())
@@ -1584,14 +1619,14 @@ mod tests {
 
         let data = [1u8; 2 * BLOCK_SIZE];
         write_file(&mut fs, &meta, &data, Some(pos))?;
-        let read_data = read_file(&mut fs, &meta, 2 * BLOCK_SIZE, Some(pos))?;
+        let read_data = read_file(&fs, &meta, 2 * BLOCK_SIZE, Some(pos))?;
 
         assert_eq!(&read_data, &data);
         Ok(())
     }
 
     fn read_file(
-        fs: &mut Filesystem<impl TxRead>,
+        fs: &Filesystem<impl TxRead>,
         meta: &FileMeta,
         size: usize,
         pos: Option<SeekFrom>,
@@ -1713,7 +1748,7 @@ mod tests {
         }
         file.flush()?;
 
-        let content = read_file(&mut fs, &file_meta, file_size, None)?;
+        let content = read_file(&fs, &file_meta, file_size, None)?;
         assert_eq!(content, data);
         Ok(())
     }
@@ -1741,7 +1776,7 @@ mod tests {
         write_file(&mut fs, &file2, content2.as_bytes(), None)?;
 
         // Verify that file2 exists and has correct content
-        let read_content = read_file(&mut fs, &file2, content2.len(), None)?;
+        let read_content = read_file(&fs, &file2, content2.len(), None)?;
         assert_eq!(
             read_content,
             content2.as_bytes(),
