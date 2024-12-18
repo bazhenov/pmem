@@ -1896,11 +1896,7 @@ mod tests {
         const THREADS: usize = 20;
 
         fn wrapping_sum(tx: &impl TxRead) -> u8 {
-            tx.read(0, SIZE)
-                .iter()
-                .copied()
-                .reduce(|a, b| a.wrapping_add(b))
-                .unwrap()
+            tx.read(0, SIZE).iter().fold(0, |a, b| a.wrapping_add(*b))
         }
 
         fn check_transaction_consistency(mut notify: CommitNotify) -> io::Result<()> {
@@ -1910,11 +1906,9 @@ mod tests {
                 assert_eq!(i as LSN, snapshot.lsn());
                 let sum = wrapping_sum(&snapshot);
                 if sum != 0 {
-                    let lsn = snapshot.lsn();
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("Wrapping sum is {} on LSN: {} (should be 0)", sum, lsn),
-                    ));
+                    let description =
+                        format!("Sum is {} (expected 0) on LSN: {}", sum, snapshot.lsn());
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, description));
                 }
             }
             Ok(())
@@ -1929,7 +1923,7 @@ mod tests {
         // Spawn threads that will check the consistency of the volume snapshots.
         for _ in 0..THREADS {
             let notify = volume.commit_notify();
-            let task = spawn(move || check_transaction_consistency(notify));
+            let task = thread::spawn(move || check_transaction_consistency(notify));
             tasks.push(task);
         }
 
@@ -1947,7 +1941,7 @@ mod tests {
         }
 
         for task in tasks {
-            task.recv_timeout(Duration::from_secs(1)).unwrap()?;
+            task.join().unwrap()?;
         }
 
         Ok(())
