@@ -1064,7 +1064,7 @@ impl Snapshot {
     // data at a given LSN is following:
     //
     // 1. Read whatever data is in the pages.
-    // 2. Apply changes from own patches. Any transaction should see its own not yet committed cnanges.
+    // 2. Apply changes from own (uncommitted) patches. Any transaction should see its own not yet committed cnanges.
     // 3. Apply changes from undo log, to restore the state of the page that is possibly changed
     //    by concurrently committed transaction. This is needed to maintain REPETABLE READ
     //    isolation guarantee.
@@ -1083,12 +1083,10 @@ impl Snapshot {
         // of current snapshot itself.
         let mut commit_log = self.commit.as_ref().next.load_full();
         while let Some(commit) = commit_log.as_ref() {
-            if buf_mask.is_empty() {
+            if buf_mask.is_empty() || commit.lsn() <= self.lsn() {
                 break;
-            };
-            if commit.lsn() > self.lsn() {
-                apply_patches(&commit.undo, addr as usize, buf, &mut buf_mask);
             }
+            apply_patches(&commit.undo, addr as usize, buf, &mut buf_mask);
             commit_log = commit.next.load_full();
         }
     }

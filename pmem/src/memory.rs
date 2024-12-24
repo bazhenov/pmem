@@ -1,10 +1,9 @@
 use crate::volume::{split_ptr, Addr, PageNo, PageOffset, TxRead, TxWrite, PAGE_SIZE};
 use pmem_derive::Record;
 use std::{
-    any::{type_name, Any},
+    any::type_name,
     array::TryFromSliceError,
     borrow::Cow,
-    collections::HashMap,
     fmt::{self, Debug},
     io,
     marker::PhantomData,
@@ -50,9 +49,6 @@ pub enum Error {
         err: Box<Error>,
     },
 
-    #[error("Global of type {1} already registered at address {0}")]
-    GlobalAlreadyRegistered(Addr, &'static str),
-
     #[error("Page error: {0}")]
     Page(#[from] crate::volume::Error),
 }
@@ -63,7 +59,6 @@ impl From<Error> for io::Error {
             Error::DataIntegrity(..) => io::ErrorKind::InvalidData,
             Error::NoSpaceLeft => io::ErrorKind::OutOfMemory,
             Error::NullPointer => io::ErrorKind::InvalidInput,
-            Error::GlobalAlreadyRegistered(_, _) => io::ErrorKind::InvalidInput,
             Error::SlotIsNotFree(_) => io::ErrorKind::InvalidData,
             Error::UnexpectedVariantCode(..) => io::ErrorKind::InvalidInput,
             Error::RecordReadError { .. } => io::ErrorKind::InvalidData,
@@ -76,7 +71,6 @@ impl From<Error> for io::Error {
 pub struct Memory<T> {
     tx: T,
     mem_info: MemoryInfo,
-    loaded: HashMap<Addr, Box<dyn ErasedRecord + Send>>,
 }
 
 impl<T: TxRead> TxRead for Memory<T> {
@@ -141,22 +135,7 @@ impl<S: TxRead> Memory<S> {
     pub fn open(tx: S) -> Self {
         let bytes = tx.read(START_ADDR, MemoryInfo::SIZE);
         let mem_info = MemoryInfo::read(&bytes).unwrap();
-        Self {
-            tx,
-            mem_info,
-            loaded: HashMap::new(),
-        }
-    }
-
-    fn allocate_pages(&mut self, count: usize) -> Result<PageNo> {
-        let page_no = self.mem_info.next_page;
-        let addr = PAGE_SIZE as Addr * page_no as Addr;
-        if !self.valid_range(addr, PAGE_SIZE * count) {
-            return Err(Error::NoSpaceLeft);
-        }
-        trace!("Allocating {} pages at addr: 0x{:x}", count, addr);
-        self.mem_info.next_page += count as u32;
-        Ok(page_no)
+        Self { tx, mem_info }
     }
 
     pub fn lookup<T: Record>(&self, ptr: Ptr<T>) -> Result<Handle<T>> {
@@ -169,15 +148,6 @@ impl<S: TxRead> Memory<S> {
 
         let bytes = u32::from_le_bytes(items) as usize;
         Ok(self.tx.read(addr + SLICE_HEADER_SIZE as Addr, bytes))
-    }
-
-    pub fn as_ref<R: 'static>(&self, claim: Claim<R>) -> &R {
-        self.loaded
-            .get(&claim.addr)
-            .unwrap()
-            .as_any()
-            .downcast_ref()
-            .unwrap()
     }
 
     fn read_static<const N: usize>(&self, addr: Addr) -> [u8; N] {
@@ -195,20 +165,6 @@ impl<S: TxRead> Memory<S> {
     }
 }
 
-fn read_value<T: Record>(ptr: Ptr<T>, bytes: &[u8]) -> Result<Handle<T>> {
-    match T::read(bytes) {
-        Ok(value) => Ok(Handle {
-            addr: ptr.addr,
-            value,
-        }),
-        Err(err) => Err(Error::RecordReadError {
-            addr: ptr.addr,
-            type_name: type_name::<T>(),
-            err: Box::new(err),
-        }),
-    }
-}
-
 impl<S: TxWrite> Memory<S> {
     pub fn init(mut tx: S) -> Self {
         let mem_info = MemoryInfo {
@@ -221,11 +177,18 @@ impl<S: TxWrite> Memory<S> {
         mem_info.write(&mut bytes).unwrap();
         tx.write(START_ADDR, bytes);
 
-        Self {
-            tx,
-            mem_info,
-            loaded: HashMap::new(),
+        Self::open(tx)
+    }
+
+    fn allocate_pages(&mut self, count: usize) -> Result<PageNo> {
+        let page_no = self.mem_info.next_page;
+        let addr = PAGE_SIZE as Addr * page_no as Addr;
+        if !self.valid_range(addr, PAGE_SIZE * count) {
+            return Err(Error::NoSpaceLeft);
         }
+        trace!("Allocating {} pages at addr: 0x{:x}", count, addr);
+        self.mem_info.next_page += count as u32;
+        Ok(page_no)
     }
 
     pub fn alloc_addr(&mut self, size: usize) -> Result<Addr> {
@@ -383,42 +346,24 @@ impl<S: TxWrite> Memory<S> {
         Ok(())
     }
 
-    pub fn register_global<R: Record + Send>(&mut self, addr: Addr) -> Result<Claim<R>> {
-        // TODO test register in system area
-        if let Some(global) = self.loaded.get(&addr) {
-            Err(Error::GlobalAlreadyRegistered(addr, global.type_name()))
-        } else {
-            let ptr = Ptr::<R>::from_addr(addr).unwrap();
-            let record = self.tx.lookup(ptr)?.into_inner();
-            let global = Claim {
-                addr,
-                phantom: PhantomData,
-            };
-            self.loaded.insert(ptr.addr, Box::new(record));
-            Ok(global)
-        }
-    }
-
-    pub fn as_mut<R: 'static>(&mut self, claim: Claim<R>) -> &mut R {
-        self.loaded
-            .get_mut(&claim.addr)
-            .unwrap()
-            .as_any_mut()
-            .downcast_mut()
-            .unwrap()
-    }
-
     pub fn finish(self) -> Result<S> {
-        let Memory {
-            mut tx,
-            mem_info,
-            loaded,
-        } = self;
-        for (addr, value) in loaded.into_iter() {
-            tx.write(addr, value.to_vec()?);
-        }
+        let Memory { mut tx, mem_info } = self;
         mem_info.update(&mut tx);
         Ok(tx)
+    }
+}
+
+fn read_value<T: Record>(ptr: Ptr<T>, bytes: &[u8]) -> Result<Handle<T>> {
+    match T::read(bytes) {
+        Ok(value) => Ok(Handle {
+            addr: ptr.addr,
+            value,
+        }),
+        Err(err) => Err(Error::RecordReadError {
+            addr: ptr.addr,
+            type_name: type_name::<T>(),
+            err: Box::new(err),
+        }),
     }
 }
 
@@ -435,34 +380,6 @@ fn trace_debug_memory_written<T>(addr: Addr, size: usize) {
 fn required_pages_cnt(size: usize) -> usize {
     // TODO tests
     size.div_ceil(PAGE_SIZE)
-}
-
-#[derive(Record)]
-struct Slabs {
-    /// Objects of size smaller than 512KB are allocated in slabs – fixed size blocks.
-    ///
-    /// 16 slabs provides way to allocate objects of sizes from 2^3 (8 bytes) to 2^19 (512KB).
-    slabs: [Slab; 16],
-
-    /// Large objects of size greater than 512KB, are allocated in an adhoc way.
-    /// They have a separate linked list of free blocks which contains not only pointer to the next block
-    /// but also the size of the block.
-    next_allocation: Addr,
-    free_list: Addr,
-}
-
-/// Each slab provide fixed sized allocations for objects of the same size or roughly the same size.
-///
-/// Maintaining a set of N slabs of 2^N sizes provide a way to allocate/deallocate objects of different sizes
-/// without fragmentation.
-#[derive(Record, Default, Copy, Clone)]
-struct Slab {
-    /// Address of the allocation for the next object
-    current_block: Addr,
-
-    /// Linked list of free blocks, each block is of the same size defined by the number of
-    /// Slab in a Slabs array
-    free_list: Addr,
 }
 
 pub struct Ptr<T> {
@@ -625,33 +542,6 @@ pub trait Record: Sized + 'static {
     fn write(&self, data: &mut [u8]) -> Result<()>;
 }
 
-pub trait ErasedRecord {
-    fn to_vec(&self) -> Result<Vec<u8>>;
-    fn as_any(&self) -> &dyn Any;
-    fn as_any_mut(&mut self) -> &mut dyn Any;
-    fn type_name(&self) -> &'static str;
-}
-
-impl<T: Record + 'static> ErasedRecord for T {
-    fn to_vec(&self) -> Result<Vec<u8>> {
-        let mut data = vec![0; T::SIZE];
-        self.write(&mut data)?;
-        Ok(data)
-    }
-
-    fn type_name(&self) -> &'static str {
-        type_name::<T>()
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
-}
-
 macro_rules! impl_record_for_primitive {
     ($($t:ty),*) => {
         $(
@@ -715,16 +605,6 @@ impl<T: Record> Record for Option<T> {
     }
 }
 
-pub trait AsAddrAndRef<T> {
-    fn as_addr_and_ref(&self) -> (Addr, &T);
-}
-
-impl<T> AsAddrAndRef<T> for Handle<T> {
-    fn as_addr_and_ref(&self) -> (Addr, &T) {
-        (self.addr, &self.value)
-    }
-}
-
 pub struct Handle<T> {
     addr: Addr,
     value: T,
@@ -745,6 +625,10 @@ impl<T> Handle<T> {
 
     pub fn into_inner(self) -> T {
         self.value
+    }
+
+    pub fn as_addr_and_ref(&self) -> (Addr, &T) {
+        (self.addr, &self.value)
     }
 }
 
@@ -783,8 +667,6 @@ pub const fn max<const N: usize>(array: [usize; N]) -> usize {
     }
     max
 }
-
-pub type SlotClaim = u32;
 
 /// This wrapper exists primarily to opt out of default implementation of `Record` trait
 /// for arrays. We want to have a custom implementation that will write the array directly as slice.
@@ -842,18 +724,6 @@ pub struct SlotsState<T: Record> {
     /// Index of a first slot in a free list. It points to the [`Slot::Free`]
     /// structure.
     free_slot: Option<Ptr<Slot<T>>>,
-}
-
-pub struct Claim<T> {
-    addr: Addr,
-    phantom: PhantomData<T>,
-}
-
-impl<T> Copy for Claim<T> {}
-impl<T> Clone for Claim<T> {
-    fn clone(&self) -> Self {
-        *self
-    }
 }
 
 /// A memory management system for fixed-size slots.
@@ -1034,7 +904,7 @@ pub trait TxReadExt: TxRead {
 impl<S: TxRead> TxReadExt for S {}
 
 pub trait TxWriteExt: TxWrite {
-    fn update<T: Record>(&mut self, r: &impl AsAddrAndRef<T>) -> Result<()> {
+    fn update<T: Record>(&mut self, r: &Handle<T>) -> Result<()> {
         let (addr, value) = r.as_addr_and_ref();
         let mut buffer = vec![0u8; T::SIZE];
         value.write(&mut buffer)?;
@@ -1077,7 +947,7 @@ mod tests {
         let result = mem.allocate_pages(100);
         let Err(Error::NoSpaceLeft) = result else {
             panic!(
-                "Err({:?}) should be geneated, {:?} instead",
+                "Err({:?}) should be generated, {:?} instead",
                 Error::NoSpaceLeft,
                 result
             );
@@ -1093,57 +963,6 @@ mod tests {
         let value_copy = mem.read(handle.ptr())?;
         assert_eq!(&value_copy, &*handle);
         Ok(())
-    }
-
-    #[test]
-    fn check_memory() -> Result<()> {
-        let vol = Volume::default();
-        let mut tx = vol.start();
-        tx.write(800, [42u8; 1]);
-        tx.write(1000, [100u8; 1]);
-        let mut layout = Memory::init(tx);
-
-        let claim = layout.register_global::<u8>(800)?;
-        assert_eq!(layout.as_ref(claim), &42);
-
-        let claim = layout.register_global::<u8>(1000)?;
-        assert_eq!(layout.as_ref(claim), &100);
-        Ok(())
-    }
-
-    #[test]
-    fn check_memory_will_finish_globals() -> Result<()> {
-        let vol = Volume::default();
-        let mut layout = Memory::init(vol.start());
-        let addr = 800;
-        let expected_value = 42;
-
-        let claim = layout.register_global::<u8>(addr)?;
-        *layout.as_mut(claim) = expected_value;
-
-        let tx = layout.finish()?;
-
-        let mut buf = [0u8];
-        tx.read_to_buf(addr, &mut buf[..]);
-        assert_eq!(buf[0], expected_value);
-        Ok(())
-    }
-
-    #[test]
-    fn check_memory_should_return_error_on_type_conflict() {
-        let vol = Volume::default();
-        let mut layout = Memory::init(vol.start());
-
-        let expected_addr = 800;
-        layout.register_global::<u8>(expected_addr).unwrap();
-        match layout.register_global::<u16>(expected_addr) {
-            Err(Error::GlobalAlreadyRegistered(addr, type_name)) => {
-                assert_eq!(addr, expected_addr);
-                assert_eq!(type_name, "u8");
-            }
-            Err(_) => panic!("GlobalAlreadyRegistered expected"),
-            Ok(_) => panic!("Error expected"),
-        }
     }
 
     #[test]
