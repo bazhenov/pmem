@@ -249,7 +249,7 @@ impl NFSFileSystem for RFS {
         _symlink: &nfspath3,
         _attr: &sattr3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+        Err(nfsstat3::NFS3ERR_NOTSUPP)
     }
 
     #[instrument(skip(self), err(Debug, level = "warn"))]

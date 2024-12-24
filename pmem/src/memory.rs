@@ -11,6 +11,8 @@ use std::{
     mem,
     ops::{Deref, DerefMut},
 };
+use tracing::trace;
+
 /// The size of any pointer in bytes
 pub const PTR_SIZE: usize = Ptr::<u8>::SIZE;
 pub const NULL_PTR_SIZE: usize = Option::<Ptr<u8>>::SIZE;
@@ -147,19 +149,12 @@ impl<S: TxRead> Memory<S> {
     }
 
     fn allocate_pages(&mut self, count: usize) -> Result<PageNo> {
-        // TODO NoSpaceLeft check
-        if !self.valid_range(
-            PAGE_SIZE as Addr * self.mem_info.next_page as Addr,
-            PAGE_SIZE,
-        ) {
+        let page_no = self.mem_info.next_page;
+        let addr = PAGE_SIZE as Addr * page_no as Addr;
+        if !self.valid_range(addr, PAGE_SIZE * count) {
             return Err(Error::NoSpaceLeft);
         }
-        let page_no = self.mem_info.next_page;
-        tracing::trace!(
-            "Allocating {} pages at addr: {}",
-            count,
-            page_no * PAGE_SIZE as PageNo
-        );
+        trace!("Allocating {} pages at addr: 0x{:x}", count, addr);
         self.mem_info.next_page += count as u32;
         Ok(page_no)
     }
@@ -428,7 +423,7 @@ impl<S: TxWrite> Memory<S> {
 }
 
 fn trace_debug_memory_written<T>(addr: Addr, size: usize) {
-    tracing::trace!(
+    trace!(
         "Writing to addr: {:8} - {:8} type: {}",
         addr,
         addr + size as Addr,
@@ -1077,6 +1072,19 @@ mod tests {
     }
 
     #[test]
+    fn no_space_left_error_should_be_generated() {
+        let (_, mut mem) = create_memory(10);
+        let result = mem.allocate_pages(100);
+        let Err(Error::NoSpaceLeft) = result else {
+            panic!(
+                "Err({:?}) should be geneated, {:?} instead",
+                Error::NoSpaceLeft,
+                result
+            );
+        };
+    }
+
+    #[test]
     fn read_write_ptr() -> Result<()> {
         let mut mem = Memory::new();
 
@@ -1520,6 +1528,12 @@ mod tests {
                 (Just(allocations), 0..size)
             })
         }
+    }
+
+    fn create_memory(pages: u32) -> (Volume, Memory<Transaction>) {
+        let volume = Volume::new_in_memory(pages);
+        let mem = Memory::init(volume.start());
+        (volume, mem)
     }
 
     impl Memory<Transaction> {
