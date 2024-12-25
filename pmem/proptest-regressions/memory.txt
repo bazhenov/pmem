@@ -6,3 +6,6 @@
 # everyone who runs the test benefits from these saved cases.
 cc 90a1c14dfff1fb4243d01edae52591ffe44c80f764b530dc66594e062784c137 # shrinks to before = [], after = [1], alloc = 1
 cc 0b6204ea76b40a30688643b4a4c323a2c44e8075bcfd65905d45f17a0cc5c94d # shrinks to (items, target_idx) = ([1, 2], 0)
+cc 8070d095c3a88b340274bb0926041963f10d868c83a0912ed94eb188cb7cc5a9 # shrinks to snapshots = [([Write(0, [0])], [Write(0, [0])]), ([Write(0, [0])], [Write(65533, [0, 0, 0, 10])])]
+cc 3f07ab88e25ac2687a682cc0c4f9deee3928bcefdd35eb2dca5c79f3116cff6c # shrinks to snapshots = [([Write(78037, [0, 0, 0, 0, 0, 0, 0, 0, 1]), Reclaim(78039, 7)], [Write(0, [0])])]
+cc 8f757c759da1cc566bd72a2cba2fcb8d635f72873a144ebd41be6de9f0a7d7b3 # shrinks to snapshots = [([Write(0, [0])], [Write(66077, [0, 0, 0, 1])]), ([Write(0, [0])], [Reclaim(66066, 15)])]
