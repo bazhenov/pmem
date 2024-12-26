@@ -953,10 +953,15 @@ mod vmem {
 
     #[derive(Record)]
     struct VMemInfo<const N: usize> {
-        // next available for allocation page no.
+        /// next available for allocation page no.
         next_page: PageNo,
 
-        // page numbers for root page entry tables for all virtual spaces
+        /// The number of virtual spaces. On runtime should be equal or less than `N`.
+        ///
+        /// It is allowed to open `VMem<N>` as `VMem<N - 1>` (for N > 1)
+        spaces: u16,
+
+        /// page numbers for root page entry tables for all virtual spaces
         root_ptes: [PageNo; N],
     }
 
@@ -965,6 +970,7 @@ mod vmem {
             let mut tx = vol.start();
             info!(N, "Initializing VMem");
             let r = VMemInfo::<N> {
+                spaces: u16::try_from(N).expect("N is too large"),
                 // root_ptes are first N pages started from 1 (eg. [1, 2, 3, ...])
                 root_ptes: array::from_fn(|i| i as PageNo + 1),
                 // page=0 is reserved, first N pages occupied by root pte pages
@@ -987,7 +993,13 @@ mod vmem {
         }
 
         fn from_tx(tx: Transaction) -> Result<(VMem<N>, [VMemTx<N>; N])> {
+            assert!(N > 0);
             let info = tx.lookup(Ptr::<VMemInfo<N>>::from_addr(INFO_ADDR).unwrap())?;
+            assert!(
+                info.spaces as usize <= N,
+                "VMmem configured with {} virtual spaces",
+                info.spaces,
+            );
             let tx = Rc::new(RefCell::new(tx));
             let root_ptes = info.root_ptes;
             info!(next_page = info.next_page, N, "Opening VMem");
@@ -1006,6 +1018,7 @@ mod vmem {
         }
 
         #[cfg(test)]
+        #[allow(unused)]
         fn dump_translation_table(&self) {
             const PTE_ENTRIES: usize = PAGE_SIZE / PageNo::SIZE;
             let tx = self.tx.borrow();
@@ -1211,7 +1224,6 @@ mod vmem {
         #[test]
         fn reopen() -> Result<()> {
             let mut v = Volume::new_in_memory(10);
-
             let (vmem, [mut tx1, mut tx2]) = VMem::init(&v)?;
 
             tx1.write(0, b"Jekyll");
@@ -1226,7 +1238,7 @@ mod vmem {
 
         proptest! {
             #[test]
-            fn shadow_write(snapshots in vec((any_snapshot(), any_snapshot()), 0..3)) {
+            fn shadow_write_vmem_2_tx(snapshots in vec((any_snapshot(), any_snapshot()), 0..3)) {
                 let mut shadow_a = VecTx(vec![0; DB_SIZE]);
                 let mut shadow_b = VecTx(vec![0; DB_SIZE]);
                 let mut vol = Volume::with_capacity(5 * DB_SIZE);
@@ -1234,6 +1246,7 @@ mod vmem {
 
                 for (patches_a, patches_b) in snapshots {
                     let (vmem, [mut vm_a, mut vm_b]) = VMem::<2>::open(&vol)?;
+
                     for p in patches_a {
                         p.clone().write_to(&mut vm_a);
                         p.write_to(&mut shadow_a);
@@ -1242,7 +1255,6 @@ mod vmem {
                         p.clone().write_to(&mut vm_b);
                         p.write_to(&mut shadow_b);
                     }
-                    vmem.dump_translation_table();
                     assert_buffers_eq!(vm_a.read(0, DB_SIZE), shadow_a);
                     assert_buffers_eq!(vm_b.read(0, DB_SIZE), shadow_b);
 
