@@ -773,7 +773,7 @@ impl Pages {
     }
 
     fn read(&self, addr: Addr, buf: &mut [u8]) -> io::Result<()> {
-        let segments = PageSegments::new(addr, buf.len());
+        let segments = page_segments(addr, buf.len());
         for (addr, slice_range) in segments {
             let (page_no, offset) = split_addr(addr);
             let offset = offset as usize;
@@ -790,7 +790,7 @@ impl Pages {
 
     // TODO proptests
     fn write(&self, addr: Addr, buf: &[u8]) -> io::Result<()> {
-        let segments = PageSegments::new(addr, buf.len());
+        let segments = page_segments(addr, buf.len());
         for (addr, slice_range) in segments {
             let (page_no, offset) = split_addr(addr);
             let offset = offset as usize;
@@ -807,7 +807,7 @@ impl Pages {
     }
 
     fn zero(&self, addr: Addr, len: usize) -> io::Result<()> {
-        let segments = PageSegments::new(addr, len);
+        let segments = page_segments(addr, len);
         for (addr, slice_range) in segments {
             let (page_no, offset) = split_addr(addr);
             let offset = offset as usize;
@@ -1444,26 +1444,27 @@ fn intersects(patch: &Patch, range: &Range<usize>) -> bool {
 /// let size = 0x100;
 /// let buffer = vec![0; size];
 ///
-/// let segments = PageSegments::new(base_addr, size);
-/// for (addr, range) in segments {
+/// for (addr, range) in page_segments(base_addr, size) {
 ///     let result = tx.read(addr, range.len());
 ///     buffer[range].copy_from_slice(&result);
 /// }
 /// ```
-pub struct PageSegments {
+pub fn page_segments(
+    base_addr: Addr,
+    size: usize,
+) -> impl DoubleEndedIterator<Item = (Addr, Range<usize>)> {
+    PageSegments {
+        base_addr,
+        start_addr: base_addr,
+        end_addr: base_addr + size as Addr,
+    }
+}
+
+/// Iterator created by [`page_segments`]
+struct PageSegments {
     base_addr: Addr,
     start_addr: Addr,
     end_addr: Addr,
-}
-
-impl PageSegments {
-    pub fn new(base_addr: Addr, size: usize) -> Self {
-        PageSegments {
-            base_addr,
-            start_addr: base_addr,
-            end_addr: base_addr + size as Addr,
-        }
-    }
 }
 
 impl Iterator for PageSegments {
@@ -1818,18 +1819,15 @@ pub mod tests {
         // Pay notice to take(N) calls. It is needed to stop tests from infinite looping in case
         // of errors in iteration logic
 
-        assert_eq!(
-            PageSegments::new(10, 0).take(10).collect::<Vec<_>>(),
-            vec![]
-        );
+        assert_eq!(page_segments(10, 0).take(10).collect::<Vec<_>>(), vec![]);
 
         assert_eq!(
-            PageSegments::new(0, 10).take(10).collect::<Vec<_>>(),
+            page_segments(0, 10).take(10).collect::<Vec<_>>(),
             vec![(0, 0..10)]
         );
 
         assert_eq!(
-            PageSegments::new(PAGE_SIZE as Addr / 2, PAGE_SIZE)
+            page_segments(PAGE_SIZE as Addr / 2, PAGE_SIZE)
                 .take(10)
                 .collect::<Vec<_>>(),
             vec![
@@ -1839,9 +1837,7 @@ pub mod tests {
         );
 
         assert_eq!(
-            PageSegments::new(1, 2 * PAGE_SIZE)
-                .take(10)
-                .collect::<Vec<_>>(),
+            page_segments(1, 2 * PAGE_SIZE).take(10).collect::<Vec<_>>(),
             vec![
                 (1, 0..PAGE_SIZE - 1),
                 (PAGE_SIZE as Addr, (PAGE_SIZE - 1)..(2 * PAGE_SIZE - 1)),
@@ -2315,14 +2311,14 @@ pub mod tests {
 
             #[test]
             fn page_segments_len((addr, len) in any_addr_and_len()) {
-                let interval = PageSegments::new(addr, len);
+                let interval = page_segments(addr, len);
                 let len_sum = interval.map(|(_, slice_range)| slice_range.len()).sum::<usize>();
                 prop_assert_eq!(len_sum, len);
             }
 
             #[test]
             fn page_segments_are_connected((addr, len) in any_addr_and_len()) {
-                let segments = PageSegments::new(addr, len)
+                let segments = page_segments(addr, len)
                     .map(|(_, slice_range)| slice_range)
                     .collect::<Vec<_>>();
                 for i in segments.windows(2) {
@@ -2334,9 +2330,9 @@ pub mod tests {
             fn page_segments_are_equivalent_to_reverted((addr, len) in any_addr_and_len()) {
                 // take(N) is needed to prevent infinite loop in case of logic errors in iteration logic
                 // otherwise fuzz testing generates a lot of timeout errors
-                let segments = PageSegments::new(addr, len).take(100).collect::<Vec<_>>();
+                let segments = page_segments(addr, len).take(100).collect::<Vec<_>>();
 
-                let mut segments_rev = PageSegments::new(addr, len).rev().take(100).collect::<Vec<_>>();
+                let mut segments_rev = page_segments(addr, len).rev().take(100).collect::<Vec<_>>();
                 segments_rev.sort_by_key(|(addr, _)| *addr);
 
                 prop_assert_eq!(segments, segments_rev);

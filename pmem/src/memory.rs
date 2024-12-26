@@ -940,9 +940,9 @@ impl<S: TxWrite> TxWriteExt for S {}
 /// is a physical page number.
 mod vmem {
     use super::*;
-    use crate::volume::{make_addr, PageSegments, Transaction};
+    use crate::volume::{make_addr, page_segments, Transaction};
     use std::{array, cell::RefCell, rc::Rc};
-    use tracing::{debug, enabled, info, Level};
+    use tracing::{debug, info};
 
     const INFO_ADDR: Addr = 8;
 
@@ -1134,7 +1134,7 @@ mod vmem {
 
     impl<const N: usize> TxRead for VMemTx<N> {
         fn read_to_buf(&self, v_addr: Addr, buf: &mut [u8]) {
-            let segments = PageSegments::new(v_addr, buf.len());
+            let segments = page_segments(v_addr, buf.len());
             // dbg!(v_addr, buf.len());
             for (v_addr, range) in segments {
                 let (v_page, offset) = split_addr(v_addr);
@@ -1159,8 +1159,7 @@ mod vmem {
         fn write(&mut self, v_addr: Addr, bytes: impl Into<Vec<u8>>) {
             // dbg!(v_addr);
             let bytes = bytes.into();
-            let segments = PageSegments::new(v_addr, bytes.len());
-            for (v_addr, range) in segments {
+            for (v_addr, range) in page_segments(v_addr, bytes.len()) {
                 let (v_page, offset) = split_addr(v_addr);
                 let p_page = self.translate_allocate_page(v_page).unwrap();
                 let p_addr = make_addr(p_page, offset);
@@ -1171,14 +1170,15 @@ mod vmem {
         }
 
         fn reclaim(&mut self, v_addr: Addr, len: usize) {
-            let segments = PageSegments::new(v_addr, len);
-            for (v_addr, range) in segments {
+            for (v_addr, range) in page_segments(v_addr, len) {
                 let (v_page, offset) = split_addr(v_addr);
-                let p_page = self.translate_allocate_page(v_page).unwrap();
-                let p_addr = make_addr(p_page, offset);
-                trace!(v_page, v_addr, p_page, p_addr, "Writing");
-                let mut tx = self.tx.borrow_mut();
-                tx.reclaim(p_addr, range.len());
+                if let Some(p_page) = self.translate_page(v_page).unwrap() {
+                    // We only need to reclaim memory if it was allocated
+                    let p_addr = make_addr(p_page, offset);
+                    trace!(v_page, v_addr, p_page, p_addr, "Reclaiming");
+                    let mut tx = self.tx.borrow_mut();
+                    tx.reclaim(p_addr, range.len());
+                }
             }
         }
     }
