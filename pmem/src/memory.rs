@@ -938,7 +938,50 @@ impl<S: TxWrite> TxWriteExt for S {}
 ///
 /// Each entry in the root PTE table is a page number of an inner PTE table. Each entry in the inner PTE table
 /// is a physical page number.
-mod vmem {
+///
+/// ## Virtual Memory Example
+///
+/// This example demonstrates how to use the vmem package to create
+/// and manipulate multiple virtual memory spaces within a single transaction.
+///
+/// ```
+/// use pmem::memory::vmem;
+/// use pmem::volume::{Volume, TxRead, TxWrite};
+///
+/// // Create a new volume with 10 pages
+/// let mut volume = Volume::with_capacity(1024 * 1024);
+///
+/// // Initialize two virtual memory spaces
+/// let [mut vm1, mut vm2] = vmem::init(volume.start()).unwrap();
+///
+/// // Write data to the first virtual memory space
+/// vm1.write(0, b"Hello from VM1");
+///
+/// // Write data to the second virtual memory space
+/// vm2.write(0, b"Greetings from VM2");
+///
+/// // Read data from both virtual memory spaces
+/// let data1 = vm1.read(0, 14);
+/// let data2 = vm2.read(0, 18);
+///
+/// assert_eq!(&*data1, b"Hello from VM1");
+/// assert_eq!(&*data2, b"Greetings from VM2");
+///
+/// // Commit changes back to Volume
+/// let tx = vmem::finish([vm1, vm2]).unwrap();
+/// volume.commit(tx).unwrap();
+///
+/// // Reopen the virtual memory spaces
+/// let [vm1, vm2] = vmem::open(volume.snapshot()).unwrap();
+///
+/// // Verify data persists after reopening
+/// let data1 = vm1.read(0, 14);
+/// let data2 = vm2.read(0, 18);
+///
+/// assert_eq!(&*data1, b"Hello from VM1");
+/// assert_eq!(&*data2, b"Greetings from VM2");
+/// ```
+pub mod vmem {
     use super::*;
     use crate::volume::{make_addr, page_segments};
     use std::{array, cell::RefCell, rc::Rc};
@@ -1009,7 +1052,7 @@ mod vmem {
 
     pub fn finish<const N: usize, T: TxWrite>(txs: [VTx<T>; N]) -> Result<T> {
         // We need to drop all transactions except one. After that we should be
-        // able to move out of transaction Rc
+        // able to move global transaction out of Rc
         let mut txs = txs.into_iter().collect::<Vec<_>>();
         txs.drain(1..);
         let last_vmem = txs.remove(0);
@@ -1287,6 +1330,43 @@ mod tests {
         assert_eq!(max([1, 2, 3]), 3);
         assert_eq!(max([3, 2, 1]), 3);
         assert_eq!(max([]), 0);
+    }
+
+    #[test]
+    pub fn vmem_example() -> Result<()> {
+        // Create a new volume with 10 pages
+        let mut volume = Volume::with_capacity(1024 * 1024);
+
+        // Initialize two virtual memory spaces
+        let [mut vm1, mut vm2] = vmem::init(volume.start())?;
+
+        // Write data to the first virtual memory space
+        vm1.write(0, b"Hello from VM1");
+
+        // Write data to the second virtual memory space
+        vm2.write(0, b"Greetings from VM2");
+
+        // Read data from both virtual memory spaces
+        let data1 = vm1.read(0, 14);
+        let data2 = vm2.read(0, 18);
+
+        assert_eq!(&*data1, b"Hello from VM1");
+        assert_eq!(&*data2, b"Greetings from VM2");
+
+        // Commit changes back to Volume
+        volume.commit(vmem::finish([vm1, vm2])?)?;
+
+        // Reopen the virtual memory spaces
+        let [vm1, vm2] = vmem::open(volume.snapshot())?;
+
+        // Verify data persists after reopening
+        let data1 = vm1.read(0, 14);
+        let data2 = vm2.read(0, 18);
+
+        assert_eq!(&*data1, b"Hello from VM1");
+        assert_eq!(&*data2, b"Greetings from VM2");
+
+        Ok(())
     }
 
     #[test]
