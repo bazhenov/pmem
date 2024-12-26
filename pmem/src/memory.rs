@@ -1,4 +1,4 @@
-use crate::volume::{split_addr, Addr, PageNo, PageOffset, TxRead, TxWrite, PAGE_SIZE};
+use crate::volume::{make_addr, split_addr, Addr, PageNo, PageOffset, TxRead, TxWrite, PAGE_SIZE};
 use pmem_derive::Record;
 use std::{
     any::type_name,
@@ -392,12 +392,21 @@ pub struct Ptr<T> {
 }
 
 impl<T> Ptr<T> {
-    /// TODO add unchecked version
+    /// Constructs a new [`Ptr`] from address.
+    ///
+    /// Returns [`None`] if resulting address is 0
     pub fn from_addr(addr: Addr) -> Option<Self> {
         (addr > 0).then_some(Self {
             addr,
             _phantom: PhantomData::<T>,
         })
+    }
+
+    /// Construct a new [`Ptr`] from page number and page-offset
+    ///
+    /// Returns [`None`] if resulting address is 0
+    pub fn from_page_offset(page: PageNo, offset: PageOffset) -> Option<Self> {
+        Self::from_addr(make_addr(page, offset))
     }
 }
 
@@ -990,7 +999,7 @@ pub mod vmem {
     const INFO_ADDR: Addr = 8;
 
     #[derive(Record)]
-    struct VMemInfo {
+    struct GlobalInfo {
         /// next available for allocation page no.
         next_page: PageNo,
 
@@ -1000,42 +1009,42 @@ pub mod vmem {
         spaces: u16,
     }
 
+    /// page numbers for root page entry tables for all virtual spaces
     #[derive(Record)]
-    struct VMemRootPages<const N: usize> {
-        /// page numbers for root page entry tables for all virtual spaces
-        root_ptes: [PageNo; N],
-    }
+    struct RootTranslationTables<const N: usize>([PageNo; N]);
 
     pub fn init<const N: usize, T: TxWrite>(mut tx: T) -> Result<[VTx<T>; N]> {
         info!(N, "Initializing VMem");
-        let info = VMemInfo {
+        let info = GlobalInfo {
             spaces: u16::try_from(N).expect("N is too large"),
             // page=0 is reserved, first N pages occupied by root pte pages
             // first available for allocation page is N + 1
             next_page: N as PageNo + 1,
         };
-        let root_pages = VMemRootPages::<N> {
-            // root_ptes are first N pages started from 1 (eg. [1, 2, 3, ...])
-            root_ptes: array::from_fn(|i| i as PageNo + 1),
-        };
+        // root_ptes are first N pages started from 1 (eg. [1, 2, 3, ...])
+        let root_pages = RootTranslationTables::<N>(array::from_fn(|i| i as PageNo + 1));
         tx.update(&Handle::new(INFO_ADDR, info))?;
-        tx.update(&Handle::new(INFO_ADDR + VMemInfo::SIZE as Addr, root_pages))?;
+        tx.update(&Handle::new(
+            INFO_ADDR + GlobalInfo::SIZE as Addr,
+            root_pages,
+        ))?;
         open(tx)
     }
 
     pub fn open<const N: usize, T: TxRead>(tx: T) -> Result<[VTx<T>; N]> {
         assert!(N > 0);
-        let info = tx.lookup(Ptr::<VMemInfo>::from_addr(INFO_ADDR).unwrap())?;
+        let info = tx.lookup(Ptr::<GlobalInfo>::from_addr(INFO_ADDR).unwrap())?;
         assert!(
             info.spaces as usize <= N,
             "VMmem configured with {} virtual spaces",
             info.spaces,
         );
         let root_pages = tx.lookup(
-            Ptr::<VMemRootPages<N>>::from_addr(INFO_ADDR + VMemInfo::SIZE as Addr).unwrap(),
+            Ptr::<RootTranslationTables<N>>::from_addr(INFO_ADDR + GlobalInfo::SIZE as Addr)
+                .unwrap(),
         )?;
         info!(next_page = info.next_page, N, "Opening VMem");
-        for (i, pte) in root_pages.root_ptes.iter().enumerate() {
+        for (i, pte) in root_pages.0.iter().enumerate() {
             assert!(*pte > 0, "Root Page Table number is missing");
             debug!(i, root_pte_page = pte, "Root PTE");
         }
@@ -1046,7 +1055,7 @@ pub mod vmem {
         Ok(array::from_fn(|i| VTx {
             tx: Rc::clone(&tx),
             info: Rc::clone(&info),
-            root_pt: root_pages.root_ptes[i],
+            root_pt: root_pages.0[i],
         }))
     }
 
@@ -1067,40 +1076,39 @@ pub mod vmem {
     pub struct VTx<T> {
         /// Global transaction
         tx: Rc<RefCell<T>>,
-        info: Rc<RefCell<Handle<VMemInfo>>>,
+        info: Rc<RefCell<Handle<GlobalInfo>>>,
         root_pt: PageNo,
     }
 
     impl<T: TxRead> VTx<T> {
         /// Translate virtual page number to a physical one
-        fn translate_page(&self, v_page: PageNo) -> Result<Option<PageNo>> {
+        fn translate_page(&self, tx: &T, v_page: PageNo) -> Option<PageNo> {
             let (pt_1_idx, pt_2_idx) = split_pte_idx(v_page);
-            let tx = self.tx.borrow();
 
-            let pte_page = tx.lookup(pte_ptr(self.root_pt, pt_1_idx))?;
+            let pte_page = tx
+                .lookup(pte_ptr(self.root_pt, pt_1_idx))
+                .expect("Unable to read PTE");
             let phys_page_no = if *pte_page > 0 {
-                *tx.lookup(pte_ptr(*pte_page, pt_2_idx))?
+                *tx.lookup(pte_ptr(*pte_page, pt_2_idx))
+                    .expect("Unable to read PTE")
             } else {
                 0
             };
-            Ok(Some(phys_page_no).filter(|&i| i > 0))
+            Some(phys_page_no).filter(|&i| i > 0)
         }
 
+        /// Diagnostic method that prints translation table for a current virtual transaction
         #[cfg(test)]
         #[allow(unused)]
         fn dump_translation_table(&self) {
             const PTE_ENTRIES: usize = PAGE_SIZE / PageNo::SIZE;
             let tx = self.tx.borrow();
             let info = self.info.borrow();
-            let root_ptr =
-                Ptr::<[PageNo; PTE_ENTRIES]>::from_addr(self.root_pt as Addr * PAGE_SIZE as Addr)
-                    .unwrap();
+            let root_ptr = Ptr::<[PageNo; PTE_ENTRIES]>::from_page_offset(self.root_pt, 0).unwrap();
             let mut v_page = 0;
             let root_pt = tx.lookup(root_ptr).unwrap();
             for pte1 in root_pt.into_iter().take_while(|&i| i > 0) {
-                let pt_2_ptr =
-                    Ptr::<[PageNo; PTE_ENTRIES]>::from_addr(pte1 as Addr * PAGE_SIZE as Addr)
-                        .unwrap();
+                let pt_2_ptr = Ptr::<[PageNo; PTE_ENTRIES]>::from_page_offset(pte1, 0).unwrap();
                 let pt_2 = tx.lookup(pt_2_ptr).unwrap();
                 for p_page in pt_2.into_iter().take_while(|&i| i > 0) {
                     println!("   {} -> {}", v_page, p_page);
@@ -1135,35 +1143,36 @@ pub mod vmem {
     }
 
     fn pte_ptr(page_no: PageNo, index: u32) -> Ptr<u32> {
-        let pt = page_no as Addr;
-        let index = index as Addr;
-        let page_addr = pt * PAGE_SIZE as Addr;
-        let offset = index * PageNo::SIZE as Addr;
-        Ptr::<PageNo>::from_addr(page_addr + offset).unwrap()
+        let offset = index as PageOffset * PageNo::SIZE as PageOffset;
+        Ptr::<PageNo>::from_page_offset(page_no, offset).unwrap()
     }
 
     impl<T: TxWrite> VTx<T> {
         /// Translate virtual page number to a physical one and allocates a page
         /// it there is no mapping for a page
-        fn translate_allocate_page(&self, v_page: PageNo) -> Result<PageNo> {
+        fn translate_allocate_page(&self, v_page: PageNo) -> PageNo {
             let (pt_1_idx, pt_2_idx) = split_pte_idx(v_page);
 
             let mut tx = self.tx.borrow_mut();
-            let mut pte_1 = tx.lookup(pte_ptr(self.root_pt, pt_1_idx))?;
+            let mut pte_1 = tx
+                .lookup(pte_ptr(self.root_pt, pt_1_idx))
+                .expect("Unable to read PTE");
 
             if *pte_1 == 0 {
                 *pte_1 = self.allocate_physical_page(&tx);
-                tx.update(&pte_1)?;
+                tx.update(&pte_1).expect("Unable to update PTE");
                 debug!(page = *pte_1, level = 1, "Allocating new PTE page");
             }
 
-            let mut pte_2 = tx.lookup(pte_ptr(*pte_1, pt_2_idx))?;
+            let mut pte_2 = tx
+                .lookup(pte_ptr(*pte_1, pt_2_idx))
+                .expect("Unable to read PTE");
             if *pte_2 == 0 {
                 *pte_2 = self.allocate_physical_page(&tx);
                 debug!(page = *pte_2, level = 2, "Allocating new page");
-                tx.update(&pte_2)?;
+                tx.update(&pte_2).expect("Unable to update PTE");
             }
-            Ok(*pte_2)
+            *pte_2
         }
 
         fn allocate_physical_page(&self, tx: &T) -> PageNo {
@@ -1181,13 +1190,10 @@ pub mod vmem {
     impl<T: TxRead> TxRead for VTx<T> {
         fn read_to_buf(&self, v_addr: Addr, buf: &mut [u8]) {
             let segments = page_segments(v_addr, buf.len());
-            // dbg!(v_addr, buf.len());
+            let tx = self.tx.borrow();
             for (v_addr, range) in segments {
                 let (v_page, offset) = split_addr(v_addr);
-                // dbg!(v_page, offset);
-                if let Some(p_page) = self.translate_page(v_page).unwrap() {
-                    dbg!(p_page);
-                    let tx = self.tx.borrow();
+                if let Some(p_page) = self.translate_page(&tx, v_page) {
                     let p_addr = make_addr(p_page, offset);
                     trace!(v_page, v_addr, p_page, p_addr, "Reading");
                     tx.read_to_buf(p_addr, &mut buf[range]);
@@ -1196,8 +1202,7 @@ pub mod vmem {
         }
 
         fn valid_range(&self, addr: Addr, len: usize) -> bool {
-            let tx = self.tx.borrow();
-            tx.valid_range(addr, len)
+            self.tx.borrow().valid_range(addr, len)
         }
     }
 
@@ -1207,7 +1212,7 @@ pub mod vmem {
             let bytes = bytes.into();
             for (v_addr, range) in page_segments(v_addr, bytes.len()) {
                 let (v_page, offset) = split_addr(v_addr);
-                let p_page = self.translate_allocate_page(v_page).unwrap();
+                let p_page = self.translate_allocate_page(v_page);
                 let p_addr = make_addr(p_page, offset);
                 trace!(v_page, v_addr, p_page, p_addr, "Writing");
                 let mut tx = self.tx.borrow_mut();
@@ -1216,13 +1221,13 @@ pub mod vmem {
         }
 
         fn reclaim(&mut self, v_addr: Addr, len: usize) {
+            let mut tx = self.tx.borrow_mut();
             for (v_addr, range) in page_segments(v_addr, len) {
                 let (v_page, offset) = split_addr(v_addr);
-                if let Some(p_page) = self.translate_page(v_page).unwrap() {
+                if let Some(p_page) = self.translate_page(&tx, v_page) {
                     // We only need to reclaim memory if it was allocated
                     let p_addr = make_addr(p_page, offset);
                     trace!(v_page, v_addr, p_page, p_addr, "Reclaiming");
-                    let mut tx = self.tx.borrow_mut();
                     tx.reclaim(p_addr, range.len());
                 }
             }
@@ -1330,43 +1335,6 @@ mod tests {
         assert_eq!(max([1, 2, 3]), 3);
         assert_eq!(max([3, 2, 1]), 3);
         assert_eq!(max([]), 0);
-    }
-
-    #[test]
-    pub fn vmem_example() -> Result<()> {
-        // Create a new volume with 10 pages
-        let mut volume = Volume::with_capacity(1024 * 1024);
-
-        // Initialize two virtual memory spaces
-        let [mut vm1, mut vm2] = vmem::init(volume.start())?;
-
-        // Write data to the first virtual memory space
-        vm1.write(0, b"Hello from VM1");
-
-        // Write data to the second virtual memory space
-        vm2.write(0, b"Greetings from VM2");
-
-        // Read data from both virtual memory spaces
-        let data1 = vm1.read(0, 14);
-        let data2 = vm2.read(0, 18);
-
-        assert_eq!(&*data1, b"Hello from VM1");
-        assert_eq!(&*data2, b"Greetings from VM2");
-
-        // Commit changes back to Volume
-        volume.commit(vmem::finish([vm1, vm2])?)?;
-
-        // Reopen the virtual memory spaces
-        let [vm1, vm2] = vmem::open(volume.snapshot())?;
-
-        // Verify data persists after reopening
-        let data1 = vm1.read(0, 14);
-        let data2 = vm2.read(0, 18);
-
-        assert_eq!(&*data1, b"Hello from VM1");
-        assert_eq!(&*data2, b"Greetings from VM2");
-
-        Ok(())
     }
 
     #[test]

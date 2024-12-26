@@ -2629,31 +2629,6 @@ pub mod tests {
         pub(crate) fn any_snapshot() -> impl Strategy<Value = Vec<Patch>> {
             vec(patches::any_patch(), 1..10)
         }
-
-        // #[track_caller]
-        // pub fn assert_buffers_eq(a: &[u8], b: &[u8]) -> std::result::Result<(), TestCaseError> {
-        //     prop_assert_eq!(a.len(), b.len(), "Buffers should have the same length");
-
-        //     let mut mismatch = a
-        //         .iter()
-        //         .zip(b)
-        //         .enumerate()
-        //         .skip_while(|(_, (a, b))| *a == *b)
-        //         .take_while(|(_, (a, b))| *a != *b)
-        //         .map(|(idx, _)| idx);
-
-        //     if let Some(start) = mismatch.next() {
-        //         let end = mismatch.last().unwrap_or(start) + 1;
-        //         prop_assert_eq!(
-        //             &a[start..end],
-        //             &b[start..end],
-        //             "Mismatch detected at {}..{}",
-        //             start,
-        //             end
-        //         );
-        //     }
-        //     Ok(())
-        // }
     }
 
     /// Spawning a thread and returning a receiver to get a result from it.
