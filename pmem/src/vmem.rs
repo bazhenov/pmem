@@ -172,6 +172,12 @@ impl<T: TxRead> VTx<T> {
         Some(phys_page_no).filter(|&i| i > 0)
     }
 
+    /// Number of globally allocated pages (by all vmem spaces)
+    #[cfg(test)]
+    fn pages_allocated(&self) -> PageNo {
+        self.info.borrow().next_page
+    }
+
     /// Diagnostic method that prints translation table for a current virtual transaction
     #[cfg(test)]
     #[allow(unused)]
@@ -276,8 +282,24 @@ impl<T: TxRead> TxRead for VTx<T> {
         }
     }
 
+    /// Returns if this memory region can be mapped
+    ///
+    /// It means that immediate try to write in this memory will be successful. But if another
+    /// virtual transaction will map some memory first this transaction might be unable to map new memory.
     fn valid_range(&self, addr: Addr, len: usize) -> bool {
-        self.tx.borrow().valid_range(addr, len)
+        // count the number of pages in specified memory range that are not already mapped
+        let mut unmapped_pages = 0;
+        let tx = self.tx.borrow();
+        for (v_addr, _) in page_segments(addr, len) {
+            let (v_page, _) = split_addr(v_addr);
+            if self.translate_page(&tx, v_page).is_none() {
+                unmapped_pages += 1;
+            }
+        }
+
+        // Reading next free page and checking if we have enough space
+        let next_page = self.info.borrow().next_page;
+        tx.valid_range(make_addr(next_page, 0), unmapped_pages * PAGE_SIZE)
     }
 }
 
@@ -349,6 +371,24 @@ mod tests {
         let [tx1, tx2] = vmem::open(v.snapshot())?;
         assert_eq!(&*tx1.read(0, 6), b"Jekyll");
         assert_eq!(&*tx2.read(0, 4), b"Hide");
+        Ok(())
+    }
+
+    #[test]
+    fn valid_memory_range() -> Result<()> {
+        let pages_cnt = 10;
+        let v = Volume::new_in_memory(pages_cnt);
+        let [tx1, tx2] = vmem::init(v.start()).unwrap();
+
+        let pages_allocated = tx1.pages_allocated();
+        let pages_available = pages_cnt - pages_allocated;
+
+        assert!(tx1.valid_range(0, pages_available as usize * PAGE_SIZE));
+        assert!(tx2.valid_range(0, pages_available as usize * PAGE_SIZE));
+
+        assert!(!tx1.valid_range(0, (pages_available + 1) as usize * PAGE_SIZE));
+        assert!(!tx1.valid_range(0, (pages_available + 1) as usize * PAGE_SIZE));
+
         Ok(())
     }
 
