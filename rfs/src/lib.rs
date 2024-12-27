@@ -1666,12 +1666,14 @@ mod tests {
     #[test]
     #[should_panic(expected = "NoSpaceLeft")]
     fn no_space_left() {
-        let (mut fs, _) = create_fs_with_size(PAGE_SIZE);
+        const VOLUME_SIZE: usize = 1024 * 1024;
+        const FILES_TO_WRITE: usize = VOLUME_SIZE.div_ceil(MAX_FILE_SIZE) + 1;
+
+        let (mut fs, _) = create_fs_with_size(VOLUME_SIZE);
         let root = fs.get_root().unwrap();
 
         let pos = Some(SeekFrom::Start((MAX_FILE_SIZE - 1) as u64));
-        // In order to trigger NoSpaceLeft we need to write 64Kib (1 page in Volume) / MAX_FILE_SIZE (5184) = 13 files.
-        for idx in 0..13 {
+        for idx in 0..FILES_TO_WRITE {
             let f = fs.create_file(&root, format!("swap{}", idx)).unwrap();
             write_file(&mut fs, &f, &[1], pos).unwrap();
         }
