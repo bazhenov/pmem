@@ -1261,8 +1261,8 @@ fn push_patch(patches: &mut Vec<Patch>, patch: Patch) {
 
 /// Applies a list of patches to a given buffer within a specified range.
 ///
-/// This function iterates over the provided snapshots and applies each patch from each snapshot
-/// that intersects with the specified range to the given buffer.
+/// This function iterates over the provided patches and applies ones that intersects with the specified range to the
+/// given buffer.
 ///
 /// # Arguments
 ///
