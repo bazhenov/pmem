@@ -27,7 +27,7 @@ const VOLUME_INFO_ADDR: Addr = 0x50;
 
 pub struct Filesystem<S> {
     volume: Handle<VolumeInfo>,
-    fnode_slots: Rc<RefCell<Slots<FNode, VTx<S>>>>,
+    fnodes: Rc<RefCell<Slots<FNode, VTx<S>>>>,
     mem: Rc<RefCell<Memory<VTx<S>>>>,
 }
 
@@ -41,11 +41,11 @@ impl<S: TxRead> Filesystem<S> {
         let [tx1, tx2] = vmem::open(snapshot).unwrap();
         let volume = tx1.lookup(Ptr::<VolumeInfo>::from_addr(VOLUME_INFO_ADDR).unwrap())?;
         let mem = Rc::new(RefCell::new(Memory::open(tx1)));
-        let fnode_slots = Rc::new(RefCell::new(Slots::open(tx2)?));
+        let fnodes = Rc::new(RefCell::new(Slots::open(tx2)?));
         Ok(Self {
             volume,
             mem,
-            fnode_slots,
+            fnodes,
         })
     }
 
@@ -71,7 +71,7 @@ impl<S: TxRead> Filesystem<S> {
             .lookup_inode(dir)?
             .children
             .ok_or(ErrorKind::NotFound)?;
-        let fnodes = self.fnode_slots.borrow();
+        let fnodes = self.fnodes.borrow();
         let child = Self::find_child(&mem, &*fnodes, children, name.as_ref())?;
         FileMeta::from(child.node, &mem)
     }
@@ -80,7 +80,7 @@ impl<S: TxRead> Filesystem<S> {
     pub fn lookup_by_id(&self, id: u64) -> Result<FileMeta> {
         let mem = self.mem.borrow();
         let ptr = Ptr::<FNode>::from_addr(id as Addr).ok_or(ErrorKind::NotFound)?;
-        let fnodes = self.fnode_slots.borrow();
+        let fnodes = self.fnodes.borrow();
         let handle = fnodes.read(ptr)?.ok_or(ErrorKind::NotFound)?;
         FileMeta::from(handle, &mem)
     }
@@ -106,7 +106,7 @@ impl<S: TxRead> Filesystem<S> {
         Ok(File {
             pos: 0,
             mem: Rc::clone(&self.mem),
-            fnodes: Rc::clone(&self.fnode_slots),
+            fnodes: Rc::clone(&self.fnodes),
             meta: file_info,
         })
     }
@@ -120,7 +120,7 @@ impl<S: TxRead> Filesystem<S> {
     }
 
     fn get_root_handle(&self) -> Handle<FNode> {
-        self.fnode_slots
+        self.fnodes
             .borrow()
             .read(self.volume.root)
             .unwrap()
@@ -129,7 +129,7 @@ impl<S: TxRead> Filesystem<S> {
 
     fn lookup_inode(&self, meta: &FileMeta) -> Result<Handle<FNode>> {
         let ptr = Ptr::from_addr(meta.fid as Addr).ok_or(ErrorKind::InvalidInput)?;
-        let fnodes = self.fnode_slots.borrow();
+        let fnodes = self.fnodes.borrow();
         Ok(fnodes.read(ptr).transpose().ok_or(ErrorKind::NotFound)??)
     }
 
@@ -148,7 +148,7 @@ impl<S: TxRead> Filesystem<S> {
             let name = name.to_str().unwrap();
 
             let children = cur_node.children.ok_or(ErrorKind::NotFound)?;
-            let fnodes = self.fnode_slots.borrow();
+            let fnodes = self.fnodes.borrow();
             let child = Self::find_child(mem, &fnodes, children, name)?;
             cur_node = child.node;
         }
@@ -180,7 +180,8 @@ impl<S: TxRead> Filesystem<S> {
         let parent = self.lookup_inode(dir).unwrap();
 
         ReadDir {
-            fs: self,
+            mem: Rc::clone(&self.mem),
+            fnodes: Rc::clone(&self.fnodes),
             next: parent.children,
         }
     }
@@ -208,7 +209,7 @@ impl<S: TxWrite> Filesystem<S> {
         Self {
             volume,
             mem,
-            fnode_slots,
+            fnodes: fnode_slots,
         }
     }
 
@@ -217,7 +218,7 @@ impl<S: TxWrite> Filesystem<S> {
         let mut mem = self.mem.borrow_mut();
 
         let children = dir.children.ok_or(ErrorKind::NotFound)?;
-        let file = Self::find_child(&mem, &self.fnode_slots.borrow(), children, name.as_ref())?;
+        let file = Self::find_child(&mem, &self.fnodes.borrow(), children, name.as_ref())?;
 
         if file.node.node_type == NodeType::Directory && file.node.children.is_some() {
             return Err(ErrorKind::InvalidData.into());
@@ -243,7 +244,7 @@ impl<S: TxWrite> Filesystem<S> {
         }
 
         mem.reclaim(file.node.name.0)?;
-        let mut fnodes = self.fnode_slots.borrow_mut();
+        let mut fnodes = self.fnodes.borrow_mut();
         fnodes.free(file.node)?;
 
         if let Some(mut referent) = file.referent {
@@ -269,14 +270,14 @@ impl<S: TxWrite> Filesystem<S> {
             // Update the parent directory if the new child is the first in the list
             if child.next == Some(children) {
                 dir.children = Some(child.ptr());
-                let mut fnodes = self.fnode_slots.borrow_mut();
+                let mut fnodes = self.fnodes.borrow_mut();
                 fnodes.as_mut_tx().update(&dir)?;
             }
             child
         } else {
             let node = self.write_fsnode(file_name, NodeType::File)?;
             dir.children = Some(node.ptr());
-            let mut fnodes = self.fnode_slots.borrow_mut();
+            let mut fnodes = self.fnodes.borrow_mut();
             fnodes.as_mut_tx().update(&dir)?;
             node
         };
@@ -301,7 +302,7 @@ impl<S: TxWrite> Filesystem<S> {
             // Update the parent directory if the new child is the first in the list
             if new_child.next == Some(first_child) {
                 parent.children = Some(new_child.ptr());
-                let mut fnodes = self.fnode_slots.borrow_mut();
+                let mut fnodes = self.fnodes.borrow_mut();
                 fnodes.as_mut_tx().update(&parent)?;
             }
             new_child
@@ -310,7 +311,7 @@ impl<S: TxWrite> Filesystem<S> {
                 .write_fsnode(name.as_ref(), NodeType::Directory)
                 .expect("Unable to create dir");
             parent.children = Some(dir_inode.ptr());
-            let mut fnodes = self.fnode_slots.borrow_mut();
+            let mut fnodes = self.fnodes.borrow_mut();
             fnodes.as_mut_tx().update(&parent)?;
             dir_inode
         };
@@ -334,14 +335,14 @@ impl<S: TxWrite> Filesystem<S> {
                 // Update the directory FNode if the new child is the first in the list
                 if new_child.next == Some(first_child) {
                     node.children = Some(new_child.ptr());
-                    let mut fnodes = self.fnode_slots.borrow_mut();
+                    let mut fnodes = self.fnodes.borrow_mut();
                     fnodes.as_mut_tx().update(&node)?;
                 }
                 new_child
             } else {
                 let new_node = self.write_fsnode(name.to_str().unwrap(), NodeType::Directory)?;
                 node.children = Some(new_node.ptr());
-                let mut fnodes = self.fnode_slots.borrow_mut();
+                let mut fnodes = self.fnodes.borrow_mut();
                 fnodes.as_mut_tx().update(&node)?;
                 new_node
             }
@@ -353,7 +354,7 @@ impl<S: TxWrite> Filesystem<S> {
     pub fn finish(self) -> Result<S> {
         let Self {
             mem,
-            fnode_slots,
+            fnodes: fnode_slots,
             volume,
         } = self;
         let mut tx1 = Rc::into_inner(mem)
@@ -379,7 +380,7 @@ impl<S: TxWrite> Filesystem<S> {
         let mut cur_node = Some(start_node);
         while let Some(node) = cur_node {
             let mem = self.mem.borrow();
-            let fnodes = self.fnode_slots.borrow();
+            let fnodes = self.fnodes.borrow();
             let node = fnodes.read(node)?.ok_or(ErrorKind::NotFound)?;
             let child_name = node.name(&mem)?;
             match child_name.as_str().cmp(name) {
@@ -394,7 +395,7 @@ impl<S: TxWrite> Filesystem<S> {
 
         let mut new_node = self.write_fsnode(name, node_type)?;
         new_node.next = cur_node;
-        let mut fnodes = self.fnode_slots.borrow_mut();
+        let mut fnodes = self.fnodes.borrow_mut();
         fnodes.as_mut_tx().update(&new_node)?;
 
         if let Some(prev_node) = prev_node {
@@ -418,7 +419,7 @@ impl<S: TxWrite> Filesystem<S> {
             next: None,
         };
 
-        let handle = self.fnode_slots.borrow_mut().allocate_and_write(entry)?;
+        let handle = self.fnodes.borrow_mut().allocate_and_write(entry)?;
         Ok(handle)
     }
 
@@ -525,12 +526,12 @@ impl<S: TxWrite> File<S> {
         let mut blocks = blocks_required(self.meta.size);
         let blocks_required = blocks + blocks_to_allocate;
 
-        let mem = &mut self.mem.borrow_mut();
+        let mut mem = self.mem.borrow_mut();
 
         // Allocating direct data blocks if needed
         let blocks_before = blocks;
         while blocks < blocks_required && blocks <= LAST_DIRECT_BLOCK as u64 {
-            make_sure_data_block_exists(mem, &mut self.meta.content.direct[blocks as usize])?;
+            make_sure_data_block_exists(&mut mem, &mut self.meta.content.direct[blocks as usize])?;
             blocks += 1;
         }
         if blocks > blocks_before {
@@ -540,12 +541,12 @@ impl<S: TxWrite> File<S> {
         // Allocating indirect data block if needed
         if blocks < blocks_required {
             let mut indirect_block =
-                make_sure_ptr_block_exists(mem, &mut self.meta.content.indirect)?;
+                make_sure_ptr_block_exists(&mut mem, &mut self.meta.content.indirect)?;
 
             let blocks_before = blocks;
             while blocks < blocks_required && blocks <= LAST_INDIRECT_BLOCK as u64 {
                 let idx = blocks as usize - FIRST_INDIRECT_BLOCK;
-                make_sure_data_block_exists(mem, &mut indirect_block[idx])?;
+                make_sure_data_block_exists(&mut mem, &mut indirect_block[idx])?;
                 blocks += 1;
             }
             mem.update(&indirect_block)?;
@@ -557,7 +558,7 @@ impl<S: TxWrite> File<S> {
         // Allocating double indirect data block if needed
         if blocks < blocks_required {
             let mut double_indirect_block =
-                make_sure_ptr_block_exists(mem, &mut self.meta.content.double_indirect)?;
+                make_sure_ptr_block_exists(&mut mem, &mut self.meta.content.double_indirect)?;
 
             let blocks_before = blocks;
             while blocks < blocks_required && blocks <= LAST_DOUBLE_INDIRECT_BLOCK as u64 {
@@ -568,8 +569,8 @@ impl<S: TxWrite> File<S> {
                 let a_idx = idx / POINTERS_PER_BLOCK;
                 let b_idx = idx % POINTERS_PER_BLOCK;
                 let mut a_block =
-                    make_sure_ptr_block_exists(mem, &mut double_indirect_block[a_idx])?;
-                make_sure_data_block_exists(mem, &mut a_block[b_idx])?;
+                    make_sure_ptr_block_exists(&mut mem, &mut double_indirect_block[a_idx])?;
+                make_sure_data_block_exists(&mut mem, &mut a_block[b_idx])?;
                 // Here is possible performance improvement, technically we don't need to update
                 // the indirect block every time, but we can do it in the end
                 mem.update(&a_block)?;
@@ -589,25 +590,30 @@ impl<S: TxWrite> File<S> {
     }
 }
 
-/// Iteaor over the directory entries. Created by [`Filesystem::readdir`]
-struct ReadDir<'a, S> {
-    fs: &'a Filesystem<S>,
+/// Iterator over the directory entries. Created by [`Filesystem::readdir`]
+struct ReadDir<S> {
+    mem: Rc<RefCell<Memory<VTx<S>>>>,
+    fnodes: Rc<RefCell<Slots<FNode, VTx<S>>>>,
     next: Option<Ptr<FNode>>,
 }
 
-impl<'a, S> ReadDir<'a, S> {
-    fn empty(fs: &'a Filesystem<S>) -> Self {
-        Self { fs, next: None }
+impl<S> ReadDir<S> {
+    fn empty(fs: &Filesystem<S>) -> Self {
+        Self {
+            mem: Rc::clone(&fs.mem),
+            fnodes: Rc::clone(&fs.fnodes),
+            next: None,
+        }
     }
 }
 
-impl<S: TxRead> Iterator for ReadDir<'_, S> {
+impl<S: TxRead> Iterator for ReadDir<S> {
     type Item = FileMeta;
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(next) = self.next.take() {
-            let mem = self.fs.mem.borrow_mut();
-            let fnodes = self.fs.fnode_slots.borrow();
+            let mem = self.mem.borrow_mut();
+            let fnodes = self.fnodes.borrow();
             let next_child = fnodes.read(next).unwrap().unwrap();
             self.next = next_child.next;
             Some(FileMeta::from(next_child, &mem).unwrap())
@@ -700,7 +706,7 @@ pub struct Changes<'a, A: TxRead, B: TxRead> {
     ///
     /// Each time we encounter a new directory, we push [`Join`] of two iterators to the stack. Thus effectively
     /// we are implementing a depth-first search of the directory tree.
-    stack: Vec<Join<ReadDir<'a, A>, ReadDir<'a, B>>>,
+    stack: Vec<Join<ReadDir<A>, ReadDir<B>>>,
     path: Rc<PathBuf>,
 }
 
