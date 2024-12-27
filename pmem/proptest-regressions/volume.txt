@@ -6,3 +6,5 @@
 # everyone who runs the test benefits from these saved cases.
 cc 2f33a85ea685342ac1e13a88b289c379b1989a487658c1fbe1bc60de29944766 # shrinks to snapshots = [[Reclaim(0, 1)]]
 cc 0e52387685658b07d1ddb322df56e27b2352cdcd288517945db0030157427a2e # shrinks to snapshots = [[Write(0, [0])]]
+cc e70392dec9074c190a275b3cc4fd55abbcc426cef0a31c1a4e77d2a953d742cd # shrinks to snapshots = [[Write(21021, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]), Reclaim(21021, 11)]]
+cc ba5b3462605adcb6f4633e32bc0b85badc52e487542cfa2024279b53f1494939 # shrinks to snapshots = [[Write(175141, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]), Reclaim(175140, 15)]]

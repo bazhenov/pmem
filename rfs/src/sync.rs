@@ -118,7 +118,7 @@ mod tests {
     }
 
     fn create_fs() -> (Filesystem<Transaction>, Volume) {
-        let mut volume = Volume::new_in_memory(3);
+        let mut volume = Volume::with_capacity(1024 * 1024);
         let fs = Filesystem::allocate(volume.start());
         volume.commit(fs.finish().unwrap()).unwrap();
         let fs = Filesystem::open(volume.start()).unwrap();

@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 6212ff698d69d5971716804336b665f3f9979bc5434a797b410a0a63382318d9 # shrinks to a = [CreateFile("/a-x-ray/a-charlie/a-quebec.txt"), CreateFile("/a-delta/a-charlie/a-india.txt"), CreateFile("/a-uniform/a-lima/a-india.txt"), CreateFile("/a-yankee/a-charlie/a-golf.txt")], b = [CreateFile("/b-whiskey/b-hotel/b-zulu.txt"), CreateFile("/b-alfa/b-tango/b-echo.txt"), CreateFile("/b-bravo/b-oscar/b-victor.txt")], common = [CreateDirectory("/charlie/victor/lima"), CreateFile("/tango/kilo/alfa.txt"), CreateFile("/november/india/echo.txt"), CreateFile("/oscar/delta/zulu.txt"), CreateDirectory("/kilo/november/x-ray"), CreateDirectory("/zulu/yankee/papa")]

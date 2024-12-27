@@ -290,7 +290,7 @@ impl Patch {
     }
 
     #[cfg(test)]
-    fn write_to(self, tx: &mut impl TxWrite) {
+    pub fn write_to(self, tx: &mut impl TxWrite) {
         match self {
             Patch::Write(addr, bytes) => tx.write(addr, bytes),
             Patch::Reclaim(addr, size) => tx.reclaim(addr, size),
@@ -646,7 +646,7 @@ impl Volume {
     }
 
     #[cfg(test)]
-    fn read(&self, addr: Addr, len: usize) -> Cow<[u8]> {
+    pub fn read(&self, addr: Addr, len: usize) -> Cow<[u8]> {
         let mut buffer = vec![0; len];
 
         let snapshot = self.snapshot();
@@ -773,9 +773,9 @@ impl Pages {
     }
 
     fn read(&self, addr: Addr, buf: &mut [u8]) -> io::Result<()> {
-        let segments = PageSegments::new(addr, buf.len());
+        let segments = page_segments(addr, buf.len());
         for (addr, slice_range) in segments {
-            let (page_no, offset) = split_ptr(addr);
+            let (page_no, offset) = split_addr(addr);
             let offset = offset as usize;
             let len = slice_range.len();
 
@@ -790,9 +790,9 @@ impl Pages {
 
     // TODO proptests
     fn write(&self, addr: Addr, buf: &[u8]) -> io::Result<()> {
-        let segments = PageSegments::new(addr, buf.len());
+        let segments = page_segments(addr, buf.len());
         for (addr, slice_range) in segments {
-            let (page_no, offset) = split_ptr(addr);
+            let (page_no, offset) = split_addr(addr);
             let offset = offset as usize;
             let len = slice_range.len();
 
@@ -807,9 +807,9 @@ impl Pages {
     }
 
     fn zero(&self, addr: Addr, len: usize) -> io::Result<()> {
-        let segments = PageSegments::new(addr, len);
+        let segments = page_segments(addr, len);
         for (addr, slice_range) in segments {
-            let (page_no, offset) = split_ptr(addr);
+            let (page_no, offset) = split_addr(addr);
             let offset = offset as usize;
             let len = slice_range.len();
 
@@ -1261,8 +1261,8 @@ fn push_patch(patches: &mut Vec<Patch>, patch: Patch) {
 
 /// Applies a list of patches to a given buffer within a specified range.
 ///
-/// This function iterates over the provided snapshots and applies each patch from each snapshot
-/// that intersects with the specified range to the given buffer.
+/// This function iterates over the provided patches and applies ones that intersects with the specified range to the
+/// given buffer.
 ///
 /// # Arguments
 ///
@@ -1392,21 +1392,27 @@ fn split_ptr_checked(addr: Addr, len: usize, pages: u32) -> (PageNo, PageOffset)
         pages as u64 * PAGE_SIZE as u64
     );
 
-    split_ptr(addr)
+    split_addr(addr)
 }
 
 fn is_valid_ptr(addr: Addr, len: usize, pages: u32) -> bool {
-    let (page_no, _) = split_ptr(addr);
+    let (page_no, _) = split_addr(addr);
     // we need to subtract 1 byte, because end address exclusive
-    let (end_page_no, _) = split_ptr(addr + (len as Addr) - 1);
+    let (end_page_no, _) = split_addr(addr + (len as Addr) - 1);
 
     page_no < pages && end_page_no < pages
 }
 
-pub fn split_ptr(addr: Addr) -> (PageNo, PageOffset) {
+pub fn split_addr(addr: Addr) -> (PageNo, PageOffset) {
     let page_no = (addr >> PAGE_SIZE_BITS) & 0xFFFF_FFFF;
     let offset = addr & (PAGE_SIZE - 1) as u64;
     (page_no.try_into().unwrap(), offset.try_into().unwrap())
+}
+
+/// Creates an address from a given page no and offset.
+pub fn make_addr(page_no: PageNo, offset: PageOffset) -> Addr {
+    // Need to cast page_no to Addr first, instead overflow will happen
+    ((page_no as Addr) << PAGE_SIZE_BITS) | offset as Addr
 }
 
 /// Returns true of given patch intersects given range of bytes
@@ -1438,26 +1444,27 @@ fn intersects(patch: &Patch, range: &Range<usize>) -> bool {
 /// let size = 0x100;
 /// let buffer = vec![0; size];
 ///
-/// let segments = PageSegments::new(base_addr, size);
-/// for (addr, range) in segments {
+/// for (addr, range) in page_segments(base_addr, size) {
 ///     let result = tx.read(addr, range.len());
 ///     buffer[range].copy_from_slice(&result);
 /// }
 /// ```
+pub fn page_segments(
+    base_addr: Addr,
+    size: usize,
+) -> impl DoubleEndedIterator<Item = (Addr, Range<usize>)> {
+    PageSegments {
+        base_addr,
+        start_addr: base_addr,
+        end_addr: base_addr + size as Addr,
+    }
+}
+
+/// Iterator created by [`page_segments`]
 struct PageSegments {
     base_addr: Addr,
     start_addr: Addr,
     end_addr: Addr,
-}
-
-impl PageSegments {
-    fn new(base_addr: Addr, size: usize) -> Self {
-        PageSegments {
-            base_addr,
-            start_addr: base_addr,
-            end_addr: base_addr + size as Addr,
-        }
-    }
 }
 
 impl Iterator for PageSegments {
@@ -1470,7 +1477,7 @@ impl Iterator for PageSegments {
         let len = if are_on_the_same_page(self.start_addr, self.end_addr - 1) {
             self.end_addr - self.start_addr
         } else {
-            let (page, _) = split_ptr(self.start_addr);
+            let (page, _) = split_addr(self.start_addr);
             let next_page_addr = (page + 1) as Addr * PAGE_SIZE as Addr;
             next_page_addr - self.start_addr
         };
@@ -1489,7 +1496,7 @@ impl DoubleEndedIterator for PageSegments {
         let len = if are_on_the_same_page(self.start_addr, self.end_addr - 1) {
             (self.end_addr - self.start_addr) as usize
         } else {
-            let (page, _) = split_ptr(self.end_addr - 1);
+            let (page, _) = split_addr(self.end_addr - 1);
             let page_start_addr = page as Addr * PAGE_SIZE as Addr;
             (self.end_addr - page_start_addr) as usize
         };
@@ -1501,11 +1508,12 @@ impl DoubleEndedIterator for PageSegments {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use crate::driver::{FileDriver, TestPageDriver};
     use rand::{rngs::SmallRng, Rng, SeedableRng};
     use std::{
+        ops::Deref,
         sync::mpsc::{self, Receiver},
         thread,
         time::Duration,
@@ -1811,18 +1819,15 @@ mod tests {
         // Pay notice to take(N) calls. It is needed to stop tests from infinite looping in case
         // of errors in iteration logic
 
-        assert_eq!(
-            PageSegments::new(10, 0).take(10).collect::<Vec<_>>(),
-            vec![]
-        );
+        assert_eq!(page_segments(10, 0).take(10).collect::<Vec<_>>(), vec![]);
 
         assert_eq!(
-            PageSegments::new(0, 10).take(10).collect::<Vec<_>>(),
+            page_segments(0, 10).take(10).collect::<Vec<_>>(),
             vec![(0, 0..10)]
         );
 
         assert_eq!(
-            PageSegments::new(PAGE_SIZE as Addr / 2, PAGE_SIZE)
+            page_segments(PAGE_SIZE as Addr / 2, PAGE_SIZE)
                 .take(10)
                 .collect::<Vec<_>>(),
             vec![
@@ -1832,9 +1837,7 @@ mod tests {
         );
 
         assert_eq!(
-            PageSegments::new(1, 2 * PAGE_SIZE)
-                .take(10)
-                .collect::<Vec<_>>(),
+            page_segments(1, 2 * PAGE_SIZE).take(10).collect::<Vec<_>>(),
             vec![
                 (1, 0..PAGE_SIZE - 1),
                 (PAGE_SIZE as Addr, (PAGE_SIZE - 1)..(2 * PAGE_SIZE - 1)),
@@ -2039,7 +2042,7 @@ mod tests {
         snapshot.commit
     }
 
-    mod patch {
+    pub mod patch {
         use super::*;
         use Patch::*;
 
@@ -2194,49 +2197,77 @@ mod tests {
         use super::*;
 
         #[test]
-        fn split_ptr_generic() {
+        fn split_addr_generic() {
             let addr = 0x0AF0_1234;
-            let (page_no, offset) = split_ptr(addr);
+            let (page_no, offset) = split_addr(addr);
 
             assert_eq!(page_no, 0x0AF0);
             assert_eq!(offset, 0x1234);
         }
 
         #[test]
-        fn split_ptr_at_boundary() {
+        fn split_addr_at_boundary() {
             let addr = PAGE_SIZE as Addr - 1; // Last address of the first page
-            let (page_no, offset) = split_ptr(addr);
+            let (page_no, offset) = split_addr(addr);
 
             assert_eq!(page_no, 0);
             assert_eq!(offset, (PAGE_SIZE - 1) as PageOffset);
         }
 
         #[test]
-        fn test_split_ptr_zero() {
+        fn split_addr_zero() {
             let addr = 0x00000000;
-            let (page_no, offset) = split_ptr(addr);
+            let (page_no, offset) = split_addr(addr);
 
             assert_eq!(page_no, 0);
             assert_eq!(offset, 0);
         }
 
         #[test]
-        fn test_split_ptr_max_addr() {
+        fn split_addr_max_addr() {
             let addr = Addr::MAX;
-            let (page_no, offset) = split_ptr(addr);
+            let (page_no, offset) = split_addr(addr);
 
             assert_eq!(page_no, 0xFFFFFFFF);
             assert_eq!(offset, 0xFFFF);
         }
     }
 
-    mod proptests {
+    pub mod proptests {
         use super::*;
         use proptest::{collection::vec, prelude::*};
         use NormalizedPatches::*;
 
         /// The size of database for testing
-        const DB_SIZE: usize = PAGE_SIZE * 2;
+        pub const DB_SIZE: usize = PAGE_SIZE * 3;
+
+        #[macro_export]
+        macro_rules! assert_buffers_eq {
+            ($a:expr, $b:expr) => {{
+                let a: &[u8] = &$a;
+                let b: &[u8] = &$b;
+                proptest::prop_assert_eq!(a.len(), b.len(), "Buffers should have the same length");
+
+                let mut mismatch = a
+                    .iter()
+                    .zip(b)
+                    .enumerate()
+                    .skip_while(|(_, (a, b))| *a == *b)
+                    .take_while(|(_, (a, b))| *a != *b)
+                    .map(|(idx, _)| idx);
+
+                if let Some(start) = mismatch.next() {
+                    let end = mismatch.last().unwrap_or(start) + 1;
+                    proptest::prop_assert_eq!(
+                        &a[start..end],
+                        &b[start..end],
+                        "Mismatch detected at {}..{}",
+                        start,
+                        end
+                    );
+                }
+            }};
+        }
 
         proptest! {
             #[test]
@@ -2280,14 +2311,14 @@ mod tests {
 
             #[test]
             fn page_segments_len((addr, len) in any_addr_and_len()) {
-                let interval = PageSegments::new(addr, len);
+                let interval = page_segments(addr, len);
                 let len_sum = interval.map(|(_, slice_range)| slice_range.len()).sum::<usize>();
                 prop_assert_eq!(len_sum, len);
             }
 
             #[test]
             fn page_segments_are_connected((addr, len) in any_addr_and_len()) {
-                let segments = PageSegments::new(addr, len)
+                let segments = page_segments(addr, len)
                     .map(|(_, slice_range)| slice_range)
                     .collect::<Vec<_>>();
                 for i in segments.windows(2) {
@@ -2299,9 +2330,9 @@ mod tests {
             fn page_segments_are_equivalent_to_reverted((addr, len) in any_addr_and_len()) {
                 // take(N) is needed to prevent infinite loop in case of logic errors in iteration logic
                 // otherwise fuzz testing generates a lot of timeout errors
-                let segments = PageSegments::new(addr, len).take(100).collect::<Vec<_>>();
+                let segments = page_segments(addr, len).take(100).collect::<Vec<_>>();
 
-                let mut segments_rev = PageSegments::new(addr, len).rev().take(100).collect::<Vec<_>>();
+                let mut segments_rev = page_segments(addr, len).rev().take(100).collect::<Vec<_>>();
                 segments_rev.sort_by_key(|(addr, _)| *addr);
 
                 prop_assert_eq!(segments, segments_rev);
@@ -2312,30 +2343,18 @@ mod tests {
             /// In the end, the final snapshot state should be equal to the shadow buffer.
             #[test]
             fn shadow_write(snapshots in vec(any_snapshot(), 0..3)) {
-                let mut shadow_buffer = vec![0; DB_SIZE];
+                let mut shadow = VecTx(vec![0; DB_SIZE]);
                 let mut vol = Volume::with_capacity(DB_SIZE);
 
                 for patches in snapshots {
                     let mut tx = vol.start();
                     for patch in patches {
-                        let offset = patch.addr() as usize;
-                        let range = offset..offset + patch.len();
-                        match patch {
-                            Patch::Write(offset, bytes) => {
-                                shadow_buffer[range].copy_from_slice(bytes.as_slice());
-                                tx.write(offset, bytes);
-                            },
-                            Patch::Reclaim(offset, len) => {
-                                shadow_buffer[range].fill(0);
-                                tx.reclaim(offset, len);
-
-                            }
-                        }
+                        patch.clone().write_to(&mut tx);
+                        patch.write_to(&mut shadow);
                     }
-                    vol.commit(tx).unwrap();
+                    vol.commit(tx)?;
+                    assert_buffers_eq!(vol.read(0, DB_SIZE), shadow);
                 }
-
-                assert_buffers_eq(&vol.read(0, DB_SIZE), shadow_buffer.as_slice())?;
             }
 
             /// This test ensure that no matter transactions are committed, snapshot should always
@@ -2505,12 +2524,11 @@ mod tests {
 
         /// A set of strategies to generate different patches for property testing
         mod patches {
-            use prop::test_runner::TestRng;
-
             use super::*;
+            use prop::test_runner::TestRng;
             use std::mem;
 
-            pub(super) fn any_pair() -> impl Strategy<Value = (Patch, Patch)> {
+            pub fn any_pair() -> impl Strategy<Value = (Patch, Patch)> {
                 prop_oneof![
                     disconnected(),
                     adjacent(),
@@ -2519,7 +2537,7 @@ mod tests {
                 ]
             }
 
-            pub(super) fn connected() -> impl Strategy<Value = (Patch, Patch)> {
+            pub fn connected() -> impl Strategy<Value = (Patch, Patch)> {
                 prop_oneof![
                     adjacent(),
                     overlapped(),
@@ -2527,21 +2545,21 @@ mod tests {
                 ]
             }
 
-            pub(super) fn adjacent() -> impl Strategy<Value = (Patch, Patch)> {
+            pub fn adjacent() -> impl Strategy<Value = (Patch, Patch)> {
                 (any_patch(), any_patch()).prop_map(|(mut a, b)| {
                     a.set_addr(b.end());
                     (a, b)
                 })
             }
 
-            pub(super) fn disconnected() -> impl Strategy<Value = (Patch, Patch)> {
+            pub fn disconnected() -> impl Strategy<Value = (Patch, Patch)> {
                 (any_patch(), any_patch())
                     .prop_filter("Patches should be disconnected", |(p1, p2)| {
                         !p1.overlaps(p2) && !p1.adjacent(p2)
                     })
             }
 
-            pub(super) fn overlapped() -> impl Strategy<Value = (Patch, Patch)> {
+            pub fn overlapped() -> impl Strategy<Value = (Patch, Patch)> {
                 (any_patch_with_len(2..5), any_patch_with_len(2..5))
                     .prop_perturb(|(a, mut b), mut rng| {
                         // Position B at the end of A so that they are partially overlaps
@@ -2554,7 +2572,7 @@ mod tests {
             }
 
             /// The first returned patch is covering and the second is covered
-            pub(super) fn covered() -> impl Strategy<Value = (Patch, Patch)> {
+            pub fn covered() -> impl Strategy<Value = (Patch, Patch)> {
                 (any_patch(), any_patch())
                     .prop_map(|(a, b)| {
                         // reordering so that A is always longer or the same length as B
@@ -2576,15 +2594,15 @@ mod tests {
                     })
             }
 
-            pub(super) fn any_patch_with_len(len: Range<usize>) -> impl Strategy<Value = Patch> {
+            pub fn any_patch_with_len(len: Range<usize>) -> impl Strategy<Value = Patch> {
                 prop_oneof![write_patch(len.clone()), reclaim_patch(len)]
             }
 
-            pub(super) fn any_patch() -> impl Strategy<Value = Patch> {
+            pub fn any_patch() -> impl Strategy<Value = Patch> {
                 prop_oneof![write_patch(1..16), reclaim_patch(1..16)]
             }
 
-            pub(super) fn write_patch(len: Range<usize>) -> impl Strategy<Value = Patch> {
+            pub fn write_patch(len: Range<usize>) -> impl Strategy<Value = Patch> {
                 (0..DB_SIZE, vec(any::<u8>(), len))
                     .prop_filter("out of bounds patch", |(offset, bytes)| {
                         offset + bytes.len() < DB_SIZE
@@ -2592,7 +2610,7 @@ mod tests {
                     .prop_map(|(offset, bytes)| Patch::Write(offset as Addr, bytes))
             }
 
-            pub(super) fn reclaim_patch(len: Range<usize>) -> impl Strategy<Value = Patch> {
+            pub fn reclaim_patch(len: Range<usize>) -> impl Strategy<Value = Patch> {
                 (0..DB_SIZE, len)
                     .prop_filter("out of bounds patch", |(offset, len)| {
                         (*offset + *len) < DB_SIZE
@@ -2608,33 +2626,8 @@ mod tests {
             }
         }
 
-        fn any_snapshot() -> impl Strategy<Value = Vec<Patch>> {
+        pub(crate) fn any_snapshot() -> impl Strategy<Value = Vec<Patch>> {
             vec(patches::any_patch(), 1..10)
-        }
-
-        #[track_caller]
-        fn assert_buffers_eq(a: &[u8], b: &[u8]) -> std::result::Result<(), TestCaseError> {
-            prop_assert_eq!(a.len(), b.len(), "Buffers should have the same length");
-
-            let mut mismatch = a
-                .iter()
-                .zip(b)
-                .enumerate()
-                .skip_while(|(_, (a, b))| *a == *b)
-                .take_while(|(_, (a, b))| *a != *b)
-                .map(|(idx, _)| idx);
-
-            if let Some(start) = mismatch.next() {
-                let end = mismatch.last().unwrap_or(start) + 1;
-                prop_assert_eq!(
-                    &a[start..end],
-                    &b[start..end],
-                    "Mismatch detected at {}..{}",
-                    start,
-                    end
-                );
-            }
-            Ok(())
         }
     }
 
@@ -2686,6 +2679,52 @@ mod tests {
 
         fn len(&self) -> usize {
             (self.end - self.start) as usize
+        }
+    }
+
+    /// Simple adapter of a [`Vec`] to [`TxRead`]/[`TxWrite`] traits
+    pub struct VecTx(pub Vec<u8>);
+
+    impl TxRead for VecTx {
+        fn read_to_buf(&self, addr: Addr, buf: &mut [u8]) {
+            assert!(self.valid_range(addr, buf.len()), "OOB read");
+            let addr = addr as usize;
+            let len = buf.len();
+            buf.copy_from_slice(&self.0[addr..(addr + len)]);
+        }
+
+        fn valid_range(&self, addr: Addr, len: usize) -> bool {
+            addr as usize + len <= self.0.len()
+        }
+    }
+
+    impl TxWrite for VecTx {
+        fn write(&mut self, addr: Addr, bytes: impl Into<Vec<u8>>) {
+            let bytes = bytes.into();
+            let len = bytes.len();
+            assert!(self.valid_range(addr, len), "OOB write");
+            let addr = addr as usize;
+            self.0[addr..(addr + len)].copy_from_slice(&bytes);
+        }
+
+        fn reclaim(&mut self, addr: Addr, len: usize) {
+            assert!(self.valid_range(addr, len), "OOB reclaim");
+            let addr = addr as usize;
+            self.0[addr..(addr + len)].fill(0);
+        }
+    }
+
+    impl Deref for VecTx {
+        type Target = [u8];
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl From<VecTx> for Vec<u8> {
+        fn from(val: VecTx) -> Self {
+            val.0
         }
     }
 }
