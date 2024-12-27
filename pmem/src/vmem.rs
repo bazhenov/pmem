@@ -24,7 +24,7 @@
 //! and manipulate multiple virtual memory spaces within a single transaction.
 //!
 //! ```
-//! use pmem::memory::vmem;
+//! use pmem::vmem;
 //! use pmem::volume::{Volume, TxRead, TxWrite};
 //!
 //! // Create a new volume with 10 pages
