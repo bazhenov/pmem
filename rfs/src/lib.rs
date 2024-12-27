@@ -119,7 +119,7 @@ impl<S: TxRead> Filesystem<S> {
         self.do_readdir(dir)
     }
 
-    fn get_root_handle(&self, mem: &Memory<S>) -> Handle<FNode> {
+    fn get_root_handle(&self, mem: &Memory<impl TxRead>) -> Handle<FNode> {
         mem.lookup(self.volume.root).unwrap()
     }
 
@@ -128,7 +128,11 @@ impl<S: TxRead> Filesystem<S> {
         self.mem.borrow().lookup(ptr).map_err(|e| e.into())
     }
 
-    fn do_lookup_file(&self, mem: &Memory<S>, path: impl AsRef<str>) -> Result<Handle<FNode>> {
+    fn do_lookup_file(
+        &self,
+        mem: &Memory<impl TxRead>,
+        path: impl AsRef<str>,
+    ) -> Result<Handle<FNode>> {
         let path = PathBuf::from(path.as_ref());
         let components = components(&path)?;
         let mut cur_node = self.get_root_handle(mem);
@@ -145,7 +149,11 @@ impl<S: TxRead> Filesystem<S> {
         Ok(cur_node)
     }
 
-    fn find_child(mem: &Memory<S>, start_node: Ptr<FNode>, name: &str) -> Result<FileInfoReferent> {
+    fn find_child(
+        mem: &Memory<impl TxRead>,
+        start_node: Ptr<FNode>,
+        name: &str,
+    ) -> Result<FileInfoReferent> {
         let mut referent = None;
         let mut cur_node = Some(start_node);
 
@@ -402,7 +410,7 @@ impl<S: TxWrite> Filesystem<S> {
     /// Returns iterator over pointers to all [`DataBlock`]: direct, indirect and double indirect
     fn iter_blocks(
         &self,
-        mem: &Memory<S>,
+        mem: &Memory<impl TxRead>,
         ptrs: &BlockPointers,
     ) -> Result<impl Iterator<Item = Ptr<DataBlock>>> {
         let mut iters = vec![];
